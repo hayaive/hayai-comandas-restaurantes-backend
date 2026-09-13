@@ -1,0 +1,756 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// HAYAI · Comandas para restaurantes — esquema de datos (PostgreSQL)
+//
+// Autor: J.O.R.B.I (data-engineer). Producido ANTES de escribir código de
+// aplicación. La justificación de cada decisión está en docs/DECISIONES-DATOS.md
+// y el contrato para el frontend/backend en CONTRACT.md.
+//
+// Convenciones (heredadas de C:\dev\hayai-saas y hayai-sistema-de-pedidos-backend;
+// respetarlas al añadir tablas):
+//   · Modelos PascalCase con @@map a snake_case; campos camelCase con @map.
+//     El wire de la API queda camelCase; la base de datos, snake_case.
+//   · Todo id de negocio es UUIDv7 generado en el ORIGEN (src/comun/uuid.ts),
+//     nunca por la base. Ordenable por tiempo y válido antes del INSERT, que es
+//     lo que necesita un frontend optimista (la mesa se pinta ocupada al toque).
+//   · Dinero en NUMERIC, nunca float. USD Decimal(14,4) · Bs Decimal(18,4) ·
+//     tasa Decimal(18,8) · cantidades Decimal(14,3) · plano Decimal(10,2).
+//   · Todo DateTime es timestamptz. El día contable NO se deriva del UTC: se
+//     materializa en `fecha_operativa` al abrir la comanda (ver §Fecha operativa
+//     en docs/DECISIONES-DATOS.md). Un restaurante que cierra a las 2am factura
+//     al día anterior.
+//   · Toda tabla de negocio lleva `restaurante_id` como PRIMERA columna de sus
+//     índices, y `@@unique([restauranteId, id])` para habilitar las FK compuestas
+//     que hacen imposible referenciar datos de otro restaurante.
+//   · ⚠️ Ninguna FK compuesta usa `onDelete: SetNull`. Postgres anularía TODAS
+//     las columnas de la FK, incluida `restaurante_id`, que es NOT NULL: el
+//     DELETE fallaría en producción con un error incomprensible. Todas usan
+//     `Restrict`, que además es la semántica correcta aquí — a un usuario que
+//     firmó comandas se le desactiva (`activo = false`), no se le borra.
+//
+// ⚠️ DDL A MANO: este esquema depende de objetos que Prisma no sabe declarar
+//    (índices únicos parciales, EXCLUDE de solape, triggers, vistas, RLS).
+//    Viven en prisma/sql/ y se pegan dentro de la migración generada.
+//    prisma/sql/99_verificar_objetos.sql falla si alguno se perdió: correrlo en CI.
+// ═══════════════════════════════════════════════════════════════════════════
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enumeraciones ─────────────────────────────────────────────────────────
+// Añadir un valor exige `ALTER TYPE ... ADD VALUE` y desplegar el backend ANTES
+// que el frontend que lo emite. Quitar un valor es una migración en 3 fases.
+
+enum RolUsuario {
+  administrador
+  encargado
+  mesero
+  cocina
+  caja
+
+  @@map("rol_usuario")
+}
+
+enum FormaMesa {
+  redonda
+  cuadrada
+  rectangular
+  barra
+
+  @@map("forma_mesa")
+}
+
+/// Ciclo de vida de una reservación.
+/// `sentada` es el estado que el usuario llamó "mesa ocupada": el cliente llegó,
+/// se le abrió comanda y la mesa dejó de estar disponible.
+enum EstadoReservacion {
+  pendiente
+  confirmada
+  sentada
+  completada
+  cancelada
+  no_show
+
+  @@map("estado_reservacion")
+}
+
+/// Quién creó la reservación. `enlace_publico` = el propio cliente por QR/link,
+/// sin sesión: se audita distinto y se le aplica rate-limit.
+enum OrigenReservacion {
+  personal
+  enlace_publico
+
+  @@map("origen_reservacion")
+}
+
+/// Estado de la cuenta de la mesa.
+/// `por_cobrar` = el cliente pidió la cuenta; la mesa sigue ocupada pero la
+/// cocina ya no recibe items. Es lo que colorea el panel lateral.
+enum EstadoComanda {
+  abierta
+  por_cobrar
+  cobrada
+  anulada
+
+  @@map("estado_comanda")
+}
+
+enum TipoComanda {
+  mesa
+  para_llevar
+
+  @@map("tipo_comanda")
+}
+
+/// Estado de la LÍNEA, no de la cuenta. Deliberadamente sin `pagado`: el pago es
+/// de la comanda completa (ver docs/DECISIONES-DATOS.md §Por qué el ítem no se paga).
+enum EstadoComandaItem {
+  pendiente
+  en_preparacion
+  servido
+  cancelado
+
+  @@map("estado_comanda_item")
+}
+
+/// A qué estación se envía la comanda. Barra y cocina imprimen/despachan aparte.
+enum DestinoPreparacion {
+  cocina
+  barra
+  ninguno
+
+  @@map("destino_preparacion")
+}
+
+enum TurnoServicio {
+  desayuno
+  almuerzo
+  cena
+  madrugada
+
+  @@map("turno_servicio")
+}
+
+/// Métodos de pago del mercado venezolano. `pago_movil` y `transferencia`
+/// exigen referencia (CHECK en prisma/sql/02_constraints_a_mano.sql).
+enum MetodoPago {
+  efectivo_usd
+  efectivo_bs
+  pago_movil
+  transferencia
+  punto
+  binance
+  otro
+
+  @@map("metodo_pago")
+}
+
+enum Moneda {
+  USD
+  BS
+
+  @@map("moneda")
+}
+
+enum FuenteTasa {
+  bcv
+  manual
+  binance
+
+  @@map("fuente_tasa")
+}
+
+// ═══════════════════ 1 · RESTAURANTE Y PERSONAS ════════════════════════════
+
+/// Raíz del tenant. Existe desde el día 1 aunque hoy haya un solo restaurante:
+/// añadir `restaurante_id` después obliga a rehacer cada PK, cada índice y cada
+/// consulta del sistema (ver docs/DECISIONES-DATOS.md §D1).
+model Restaurante {
+  id     String @id @db.Uuid
+  /// Namespace de la URL pública de reservas: /r/<slug>/reservar
+  slug   String @unique @db.Citext
+  nombre String
+  rif    String?
+
+  /// Moneda en la que se fijan los precios del menú. En Venezuela: USD.
+  /// El cobro en Bs se convierte a la tasa del momento y NO se persiste derivado.
+  monedaBase   Moneda @default(USD) @map("moneda_base")
+  zonaHoraria  String @default("America/Caracas") @map("zona_horaria")
+  /// Hora de corte del día contable. Lo cobrado antes de esta hora pertenece a
+  /// la fecha_operativa del día anterior. Default 05:00 (cierre de madrugada).
+  horaCorteDia DateTime @default(dbgenerated("'05:00'::time")) @map("hora_corte_dia") @db.Time(0)
+
+  /// Duración por defecto de una reservación, en minutos. Define el rango que
+  /// el EXCLUDE usa para impedir doble reserva de la misma mesa.
+  duracionReservaMin Int     @default(90) @map("duracion_reserva_min")
+  /// Si el cliente puede elegir mesa desde el enlace público.
+  permiteAutoseleccion Boolean @default(true) @map("permite_autoseleccion")
+
+  activo        Boolean  @default(true)
+  creadoEn      DateTime @default(now()) @map("creado_en") @db.Timestamptz(6)
+  actualizadoEn DateTime @updatedAt @map("actualizado_en") @db.Timestamptz(6)
+
+  usuarios      Usuario[]
+  salones       Salon[]
+  mesas         Mesa[]
+  plantillas    Plantilla[]
+  plantillaMesas PlantillaMesa[]
+  categorias    Categoria[]
+  productos     Producto[]
+  reservaciones Reservacion[]
+  comandas      Comanda[]
+  comandaItems  ComandaItem[]
+  pagos         ComandaPago[]
+  tasas         TasaCambio[]
+  contadores    ContadorComanda[]
+  resumenes     ResumenDia[]
+
+  @@map("restaurante")
+}
+
+/// Personal. Rol plano por enum: este producto NO replica la matriz de 23
+/// acciones × 4 roles de hayai-saas — sería sobre-ingeniería para un MVP de
+/// comandas. Si más adelante se pide, `rol` pasa a FK sin tocar el resto.
+model Usuario {
+  id            String     @id @db.Uuid
+  restauranteId String     @map("restaurante_id") @db.Uuid
+  nombre        String
+  /// Único por restaurante, no global.
+  usuario       String     @db.Citext
+  claveHash     String     @map("clave_hash")
+  /// PIN corto para el login de mostrador del mesero (Argon2id, igual que la
+  /// clave). Nullable: cocina y caja entran con usuario/clave.
+  pinHash       String?    @map("pin_hash")
+  rol           RolUsuario
+  activo        Boolean    @default(true)
+  ultimoAccesoEn DateTime? @map("ultimo_acceso_en") @db.Timestamptz(6)
+  creadoEn      DateTime   @default(now()) @map("creado_en") @db.Timestamptz(6)
+  actualizadoEn DateTime   @updatedAt @map("actualizado_en") @db.Timestamptz(6)
+
+  restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+
+  plantillasCreadas Plantilla[]    @relation("plantilla_creada_por")
+  reservaciones     Reservacion[]  @relation("reservacion_creada_por")
+  comandasAtendidas Comanda[]      @relation("comanda_mesero")
+  comandasAnuladas  Comanda[]      @relation("comanda_anulada_por")
+  itemsCancelados   ComandaItem[]  @relation("item_cancelado_por")
+  pagosRegistrados  ComandaPago[]  @relation("pago_registrado_por")
+  tasasRegistradas  TasaCambio[]   @relation("tasa_registrada_por")
+
+  @@unique([restauranteId, id], map: "usuario_restaurante_id_key")
+  @@unique([restauranteId, usuario], map: "usuario_unico_por_restaurante")
+  @@index([restauranteId, rol, activo])
+  @@map("usuario")
+}
+
+// ═══════════════════ 2 · PLANO, PLANTILLAS Y MESAS ═════════════════════════
+
+/// Espacio FÍSICO del local: "Salón principal", "Terraza", "Barra".
+/// No es lo mismo que una plantilla: la terraza y el salón operan a la vez,
+/// mientras que "Evento boda" y "Distribución normal" son alternativas del
+/// MISMO salón. Separarlos es lo que permite tener ambos casos (§D3).
+model Salon {
+  id            String    @id @db.Uuid
+  restauranteId String    @map("restaurante_id") @db.Uuid
+  nombre        String
+  orden         Int       @default(0)
+  activo        Boolean   @default(true)
+  /// Borrado lógico: hay comandas y reservaciones históricas colgando.
+  eliminadoEn   DateTime? @map("eliminado_en") @db.Timestamptz(6)
+  creadoEn      DateTime  @default(now()) @map("creado_en") @db.Timestamptz(6)
+  actualizadoEn DateTime  @updatedAt @map("actualizado_en") @db.Timestamptz(6)
+
+  restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+
+  mesas         Mesa[]
+  plantillas    Plantilla[]
+  reservaciones Reservacion[]
+  comandas      Comanda[]
+
+  @@unique([restauranteId, id], map: "salon_restaurante_id_key")
+  @@index([restauranteId, orden])
+  @@map("salon")
+}
+
+/// IDENTIDAD PERSISTENTE de una mesa. "Mesa 5" es la misma mesa 5 aunque cambie
+/// de plantilla, de posición o de número de sillas.
+///
+/// ⚠️ Decisión central del modelo (§D4): la posición X/Y, la capacidad y la
+/// forma NO viven aquí, viven en `plantilla_mesa`. Aquí vive lo que no cambia
+/// al reorganizar el salón. Así una reservación o una comanda apuntan a un
+/// `mesa_id` estable y el histórico ("¿cuánto factura la mesa 5?") sobrevive a
+/// cualquier rediseño del plano.
+model Mesa {
+  id            String @id @db.Uuid
+  restauranteId String @map("restaurante_id") @db.Uuid
+  salonId       String @map("salon_id") @db.Uuid
+  /// Lo que el mesero canta en voz alta: "5", "T-2", "Barra 1".
+  /// Único entre las mesas vivas del restaurante (índice parcial a mano).
+  etiqueta      String
+
+  /// Valores que se copian a `plantilla_mesa` al agregar la mesa a una
+  /// plantilla nueva. Son el default del editor, no la verdad operativa.
+  capacidadDefault Int       @default(4) @map("capacidad_default")
+  formaDefault     FormaMesa @default(cuadrada) @map("forma_default")
+
+  activa        Boolean   @default(true)
+  /// Borrado lógico. "Borrar mesa" en el editor de plano NO borra esto: quita
+  /// la fila de `plantilla_mesa`. Ver CONTRACT.md §Borrar mesa.
+  eliminadaEn   DateTime? @map("eliminada_en") @db.Timestamptz(6)
+  creadaEn      DateTime  @default(now()) @map("creada_en") @db.Timestamptz(6)
+  actualizadaEn DateTime  @updatedAt @map("actualizada_en") @db.Timestamptz(6)
+
+  restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  salon       Salon       @relation(fields: [restauranteId, salonId], references: [restauranteId, id], onDelete: Restrict)
+
+  enPlantillas  PlantillaMesa[]
+  reservaciones Reservacion[]
+  comandas      Comanda[]
+
+  @@unique([restauranteId, id], map: "mesa_restaurante_id_key")
+  @@index([restauranteId, salonId])
+  @@map("mesa")
+}
+
+/// Una distribución guardada del plano de un salón: "Distribución normal",
+/// "Evento boda", "Terraza verano". Una sola activa por salón (índice único
+/// parcial a mano: `plantilla_activa_unica`).
+model Plantilla {
+  id            String  @id @db.Uuid
+  restauranteId String  @map("restaurante_id") @db.Uuid
+  salonId       String  @map("salon_id") @db.Uuid
+  nombre        String
+  descripcion   String?
+
+  /// Lienzo lógico del editor, en las mismas unidades que pos_x/pos_y.
+  /// El frontend escala; la base guarda coordenadas del plano, no píxeles de
+  /// pantalla, para que el plano no se deforme según el monitor.
+  anchoPlano Decimal @default(1200) @map("ancho_plano") @db.Decimal(10, 2)
+  altoPlano  Decimal @default(800) @map("alto_plano") @db.Decimal(10, 2)
+
+  activa Boolean @default(false)
+
+  /// Trazabilidad del "clonar plantilla". NULL = se creó desde plano vacío.
+  clonadaDeId String? @map("clonada_de_id") @db.Uuid
+  creadaPorId String? @map("creada_por_id") @db.Uuid
+
+  creadaEn      DateTime @default(now()) @map("creada_en") @db.Timestamptz(6)
+  actualizadaEn DateTime @updatedAt @map("actualizada_en") @db.Timestamptz(6)
+
+  restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  salon       Salon       @relation(fields: [restauranteId, salonId], references: [restauranteId, id], onDelete: Restrict)
+  clonadaDe   Plantilla?  @relation("plantilla_clon", fields: [restauranteId, clonadaDeId], references: [restauranteId, id], onDelete: Restrict)
+  clones      Plantilla[] @relation("plantilla_clon")
+  creadaPor   Usuario?    @relation("plantilla_creada_por", fields: [restauranteId, creadaPorId], references: [restauranteId, id], onDelete: Restrict)
+
+  mesas         PlantillaMesa[]
+  reservaciones Reservacion[]
+  comandas      Comanda[]
+
+  @@unique([restauranteId, id], map: "plantilla_restaurante_id_key")
+  @@index([restauranteId, salonId])
+  @@map("plantilla")
+}
+
+/// La mesa DENTRO de una distribución: dónde está y cómo se dibuja.
+/// Quitar esta fila = "borrar la mesa del plano" sin perder su historia.
+model PlantillaMesa {
+  restauranteId String @map("restaurante_id") @db.Uuid
+  plantillaId   String @map("plantilla_id") @db.Uuid
+  mesaId        String @map("mesa_id") @db.Uuid
+
+  /// Esquina superior izquierda del bounding box, en unidades del plano.
+  posX Decimal @map("pos_x") @db.Decimal(10, 2)
+  posY Decimal @map("pos_y") @db.Decimal(10, 2)
+  /// Tamaño dibujado. Para `redonda`, ancho == alto == diámetro.
+  ancho Decimal @default(80) @db.Decimal(10, 2)
+  alto  Decimal @default(80) @db.Decimal(10, 2)
+  /// Grados, 0-359. Una mesa rectangular girada 90° sigue siendo la misma mesa.
+  rotacion Int @default(0) @db.SmallInt
+
+  forma FormaMesa
+  /// Sillas EN ESTA distribución: la misma mesa redonda puede ser de 4 en el
+  /// día a día y de 10 en un banquete. Por eso la capacidad vive aquí y es
+  /// NOT NULL (nada de COALESCE en cada consulta de disponibilidad).
+  capacidad Int
+  /// Fuera de servicio en esta distribución (en obra, reservada para el paso).
+  /// No admite reservas ni comandas nuevas.
+  bloqueada Boolean @default(false)
+
+  creadaEn      DateTime @default(now()) @map("creada_en") @db.Timestamptz(6)
+  actualizadaEn DateTime @updatedAt @map("actualizada_en") @db.Timestamptz(6)
+
+  restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  plantilla   Plantilla   @relation(fields: [restauranteId, plantillaId], references: [restauranteId, id], onDelete: Cascade)
+  mesa        Mesa        @relation(fields: [restauranteId, mesaId], references: [restauranteId, id], onDelete: Restrict)
+
+  @@id([plantillaId, mesaId])
+  /// Habilita la FK compuesta desde `reservacion`: una reserva sólo puede
+  /// apuntar a una mesa que REALMENTE está en esa plantilla.
+  @@unique([restauranteId, plantillaId, mesaId], map: "plantilla_mesa_restaurante_key")
+  @@index([restauranteId, mesaId])
+  @@map("plantilla_mesa")
+}
+
+// ═══════════════════ 3 · MENÚ ══════════════════════════════════════════════
+
+model Categoria {
+  id            String    @id @db.Uuid
+  restauranteId String    @map("restaurante_id") @db.Uuid
+  nombre        String
+  orden         Int       @default(0)
+  activa        Boolean   @default(true)
+  eliminadaEn   DateTime? @map("eliminada_en") @db.Timestamptz(6)
+  creadaEn      DateTime  @default(now()) @map("creada_en") @db.Timestamptz(6)
+  actualizadaEn DateTime  @updatedAt @map("actualizada_en") @db.Timestamptz(6)
+
+  restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  productos   Producto[]
+
+  @@unique([restauranteId, id], map: "categoria_restaurante_id_key")
+  @@index([restauranteId, orden])
+  @@map("categoria")
+}
+
+model Producto {
+  id            String  @id @db.Uuid
+  restauranteId String  @map("restaurante_id") @db.Uuid
+  categoriaId   String  @map("categoria_id") @db.Uuid
+  /// Código corto opcional para buscar tecleando ("B12").
+  codigo        String?
+  nombre        String
+  descripcion   String?
+
+  /// Precio en la moneda base del restaurante (USD). El precio en Bs NUNCA se
+  /// persiste: se calcula con la tasa vigente al mostrar y se congela sólo en
+  /// el pago (ver `comanda_pago.tasa_aplicada`).
+  precio Decimal  @db.Decimal(14, 4)
+  costo  Decimal? @db.Decimal(14, 4)
+
+  destino DestinoPreparacion @default(cocina)
+  /// Disponible HOY (el clásico "se acabó"). Se apaga y se enciende a diario.
+  disponible Boolean @default(true)
+  /// Está en la carta. Apagarlo lo saca del menú sin borrar su historia.
+  activo     Boolean @default(true)
+  orden      Int     @default(0)
+  imagenUrl  String? @map("imagen_url")
+  /// Minutos estimados de preparación; alimenta la vista de cocina.
+  tiempoPrepMin Int? @map("tiempo_prep_min")
+
+  creadoEn      DateTime @default(now()) @map("creado_en") @db.Timestamptz(6)
+  actualizadoEn DateTime @updatedAt @map("actualizado_en") @db.Timestamptz(6)
+
+  restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  categoria   Categoria   @relation(fields: [restauranteId, categoriaId], references: [restauranteId, id], onDelete: Restrict)
+
+  items ComandaItem[]
+
+  @@unique([restauranteId, id], map: "producto_restaurante_id_key")
+  @@index([restauranteId, categoriaId, orden])
+  @@index([restauranteId, destino])
+  @@map("producto")
+}
+
+// ═══════════════════ 4 · RESERVACIONES ═════════════════════════════════════
+
+/// Reserva de UNA mesa concreta de la plantilla vigente.
+///
+/// ⚠️ La doble reserva NO se evita en código: la evita Postgres con un
+/// constraint EXCLUDE sobre (restaurante_id, mesa_id, periodo) filtrado a los
+/// estados vivos. Sin eso hace falta SERIALIZABLE o advisory locks, y el bug
+/// aparece justo el sábado a las 8pm. Ver prisma/sql/02_constraints_a_mano.sql.
+model Reservacion {
+  id            String @id @db.Uuid
+  restauranteId String @map("restaurante_id") @db.Uuid
+  salonId       String @map("salon_id") @db.Uuid
+  /// Contra qué distribución se reservó. Si luego se activa otra plantilla que
+  /// no incluye esa mesa, la reserva queda detectable como huérfana en vez de
+  /// apuntar al vacío (consulta en CONTRACT.md §Reservas huérfanas).
+  plantillaId   String @map("plantilla_id") @db.Uuid
+  /// NULL = reservada sin mesa asignada; el cliente la elige por el enlace
+  /// público, o el anfitrión al llegar.
+  mesaId        String? @map("mesa_id") @db.Uuid
+
+  clienteNombre   String  @map("cliente_nombre")
+  clienteTelefono String? @map("cliente_telefono")
+  /// Cédula/RIF venezolano (V/E/J/P/G + 6-9 dígitos) cuando se pide.
+  clienteDocumento String? @map("cliente_documento")
+  personas        Int
+
+  iniciaEn  DateTime @map("inicia_en") @db.Timestamptz(6)
+  /// Calculado al crear a partir de restaurante.duracion_reserva_min, o fijado
+  /// a mano. Es columna real y no expresión porque `timestamptz + interval` es
+  /// STABLE, no IMMUTABLE, y por tanto no sirve en una columna generada.
+  terminaEn DateTime @map("termina_en") @db.Timestamptz(6)
+  /// tstzrange [inicia_en, termina_en) mantenido por trigger. La app nunca lo
+  /// escribe; sólo existe para que el EXCLUDE pueda comparar solapes.
+  periodo   Unsupported("tstzrange")?
+
+  estado EstadoReservacion @default(pendiente)
+  origen OrigenReservacion @default(personal)
+
+  /// Lo que viaja en el QR: /r/<slug>/reserva/<codigo_publico>.
+  /// Aleatorio de alta entropía (>=64 bits, base32 sin caracteres ambiguos).
+  codigoPublico String @unique @map("codigo_publico")
+  /// Código corto y legible que canta el anfitrión ("R-7K4Q"). No autoriza nada.
+  codigoCorto   String @map("codigo_corto")
+
+  notas String?
+
+  creadaPorId String? @map("creada_por_id") @db.Uuid
+  confirmadaEn DateTime? @map("confirmada_en") @db.Timestamptz(6)
+  sentadaEn    DateTime? @map("sentada_en") @db.Timestamptz(6)
+  canceladaEn  DateTime? @map("cancelada_en") @db.Timestamptz(6)
+  motivoCancelacion String? @map("motivo_cancelacion")
+
+  creadaEn      DateTime @default(now()) @map("creada_en") @db.Timestamptz(6)
+  actualizadaEn DateTime @updatedAt @map("actualizada_en") @db.Timestamptz(6)
+
+  restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  salon       Salon       @relation(fields: [restauranteId, salonId], references: [restauranteId, id], onDelete: Restrict)
+  plantilla   Plantilla   @relation(fields: [restauranteId, plantillaId], references: [restauranteId, id], onDelete: Restrict)
+  mesa        Mesa?       @relation(fields: [restauranteId, mesaId], references: [restauranteId, id], onDelete: Restrict)
+  creadaPor   Usuario?    @relation("reservacion_creada_por", fields: [restauranteId, creadaPorId], references: [restauranteId, id], onDelete: Restrict)
+
+  /// La comanda que se abrió al sentar a esta reserva. 1:1 opcional.
+  comanda Comanda?
+
+  @@unique([restauranteId, id], map: "reservacion_restaurante_id_key")
+  @@index([restauranteId, iniciaEn])
+  @@index([restauranteId, estado, iniciaEn])
+  @@index([restauranteId, mesaId, iniciaEn])
+  @@map("reservacion")
+}
+
+// ═══════════════════ 5 · COMANDAS ══════════════════════════════════════════
+
+/// La cuenta abierta de una mesa. Es a la vez la ocupación y el pedido: no hay
+/// tabla de "sesión de mesa" aparte porque el invariante que importa —una sola
+/// cuenta viva por mesa— se expresa mejor como índice único parcial sobre esta
+/// misma tabla (`comanda_mesa_activa_unica`). Las rondas sucesivas de pedido se
+/// modelan con `comanda_item.ronda`, que es como funciona un KDS real.
+model Comanda {
+  id            String @id @db.Uuid
+  restauranteId String @map("restaurante_id") @db.Uuid
+  tipo          TipoComanda @default(mesa)
+  /// NULL sólo cuando tipo = para_llevar (CHECK a mano).
+  salonId       String? @map("salon_id") @db.Uuid
+  mesaId        String? @map("mesa_id") @db.Uuid
+  plantillaId   String? @map("plantilla_id") @db.Uuid
+  reservacionId String? @map("reservacion_id") @db.Uuid
+
+  /// Número visible del día ("Comanda #14"). Se asigna con un UPSERT atómico
+  /// sobre `contador_comanda`, nunca con MAX()+1.
+  numeroDia Int @map("numero_dia")
+  /// Día contable en la zona horaria del restaurante, calculado AL ABRIR con
+  /// la hora de corte. No se deriva de creado_en en las consultas: si no, el
+  /// cierre de caja de la madrugada se parte en dos días.
+  fechaOperativa DateTime @map("fecha_operativa") @db.Date
+  turno          TurnoServicio
+
+  comensales Int    @default(1)
+  meseroId   String? @map("mesero_id") @db.Uuid
+
+  estado EstadoComanda @default(abierta)
+
+  abiertaEn DateTime  @default(now()) @map("abierta_en") @db.Timestamptz(6)
+  cerradaEn DateTime? @map("cerrada_en") @db.Timestamptz(6)
+
+  /// Totales en moneda base (USD). Se recalculan en la misma transacción que
+  /// toca las líneas; nunca se confían al cliente.
+  subtotal Decimal @default(0) @db.Decimal(14, 4)
+  descuento Decimal @default(0) @db.Decimal(14, 4)
+  impuesto  Decimal @default(0) @db.Decimal(14, 4)
+  propina   Decimal @default(0) @db.Decimal(14, 4)
+  total     Decimal @default(0) @db.Decimal(14, 4)
+
+  /// Tasa congelada AL COBRAR, no antes. Permite reimprimir el ticket con la
+  /// tasa que realmente se cobró.
+  tasaId    String?  @map("tasa_id") @db.Uuid
+  tasaValor Decimal? @map("tasa_valor") @db.Decimal(18, 8)
+  totalBs   Decimal? @map("total_bs") @db.Decimal(18, 4)
+
+  anuladaPorId      String? @map("anulada_por_id") @db.Uuid
+  motivoAnulacion   String? @map("motivo_anulacion")
+  notas             String?
+
+  creadaEn      DateTime @default(now()) @map("creada_en") @db.Timestamptz(6)
+  actualizadaEn DateTime @updatedAt @map("actualizada_en") @db.Timestamptz(6)
+
+  restaurante Restaurante  @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  salon       Salon?       @relation(fields: [restauranteId, salonId], references: [restauranteId, id], onDelete: Restrict)
+  mesa        Mesa?        @relation(fields: [restauranteId, mesaId], references: [restauranteId, id], onDelete: Restrict)
+  plantilla   Plantilla?   @relation(fields: [restauranteId, plantillaId], references: [restauranteId, id], onDelete: Restrict)
+  reservacion Reservacion? @relation(fields: [restauranteId, reservacionId], references: [restauranteId, id], onDelete: Restrict)
+  mesero      Usuario?     @relation("comanda_mesero", fields: [restauranteId, meseroId], references: [restauranteId, id], onDelete: Restrict)
+  anuladaPor  Usuario?     @relation("comanda_anulada_por", fields: [restauranteId, anuladaPorId], references: [restauranteId, id], onDelete: Restrict)
+  tasa        TasaCambio?  @relation(fields: [restauranteId, tasaId], references: [restauranteId, id], onDelete: Restrict)
+
+  items ComandaItem[]
+  pagos ComandaPago[]
+
+  @@unique([restauranteId, id], map: "comanda_restaurante_id_key")
+  @@unique([restauranteId, fechaOperativa, numeroDia], map: "comanda_numero_dia_unico")
+  /// 1:1 con la reservación que se sentó. NULL no colisiona con NULL en
+  /// Postgres, así que las comandas sin reserva conviven sin problema.
+  @@unique([restauranteId, reservacionId], map: "comanda_reservacion_unica")
+  /// Panel lateral: "mesas ocupadas ahora". Índice parcial a mano, ver
+  /// prisma/sql/02_constraints_a_mano.sql (`comanda_activa_idx`).
+  @@index([restauranteId, fechaOperativa, estado])
+  @@index([restauranteId, estado, abiertaEn])
+  @@index([restauranteId, meseroId, fechaOperativa])
+  @@map("comanda")
+}
+
+/// Línea de comanda. Guarda SNAPSHOT del nombre, del precio y del destino: el
+/// ticket de hoy debe reimprimirse idéntico dentro de un año aunque el producto
+/// haya cambiado de precio o de nombre. Es también la tabla sobre la que se
+/// calculan "ventas del día" y "producto más vendido".
+model ComandaItem {
+  id            String @id @db.Uuid
+  restauranteId String @map("restaurante_id") @db.Uuid
+  comandaId     String @map("comanda_id") @db.Uuid
+  productoId    String @map("producto_id") @db.Uuid
+
+  /// Ronda de envío a cocina (1 = entradas, 2 = principales...). Agrupa lo que
+  /// se manda junto sin necesidad de otra tabla.
+  ronda Int @default(1)
+  orden Int @default(0)
+
+  nombreSnap          String  @map("nombre_snap")
+  precioUnitarioSnap  Decimal @map("precio_unitario_snap") @db.Decimal(14, 4)
+  destinoSnap         DestinoPreparacion @map("destino_snap")
+  cantidad            Decimal @db.Decimal(14, 3)
+  descuentoLinea      Decimal @default(0) @map("descuento_linea") @db.Decimal(14, 4)
+  /// cantidad * precio_unitario_snap - descuento_linea. Se persiste para que
+  /// los reportes sumen una columna en vez de recalcular en cada consulta.
+  totalLinea          Decimal @map("total_linea") @db.Decimal(14, 4)
+
+  estado EstadoComandaItem @default(pendiente)
+  nota   String?
+
+  enviadoEn DateTime? @map("enviado_en") @db.Timestamptz(6)
+  servidoEn DateTime? @map("servido_en") @db.Timestamptz(6)
+  canceladoPorId    String? @map("cancelado_por_id") @db.Uuid
+  motivoCancelacion String? @map("motivo_cancelacion")
+
+  creadoEn      DateTime @default(now()) @map("creado_en") @db.Timestamptz(6)
+  actualizadoEn DateTime @updatedAt @map("actualizado_en") @db.Timestamptz(6)
+
+  restaurante  Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  comanda      Comanda     @relation(fields: [restauranteId, comandaId], references: [restauranteId, id], onDelete: Cascade)
+  producto     Producto    @relation(fields: [restauranteId, productoId], references: [restauranteId, id], onDelete: Restrict)
+  canceladoPor Usuario?    @relation("item_cancelado_por", fields: [restauranteId, canceladoPorId], references: [restauranteId, id], onDelete: Restrict)
+
+  @@unique([restauranteId, id], map: "comanda_item_restaurante_id_key")
+  @@index([comandaId, ronda, orden])
+  @@index([restauranteId, productoId])
+  /// Cola de cocina: índice parcial a mano sobre los estados vivos
+  /// (`comanda_item_cocina_idx`).
+  @@index([restauranteId, destinoSnap, estado, enviadoEn])
+  @@map("comanda_item")
+}
+
+/// Pago de una comanda. Varias filas por comanda (pago mixto: mitad efectivo
+/// USD, mitad pago móvil). `monto_usd` es el equivalente en moneda base con la
+/// tasa que se aplicó — se persiste porque es dinero que YA entró, no un precio
+/// derivado: el reporte de ventas suma esta columna.
+model ComandaPago {
+  id            String @id @db.Uuid
+  restauranteId String @map("restaurante_id") @db.Uuid
+  comandaId     String @map("comanda_id") @db.Uuid
+
+  metodo MetodoPago
+  moneda Moneda
+  /// Monto en la moneda de `moneda`.
+  monto  Decimal @db.Decimal(18, 4)
+  /// Tasa usada para convertir. NULL si moneda = USD (moneda base).
+  tasaAplicada Decimal? @map("tasa_aplicada") @db.Decimal(18, 8)
+  montoUsd     Decimal  @map("monto_usd") @db.Decimal(14, 4)
+  /// Obligatoria para pago_movil y transferencia (CHECK a mano).
+  referencia String?
+
+  recibidoEn      DateTime @default(now()) @map("recibido_en") @db.Timestamptz(6)
+  registradoPorId String?  @map("registrado_por_id") @db.Uuid
+
+  restaurante  Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  comanda      Comanda     @relation(fields: [restauranteId, comandaId], references: [restauranteId, id], onDelete: Cascade)
+  registradoPor Usuario?   @relation("pago_registrado_por", fields: [restauranteId, registradoPorId], references: [restauranteId, id], onDelete: Restrict)
+
+  @@unique([restauranteId, id], map: "comanda_pago_restaurante_id_key")
+  @@index([comandaId])
+  @@index([restauranteId, recibidoEn])
+  @@map("comanda_pago")
+}
+
+// ═══════════════════ 6 · SOPORTE: TASA, CONTADOR, ROLLUP ═══════════════════
+
+/// Tasa de cambio del día. Se consulta viva para mostrar precios en Bs y se
+/// congela en la comanda/pago al cobrar.
+model TasaCambio {
+  id            String     @id @db.Uuid
+  restauranteId String     @map("restaurante_id") @db.Uuid
+  fecha         DateTime   @db.Date
+  valor         Decimal    @db.Decimal(18, 8)
+  fuente        FuenteTasa @default(bcv)
+  registradaPorId String?  @map("registrada_por_id") @db.Uuid
+  creadaEn      DateTime   @default(now()) @map("creada_en") @db.Timestamptz(6)
+
+  restaurante   Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  registradaPor Usuario?    @relation("tasa_registrada_por", fields: [restauranteId, registradaPorId], references: [restauranteId, id], onDelete: Restrict)
+
+  comandas Comanda[]
+
+  @@unique([restauranteId, id], map: "tasa_cambio_restaurante_id_key")
+  @@unique([restauranteId, fecha, fuente], map: "tasa_cambio_dia_unica")
+  @@index([restauranteId, fecha(sort: Desc)])
+  @@map("tasa_cambio")
+}
+
+/// Contador del número visible de comanda, por restaurante y día operativo.
+/// Se incrementa con `INSERT ... ON CONFLICT DO UPDATE SET ultimo = ultimo + 1
+/// RETURNING ultimo`: atómico y sin condición de carrera, a diferencia de
+/// MAX(numero_dia)+1, que duplica números en cuanto entran dos meseros a la vez.
+model ContadorComanda {
+  restauranteId  String   @map("restaurante_id") @db.Uuid
+  fechaOperativa DateTime @map("fecha_operativa") @db.Date
+  ultimo         Int      @default(0)
+
+  restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+
+  @@id([restauranteId, fechaOperativa])
+  @@map("contador_comanda")
+}
+
+/// Rollup diario para el dashboard histórico. NO es la fuente de verdad: se
+/// recalcula desde comanda/comanda_item y se mantiene al cerrar o anular una
+/// comanda. El día EN CURSO no se lee de aquí (ver docs/DECISIONES-DATOS.md §Reportes).
+model ResumenDia {
+  restauranteId  String   @map("restaurante_id") @db.Uuid
+  fechaOperativa DateTime @map("fecha_operativa") @db.Date
+  turno          TurnoServicio
+
+  comandas      Int     @default(0)
+  comensales    Int     @default(0)
+  totalUsd      Decimal @default(0) @map("total_usd") @db.Decimal(16, 4)
+  propinasUsd   Decimal @default(0) @map("propinas_usd") @db.Decimal(16, 4)
+  descuentosUsd Decimal @default(0) @map("descuentos_usd") @db.Decimal(16, 4)
+  /// { "efectivo_usd": 120.5, "pago_movil": 43.0, ... } en equivalente USD.
+  porMetodo     Json    @default("{}") @map("por_metodo")
+  /// Producto más vendido del día por cantidad, ya resuelto.
+  productoTopId       String?  @map("producto_top_id") @db.Uuid
+  productoTopCantidad Decimal? @map("producto_top_cantidad") @db.Decimal(14, 3)
+
+  actualizadoEn DateTime @updatedAt @map("actualizado_en") @db.Timestamptz(6)
+
+  restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+
+  @@id([restauranteId, fechaOperativa, turno])
+  @@map("resumen_dia")
+}
