@@ -151,11 +151,31 @@ enum MetodoPago {
   @@map("metodo_pago")
 }
 
+/// Moneda en la que se COBRA. Deliberadamente sólo USD y BS: es el dominio de
+/// `comanda_pago.moneda` y de `restaurante.moneda_base`, y todo el cálculo de
+/// cobro está escrito sobre esas dos ("si no es USD, es bolívares").
+///
+/// ⚠️ NO añadir EUR aquí. Ver `Divisa` más abajo y docs/DECISIONES-DATOS.md §D13.
 enum Moneda {
   USD
   BS
 
   @@map("moneda")
+}
+
+/// Moneda EXTRANJERA cuya cotización en bolívares se publica: el dólar y el
+/// euro ("tasa central" del BCV). Es el dominio de `tasa_cambio.divisa`.
+///
+/// Es un enum aparte de `Moneda` a propósito (§D13): una tasa siempre se
+/// expresa como "bolívares por 1 unidad de la divisa", así que BS no puede ser
+/// miembro — el denominador es fijo. Y al revés: mantenerlo separado hace
+/// imposible que un EUR se cuele en `comanda_pago.moneda`, donde el cobro lo
+/// trataría como bolívares y lo dividiría entre la tasa del dólar.
+enum Divisa {
+  USD
+  EUR
+
+  @@map("divisa")
 }
 
 enum FuenteTasa {
@@ -691,12 +711,27 @@ model ComandaPago {
 
 // ═══════════════════ 6 · SOPORTE: TASA, CONTADOR, ROLLUP ═══════════════════
 
-/// Tasa de cambio del día. Se consulta viva para mostrar precios en Bs y se
-/// congela en la comanda/pago al cobrar.
+/// Cotización de UNA divisa en bolívares, para un día y una fuente.
+/// Se consulta viva para mostrar precios en Bs y se congela en la
+/// comanda/pago al cobrar.
+///
+/// `valor` = **bolívares por 1 unidad de `divisa`**. Nunca al revés: invertir
+/// la lectura es el error clásico y aquí costaría dinero real.
+///   divisa='USD', valor=912.50  →  1 USD = 912,50 Bs
+///   divisa='EUR', valor=985.30  →  1 EUR = 985,30 Bs
+///
+/// ⚠️ El COBRO usa exclusivamente las filas con `divisa = 'USD'` (la moneda
+/// base del restaurante). El euro es informativo: hoy nadie paga en euros.
+/// Esa regla no depende del código — la hace cumplir el trigger
+/// `comanda_tasa_base` (prisma/sql/01_constraints_y_triggers.sql §7).
 model TasaCambio {
   id            String     @id @db.Uuid
   restauranteId String     @map("restaurante_id") @db.Uuid
   fecha         DateTime   @db.Date
+  /// Qué divisa cotiza esta fila. El default existe para que el camino de
+  /// cobro y el registro rápido de "la tasa del día" sigan significando dólar
+  /// sin tener que nombrarlo (ver docs/DECISIONES-DATOS.md §D14).
+  divisa        Divisa     @default(USD)
   valor         Decimal    @db.Decimal(18, 8)
   fuente        FuenteTasa @default(bcv)
   registradaPorId String?  @map("registrada_por_id") @db.Uuid
@@ -708,7 +743,11 @@ model TasaCambio {
   comandas Comanda[]
 
   @@unique([restauranteId, id], map: "tasa_cambio_restaurante_id_key")
-  @@unique([restauranteId, fecha, fuente], map: "tasa_cambio_dia_unica")
+  /// Una cotización por divisa, día y fuente. `divisa` va en segunda posición
+  /// a propósito: el prefijo (restaurante_id, divisa) convierte este mismo
+  /// índice en el que resuelve "la tasa vigente del euro" sin índice extra.
+  @@unique([restauranteId, divisa, fecha, fuente], map: "tasa_cambio_dia_unica")
+  /// Histórico mixto para la gráfica del panel: todas las divisas por fecha.
   @@index([restauranteId, fecha(sort: Desc)])
   @@map("tasa_cambio")
 }

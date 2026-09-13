@@ -56,7 +56,11 @@ type DestinoPreparacion= 'cocina' | 'barra' | 'ninguno';
 type TurnoServicio     = 'desayuno' | 'almuerzo' | 'cena' | 'madrugada';
 type MetodoPago        = 'efectivo_usd' | 'efectivo_bs' | 'pago_movil'
                        | 'transferencia' | 'punto' | 'binance' | 'otro';
+/// Moneda en la que se COBRA. No lleva 'EUR' y no debe llevarlo: ver `Divisa`.
 type Moneda            = 'USD' | 'BS';
+/// Moneda EXTRANJERA que se cotiza en bolívares. Sólo aparece en TasaCambio.
+/// NO es intercambiable con `Moneda` — ver docs/DECISIONES-DATOS.md §D13.
+type Divisa            = 'USD' | 'EUR';
 type FuenteTasa        = 'bcv' | 'manual' | 'binance';
 
 /// Derivado, NO existe como columna: lo calcula la vista v_mesa_estado.
@@ -227,8 +231,33 @@ Reglas que **la base** hace cumplir:
 
 ### 2.12 TasaCambio / ContadorComanda / ResumenDia
 
-- `TasaCambio`: `id`, `restauranteId`, `fecha`, `valor`, `fuente`,
-  `registradaPorId?`. Única por `(restaurante, fecha, fuente)`.
+```ts
+interface TasaCambio {
+  id: string;
+  restauranteId: string;
+  fecha: string;            // 'YYYY-MM-DD' — día del restaurante, no UTC
+  divisa: Divisa;           // 'USD' | 'EUR'
+  valor: string;            // Decimal(18,8) — BOLÍVARES POR 1 UNIDAD DE `divisa`
+  fuente: FuenteTasa;
+  registradaPorId?: string;
+  creadaEn: string;
+}
+```
+
+Única por `(restaurante, divisa, fecha, fuente)`.
+
+> **`valor` se lee siempre como "Bs por 1 unidad de la divisa", nunca al revés.**
+> `divisa='USD', valor=912.50` → 1 USD = 912,50 Bs.
+> `divisa='EUR', valor=985.30` → 1 EUR = 985,30 Bs.
+> Invertir la lectura es el error clásico y aquí cuesta dinero real.
+
+Reglas que **la base** hace cumplir (verificadas, ver §10 de DECISIONES-DATOS):
+- Una comanda sólo puede congelar una tasa con `divisa='USD'`, la moneda base.
+  El euro es **informativo**: hoy nadie paga en euros. Lo impide el trigger
+  `comanda_tasa_base`, no el código.
+- La `divisa` de una tasa ya registrada es **inmutable** (`tasa_divisa_inmutable`).
+  Corregir el `valor` sí se permite; cambiar de dólar a euro, no.
+
 - `ContadorComanda`: `(restauranteId, fechaOperativa)` → `ultimo`. Infraestructura
   del número visible; el frontend no la ve.
 - `ResumenDia`: rollup por `(restaurante, fechaOperativa, turno)`. **Fase 2**:
@@ -271,7 +300,12 @@ Todos van en **una transacción**.
 
 ```
 1. Recalcular totales en el servidor desde comanda_item (jamás confiar en el cliente).
-2. Leer la tasa vigente y CONGELARLA: comanda.tasaId, tasaValor, totalBs.
+2. Leer la tasa vigente DEL DÓLAR y CONGELARLA: comanda.tasaId, tasaValor, totalBs.
+   ⚠️ `where: { restauranteId, divisa: 'USD' }`, `orderBy: [{ fecha: 'desc' },
+   { creadaEn: 'desc' }]`. Sin el filtro de divisa la consulta puede devolver
+   la cotización del EURO y convertir cada bolívar con un ~8-15 % de error.
+   La base lo rechaza (trigger `comanda_tasa_base`), pero el cobro entero
+   revienta con un 500: el filtro no es opcional.
 3. INSERT de N comanda_pago. La suma de montoUsd debe cuadrar con total.
 4. UPDATE comanda SET estado='cobrada', cerradaEn=now()
    → libera la mesa automáticamente (sale del índice parcial).
@@ -328,6 +362,9 @@ El backend **debe** capturarlos; son reglas de negocio, no fallos técnicos.
 | `23514` | cualquier CHECK | 422 | Según el constraint (ver `01_constraints_y_triggers.sql`) |
 | `23503` | cualquier FK | 422 | "El registro referenciado no existe" |
 | `23514` | `plantilla_mesa_mismo_salon` | 422 | "Esa mesa pertenece a otro salón" |
+| `23505` | `tasa_cambio_dia_unica` | 409 | "Ya existe una tasa para esa divisa, fecha y fuente" — **no debería verse**: `POST /tasa` es upsert |
+| `23514` | `comanda_tasa_base` | **500** | Bug: se cobró con una tasa que no es la del dólar. Es un error del backend, no del usuario |
+| `23514` | `tasa_divisa_inmutable` | 422 | "No se puede cambiar la divisa de una tasa ya registrada" |
 
 ---
 
@@ -444,9 +481,94 @@ GET    /reportes/dia?fecha=                                      -> { porTurno: 
 GET    /reportes/productos?desde=&hasta=&orden=cantidad|ingreso&limite=
                                                                  -> ProductoVendido[]
 GET    /reportes/cierre-caja?fecha=                              -> { porMetodo: VentaMetodo[], descuadres: Descuadre[] }
-GET    /tasa/vigente                                             -> TasaCambio
-POST   /tasa                       { valor, fuente }             -> TasaCambio
+GET    /tasa/vigente                                             -> TasasVigentes
+POST   /tasa                       CrearTasaDto                  -> TasaCambio
 ```
+
+#### `GET /tasa/vigente` — el dólar y el euro en UNA petición
+
+Devuelve **siempre 200**, aunque no haya ninguna tasa cargada. El estado
+"todavía no hay tasa" es un estado vacío, no un error: hoy el endpoint lanza
+un 400 y el frontend lo caza con un `try/catch` para convertirlo en `null`
+(`httpClient.ts`). Ese apaño desaparece — y con dos divisas ya no valdría,
+porque puede haber dólar sin euro.
+
+```ts
+interface TasasVigentes {
+  /** 'YYYY-MM-DD': hoy según la zona horaria del restaurante. */
+  fecha: string;
+  usd: TasaCambio | null;
+  eur: TasaCambio | null;
+}
+```
+
+La clave es el código de divisa en minúsculas. Añadir una divisa más adelante
+es **aditivo**: aparece una clave nueva y nada existente cambia de forma.
+
+**Cómo se resuelve "vigente"** — la última registrada, no necesariamente la de
+hoy: `WHERE restaurante_id = ? AND divisa = ?` `ORDER BY fecha DESC, creada_en
+DESC LIMIT 1`.
+
+> ⚠️ El `ORDER BY` **tiene que llevar `creada_en DESC`** como desempate. Con
+> varias `fuente` para la misma divisa y día (BCV y Binance), ordenar sólo por
+> `fecha` deja a Postgres elegir la fila, y el resultado cambia entre
+> ejecuciones. Esto ya pasaba antes de las divisas en `cobrar()`; corregirlo es
+> parte de este cambio. `fuente` es metadato, no un selector: gana la última
+> registrada.
+
+**Tasa vieja.** El endpoint devuelve la última aunque sea de hace tres días. La
+UI compara `usd.fecha` con `fecha` y avisa ("tasa del 11/09") en vez de
+presentar como de hoy una cotización vencida. No se devuelve un booleano
+derivado: con los dos campos el frontend lo calcula y no hay dos verdades.
+
+**Conversión (todo en el frontend, nada se persiste):**
+
+```
+Bs  = USD × usd.valor                 USD = Bs ÷ usd.valor
+Bs  = EUR × eur.valor                 EUR = Bs ÷ eur.valor
+EUR = USD × usd.valor ÷ eur.valor     ← cruce a través del bolívar
+```
+
+> El equivalente en euros es **informativo**. No se cobra en euros, no se
+> guarda y no entra en ningún total. Ver §D13.
+
+#### `POST /tasa` — registrar o corregir
+
+```ts
+class CrearTasaDto {
+  @IsNumber({ maxDecimalPlaces: 8 })
+  @IsPositive()
+  valor!: number;
+
+  @IsEnum(FuenteTasa)
+  fuente!: FuenteTasa;
+
+  /** Ausente = 'USD'. Ver abajo por qué es opcional. */
+  @IsOptional()
+  @IsEnum(Divisa)
+  divisa?: Divisa;
+}
+```
+
+`divisa` es **opcional con default `'USD'`** a propósito: el frontend ya
+desplegado llama `registrarTasa(valor, fuente)` sin divisa desde el diálogo de
+"no hay tasa, regístrala para cobrar" (`ComandaCard.tsx`), y ese diálogo habla
+del dólar. Con el default, ese camino sigue siendo correcto sin tocarlo.
+
+`maxDecimalPlaces: 8` iguala la precisión de la columna: sin él, `912.123456789`
+se redondea en silencio al guardarse.
+
+**Es un upsert** sobre la clave natural `(restauranteId, divisa, fecha, fuente)`,
+no un `create`. Corregir un tipeo en la tasa del día es una operación normal, y
+es **seguro para el histórico**: al cobrar, la comanda se queda con su propia
+copia en `tasa_valor`, así que actualizar la fila de hoy no reescribe ningún
+ticket ya emitido (verificado, §10 de DECISIONES-DATOS). Como `@@unique` con
+campos no nulos, `prisma.tasaCambio.upsert()` puede expresarlo directamente.
+
+**Aviso de banda, en la UI y no en la base:** si el valor nuevo se aparta más de
+~10 % del anterior de esa divisa, conviene pedir confirmación ("¿seguro?
+ayer era 912,50"). Es un *aviso*, nunca un bloqueo: la tasa puede saltar de
+verdad y la base no tiene forma de saber cuál es la magnitud correcta.
 
 ---
 

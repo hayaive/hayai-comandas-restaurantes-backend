@@ -42,7 +42,10 @@ const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
   usuario_unico_por_restaurante: { http: 409, mensaje: 'Ya existe un usuario con ese nombre de usuario' },
   reservacion_codigo_publico_key: { http: 500, mensaje: 'Error interno generando el código de la reserva' },
   restaurante_slug_key: { http: 409, mensaje: 'Ya existe un restaurante con ese slug' },
-  tasa_cambio_dia_unica: { http: 409, mensaje: 'Ya existe una tasa registrada para esa fecha y fuente' },
+  tasa_cambio_dia_unica: {
+    http: 409,
+    mensaje: 'Ya existe una tasa registrada para esa divisa, fecha y fuente',
+  },
 
   // 23503 — FK
   plantilla_mesa_restaurante_id_mesa_id_fkey: {
@@ -83,6 +86,17 @@ const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
     mensaje: 'Un pago en Bs exige la tasa aplicada; uno en USD no debe llevarla',
   },
   tasa_valor_valido: { http: 422, mensaje: 'La tasa debe ser mayor que 0' },
+  // Estos dos son la red que impide cobrar en bolívares usando la cotización
+  // del euro. Si alguna vez aparecen en producción, NO es un error del
+  // usuario: es que una consulta de tasa perdió su filtro `divisa: 'USD'`.
+  comanda_tasa_base: {
+    http: 500,
+    mensaje: 'Error interno: se intentó cobrar con una tasa que no es la del dólar',
+  },
+  tasa_divisa_inmutable: {
+    http: 422,
+    mensaje: 'No se puede cambiar la divisa de una tasa ya registrada; registra otra',
+  },
 };
 
 const MAPA_SQLSTATE: Record<string, TraduccionError> = {

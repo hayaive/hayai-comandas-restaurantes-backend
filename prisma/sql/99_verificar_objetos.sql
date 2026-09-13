@@ -46,7 +46,11 @@ DECLARE
   triggers text[] := ARRAY[
     'reservacion_periodo',
     'plantilla_mesa_mismo_salon',
-    'mesa_cambio_salon'
+    'mesa_cambio_salon',
+    -- Impiden que una comanda congele la tasa del EURO en vez de la del dólar.
+    -- Si se pierden, el cobro sigue funcionando y cobra mal: nada falla.
+    'comanda_tasa_base',
+    'tasa_divisa_inmutable'
   ];
 
   funciones text[] := ARRAY[
@@ -54,7 +58,9 @@ DECLARE
     'hayai_plantilla_mesa_mismo_salon',
     'hayai_mesa_cambio_salon',
     'hayai_fecha_operativa',
-    'hayai_turno'
+    'hayai_turno',
+    'hayai_comanda_tasa_base',
+    'hayai_tasa_divisa_inmutable'
   ];
 
   vistas text[] := ARRAY[

@@ -1,6 +1,7 @@
 # HAYAI Comandas · Decisiones de modelado
 
 > Autor: **J.O.R.B.I** (data-engineer) · 2026-09-12
+> Ampliado el 2026-09-13 con §D13/§D14 y §10 (tasa del euro).
 > Acompaña a `prisma/schema.prisma`, `prisma/sql/` y `CONTRACT.md`.
 >
 > **Estado de verificación:** el esquema completo (DDL de Prisma + los 5 archivos
@@ -27,6 +28,8 @@
 | D10 | Precios en USD; Bs nunca persistido salvo lo ya cobrado | Precio en Bs | La tasa BCV se mueve a diario; sólo se congela cuando el dinero entró, para reimprimir el ticket con la tasa real |
 | D11 | Reportes por vistas SQL, rollup sólo cuando duela | Vista materializada desde el día 1 | El día en curso tiene que ser exacto y una MV no se refresca en tiempo real |
 | D12 | FKs compuestas `(restaurante_id, id)` | FK simple por `id` | Referenciar datos de otro restaurante deja de ser un bug de permisos y pasa a ser una violación de constraint |
+| D13 | Enum `Divisa` ('USD','EUR') **aparte** de `Moneda` ('USD','BS') | Añadir `EUR` al enum `Moneda` | `Moneda` es el dominio del COBRO; un `EUR` ahí lo aceptaría el DTO de pago y el cálculo lo trataría como bolívares |
+| D14 | `tasa_cambio.divisa` con `DEFAULT 'USD'`; el cobro sólo admite USD, y lo impide un trigger | Tabla aparte para el euro / confiar en que el código filtre | Una tabla gemela se fusionaría el día que el euro se cobre; y un filtro olvidado cuesta ~8-15 % en cada bolívar cobrado |
 
 ---
 
@@ -286,7 +289,7 @@ se le desactiva, no se le borra.
 | A6 | ¿Puede el cliente reservar sin elegir mesa? | Sí (`mesa_id` nullable); la asigna el anfitrión | Cero |
 | A7 | ¿Comanda para llevar / delivery? | Modelado (`tipo = 'para_llevar'`), sin pantalla | Bajo |
 | A8 | ¿El ticket debe mostrar el total en Bs siempre? | Sí: al cobrar se exige `total_bs` | Si algún restaurante opera sólo en USD, relajar el CHECK `comanda_tasa_congelada` |
-| A9 | ¿De dónde sale la tasa BCV? | Tabla `tasa_cambio`, carga manual o job | Bajo |
+| A9 | ¿De dónde salen las tasas (BCV dólar y euro)? | Tabla `tasa_cambio` por divisa, carga manual o job (§10) | Bajo |
 | A10 | Inventario / recetas / descuento de insumos | Fuera de alcance | Alto: módulo nuevo (existe el precedente de `hayai-saas`) |
 
 **Dos avisos en voz alta para D.A.N.I:**
@@ -297,3 +300,180 @@ se le desactiva, no se le borra.
 2. `restaurante_id` sale **siempre del token verificado**, jamás del body, de un
    query param o de un header — también en los endpoints públicos de reserva,
    donde sale del `slug` de la ruta resuelto contra la tabla `restaurante`.
+
+---
+
+## 10 · Dos tasas: el dólar y el euro          *(añadido 2026-09-13)*
+
+> **Estado de verificación:** la migración `20260913101500_tasa_por_divisa` se
+> aplicó sobre un PostgreSQL real y se corrieron **22 aserciones** sobre los
+> invariantes de este apartado. Todas pasan, y `npm run db:verify` reconoce los
+> objetos nuevos. El `migrate diff` contra la base no reporta deriva.
+
+El pedido del cliente fue: *"ver un apartado donde se aprecie a qué valor está
+el BCV y el EURO a la tasa central, y que los precios en dólares puedan ver su
+correlativo en bolívares, o viceversa"*.
+
+Es un pedido de **visualización**. Los precios del menú se siguen fijando en
+USD (§D10) y el cobro sigue siendo USD/Bs. Nadie paga en euros. Lo único que
+falta en la base es poder guardar una segunda cotización.
+
+### 10.1 Por qué `Divisa` es un enum nuevo y no `EUR` dentro de `Moneda`
+
+Lo obvio era `enum Moneda { USD BS EUR }`. Es la decisión que había que evitar,
+porque `Moneda` no significa "una moneda cualquiera": es **el dominio del
+cobro**. Aparece en `comanda_pago.moneda` y en `restaurante.moneda_base`, y el
+cálculo del cobro está escrito así:
+
+```ts
+const montoUsd = p.moneda === 'USD' ? monto : monto.div(tasa.valor);
+```
+
+Es decir: **todo lo que no es USD se trata como bolívares**. Un pago marcado
+`EUR` habría entrado por esa rama y se habría dividido entre la tasa del dólar.
+El `CHECK pago_tasa_coherente` tampoco ayuda — está escrito como
+`(moneda='USD' AND tasa IS NULL) OR (moneda='BS' AND tasa IS NOT NULL)`, así que
+un `EUR` no encaja en ninguna rama y sería rechazado con un 422 incomprensible.
+Añadir `EUR` a `Moneda` habría creado un valor **tecleable en todas partes y
+guardable en ninguna**.
+
+`Divisa` se llama así y no `MonedaTasa` porque la exclusión de `BS` deja de ser
+arbitraria y pasa a ser semántica: una tasa es siempre *"bolívares por 1 unidad
+de la divisa"*, así que el denominador es fijo y `BS` no puede ser miembro.
+Con `MonedaTasa`, el primer lector se preguntaría por qué falta `BS`.
+
+Verificado: el enum `moneda` sigue siendo exactamente `USD,BS`, y un
+`INSERT INTO comanda_pago ... moneda='EUR'` ni siquiera llega a evaluarse
+(`22P02`: el valor no existe en el tipo).
+
+### 10.2 Una sola tabla con discriminador, no dos tablas
+
+La alternativa era dejar `tasa_cambio` intacta (sólo dólar) y crear una tabla
+para el euro. Se descartó: serían dos tablas de forma idéntica que habría que
+fusionar el día que el euro se cobre de verdad, y cada consulta de "las tasas
+de hoy" tendría que hacer `UNION`. Una tabla con `divisa` es la forma normal
+de esto, y absorbe sin cambios la tercera divisa que pidan.
+
+El `DEFAULT 'USD'` no es comodidad: es el **backfill exacto**. Las filas que ya
+existen se escribieron cuando la columna no existía y `valor` significaba, por
+definición, bolívares por dólar. No hay que adivinar nada. Verificado: una fila
+insertada sin nombrar la divisa queda en `USD`.
+
+El único a favor de extender `Moneda` era no crear un tipo más. El coste de
+equivocarse en la dirección contraria es dinero mal cobrado, y no es simétrico.
+
+### 10.3 El índice: uno solo hace los dos trabajos
+
+`tasa_cambio_dia_unica` pasa de `(restaurante_id, fecha, fuente)` a
+`(restaurante_id, divisa, fecha, fuente)`.
+
+`divisa` va en **segunda** posición a propósito: el prefijo
+`(restaurante_id, divisa)` convierte al propio índice de unicidad en el que
+resuelve *"la tasa vigente del euro"* (`ORDER BY fecha DESC LIMIT 1` lo recorre
+hacia atrás). Verificado con `EXPLAIN`: el plan usa `tasa_cambio_dia_unica` y no
+hizo falta ningún índice nuevo.
+
+Con todo, seamos honestos sobre la magnitud: esta tabla acumula del orden de
+**dos mil filas al año** por restaurante. Cualquier índice serviría. La decisión
+que importa aquí es la de **unicidad** —qué combinación es "la misma tasa"—, no
+el rendimiento. El índice histórico `(restaurante_id, fecha DESC)` se deja como
+estaba: sirve a la gráfica del panel, que mezcla divisas.
+
+### 10.4 ⭐ El riesgo real, y por qué se cierra en la base
+
+Este es el motivo por el que este cambio no es sólo "una columna más".
+
+Las dos consultas que eligen la tasa **no filtraban divisa**:
+
+```ts
+// comandas.service.ts §cobrar
+tx.tasaCambio.findFirst({ where: { restauranteId }, orderBy: { fecha: 'desc' } })
+// tasa.service.ts §vigente
+this.prisma.tasaCambio.findFirst({ where: { restauranteId }, orderBy: [...] })
+```
+
+El día que exista una fila de euro, esas consultas pueden devolverla. El
+escenario no es rebuscado: basta con que el dueño cargue hoy el euro y el
+último dólar sea de ayer — o con que el job del euro corra y el del dólar falle.
+Reproducido en la verificación:
+
+```
+Consulta VIEJA (sin filtro):  divisa=EUR valor=990.00000000
+Consulta NUEVA (divisa=USD):  divisa=USD valor=915.00000000
+→ cada bolívar cobrado se convertiría con un 8,2 % de error
+```
+
+Y es un error **silencioso**: no lanza excepción, no rompe el cuadre de la
+comanda (los pagos se comparan contra el mismo total mal convertido), y sólo se
+manifiesta días después como un cierre de caja que no da. Entre el dólar y el
+euro hay un 8-15 %; sobre la facturación de un mes, eso es mucho dinero.
+
+Arreglar las dos consultas es obligatorio, pero **no es suficiente**: la
+prohibición no puede depender de que nadie olvide un `where` en el futuro. Se
+pone en la base, como el resto de invariantes de este esquema:
+
+| Objeto | Qué impide |
+|---|---|
+| trigger `comanda_tasa_base` | Que una comanda congele una tasa cuya divisa no sea USD |
+| trigger `tasa_divisa_inmutable` | Que una tasa ya congelada por una comanda se convierta *después* en euro con un `UPDATE` |
+
+El segundo existe porque sin él el primero tiene una puerta trasera: el chequeo
+ocurre al escribir en `comanda`, así que un `UPDATE tasa_cambio SET divisa`
+posterior pasaría desapercibido. Además es la regla correcta por sí sola —una
+cotización del dólar no se *convierte* en una del euro, se registra otra fila.
+
+**Por qué triggers y no una columna `comanda.tasa_divisa` + FK compuesta.** La
+FK compuesta `(restaurante_id, tasa_id, tasa_divisa)` → `tasa_cambio` con un
+`CHECK tasa_divisa = 'USD'` también funcionaría, y de forma declarativa. Se
+descartó por la misma razón que en §2 con `salon_id`: **una columna copiada crea
+un segundo problema**, mantenerla sincronizada. Y aquí tiene un coste extra —
+`Comanda` es una entidad del contrato con el frontend, y le añadiría un campo
+redundante que nadie usa. Los triggers dan la misma garantía sin tocar
+`Comanda` ni `ComandaPago`.
+
+El trigger de `comanda` sale temprano si `tasa_id` es NULL o no cambió, así que
+el `SELECT` extra ocurre **una vez por cobro**, no en cada recálculo de totales
+al agregar una ronda. Verificado que ni el `UPDATE` de totales ni el de `notas`
+lo disparan.
+
+### 10.5 Qué se permite y qué no (verificado)
+
+| Caso | Resultado |
+|---|---|
+| Dólar y euro, mismo día y misma fuente | ✅ conviven |
+| Dos tasas del mismo día, divisa y fuente | ❌ `23505 tasa_cambio_dia_unica` |
+| Misma divisa y día, fuente distinta (BCV vs Binance) | ✅ permitido |
+| Congelar la tasa del **euro** al cobrar | ❌ `23514 comanda_tasa_base` |
+| Congelar la tasa del **dólar** al cobrar | ✅ sin falso positivo |
+| `UPDATE tasa SET divisa='EUR'` | ❌ `23514 tasa_divisa_inmutable` |
+| `UPDATE tasa SET valor=...` (corregir un tipeo) | ✅ y **no** reescribe la ya congelada en la comanda |
+| Un pago en euros | ❌ imposible de expresar (`22P02`) |
+
+La penúltima fila es la que hace seguro que `POST /tasa` sea un **upsert**:
+corregir la tasa de hoy es una operación normal y no toca ningún ticket ya
+emitido, porque el cobro **copia** el valor a `comanda.tasa_valor`. Ese es
+exactamente el trabajo que hacen las columnas congeladas (§D10).
+
+### 10.6 Un desempate que faltaba desde antes
+
+Al verificar apareció un problema **anterior** a las divisas: con dos fuentes
+para el mismo día (BCV y Binance), `ORDER BY fecha DESC LIMIT 1` no es
+determinista — Postgres devuelve la fila que le conviene y el resultado puede
+cambiar entre ejecuciones. `vigente()` ya desempataba con `creada_en DESC`;
+`cobrar()` no.
+
+Queda fijado en el contrato: **`ORDER BY fecha DESC, creada_en DESC`** en las
+dos. `fuente` es metadato para mostrar de dónde salió el número, no un selector:
+gana la última registrada.
+
+### 10.7 Orden de despliegue
+
+Aplicar la migración sola es seguro: no crea ninguna fila de euro. Lo que no es
+seguro es **exponer el alta de euro con el backend viejo**. El orden es:
+
+1. Migración (`prisma migrate deploy`) + `npm run db:verify`.
+2. Backend con el filtro `divisa: 'USD'` en `cobrar()` y en `vigente()`.
+3. Recién entonces, la UI que registra la tasa del euro.
+
+Si se invierten 2 y 3, el trigger evita el cobro equivocado —pero convirtiendo
+cada cobro en un 500. La red de seguridad no sustituye al orden correcto.
