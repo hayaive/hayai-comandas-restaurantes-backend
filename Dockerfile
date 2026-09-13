@@ -20,13 +20,17 @@ WORKDIR /app
 ENV NODE_ENV=production
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+RUN npm ci
 
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/src/generated ./dist/generated
 COPY --from=build /app/prisma ./prisma
 COPY --from=build /app/prisma7.config.ts ./prisma7.config.ts
 COPY --from=build /app/scripts ./scripts
+COPY --from=build /app/tsconfig.json ./tsconfig.json
+# TEMP: fuente TS completa sólo para poder correr `db:seed` (ts-node) una vez
+# contra produccion. Revertir junto con prestart:prod y `npm ci --omit=dev`.
+COPY --from=build /app/src ./src
 
 EXPOSE 3000
 
