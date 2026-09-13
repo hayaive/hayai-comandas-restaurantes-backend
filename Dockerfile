@@ -17,10 +17,10 @@ RUN npm run build
 # ── Etapa final: sólo lo necesario para correr ───────────────────────────────
 FROM node:22-slim AS runtime
 WORKDIR /app
-ENV NODE_ENV=production
 
 COPY package.json package-lock.json ./
 RUN npm ci
+ENV NODE_ENV=production
 
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/src/generated ./dist/generated
