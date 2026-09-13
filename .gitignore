@@ -1,0 +1,31 @@
+# dependencias
+/node_modules
+
+# build
+/dist
+/build
+
+# prisma client generado
+/src/generated
+
+# entorno
+.env
+.env.*.local
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# editor / os
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+
+# coverage
+/coverage
+
+# temporales
+*.tmp
