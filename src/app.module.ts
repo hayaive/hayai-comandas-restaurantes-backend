@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { ScheduleModule } from '@nestjs/schedule';
 import { ComunModule } from './comun/comun.module';
 import { JwtAuthGuard } from './comun/guards/jwt-auth.guard';
 import { AuthModule } from './auth/auth.module';
@@ -15,6 +16,7 @@ import { ReportesModule } from './reportes/reportes.module';
 @Module({
   imports: [
     ComunModule,
+    ScheduleModule.forRoot(),
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 120 }]),
     AuthModule,
     SalonesModule,

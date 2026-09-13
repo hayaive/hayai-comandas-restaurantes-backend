@@ -43,4 +43,16 @@ export class TasaController {
   crear(@UsuarioActual() u: UsuarioSesion, @Body() dto: CrearTasaDto) {
     return this.tasa.crear(u.restauranteId, u.id, dto);
   }
+
+  /**
+   * Refresco manual: repite el mismo fetch a dolarapi.com que corre el cron
+   * cada 6 horas, sin esperar al próximo tick. Endpoint separado (en vez de
+   * sobrecargar `POST /tasa` sin body) porque `CrearTasaDto` exige `valor` y
+   * `fuente` — no hay forma de "no traer body especial" sin relajar esa
+   * validación para el resto de usos manuales.
+   */
+  @Post('actualizar')
+  actualizar(@UsuarioActual() u: UsuarioSesion) {
+    return this.tasa.actualizarDesdeApiExterna(u.restauranteId);
+  }
 }
