@@ -1,0 +1,208 @@
+import {
+  ArgumentsHost,
+  Catch,
+  ExceptionFilter,
+  HttpException,
+  Logger,
+} from '@nestjs/common';
+import type { Response } from 'express';
+import { Prisma } from '../../generated/prisma/client';
+
+interface TraduccionError {
+  http: number;
+  mensaje: string;
+}
+
+/**
+ * Traducción de errores de Postgres → HTTP, según CONTRACT.md §4.
+ *
+ * La mayoría de estos invariantes viven en `prisma/sql/` (índices parciales,
+ * EXCLUDE, CHECK, triggers) y Prisma NO los conoce: el nombre del constraint
+ * es lo único estable para identificarlos, así que la traducción se hace por
+ * nombre de constraint, no por código de Prisma (que para un objeto que
+ * Prisma no modela cae en genérico).
+ */
+const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
+  // 23P01 — EXCLUDE
+  reservacion_sin_solape: { http: 409, mensaje: 'Esa mesa ya está reservada en ese horario' },
+
+  // 23505 — únicos (parciales o normales)
+  comanda_mesa_activa_unica: { http: 409, mensaje: 'La mesa ya tiene una comanda abierta' },
+  plantilla_activa_unica: { http: 409, mensaje: 'Ese salón ya tiene una plantilla activa' },
+  mesa_etiqueta_unica: { http: 409, mensaje: 'Ya existe una mesa con ese número' },
+  salon_nombre_unico: { http: 409, mensaje: 'Ya existe un salón con ese nombre' },
+  categoria_nombre_unica: { http: 409, mensaje: 'Ya existe una categoría con ese nombre' },
+  producto_nombre_unico: { http: 409, mensaje: 'Ya existe un producto activo con ese nombre' },
+  producto_codigo_unico: { http: 409, mensaje: 'Ya existe un producto activo con ese código' },
+  comanda_numero_dia_unico: {
+    http: 500,
+    mensaje: 'Error interno: el número de comanda se generó sin pasar por el contador',
+  },
+  comanda_reservacion_unica: { http: 409, mensaje: 'Esa reservación ya tiene una comanda abierta' },
+  usuario_unico_por_restaurante: { http: 409, mensaje: 'Ya existe un usuario con ese nombre de usuario' },
+  reservacion_codigo_publico_key: { http: 500, mensaje: 'Error interno generando el código de la reserva' },
+  restaurante_slug_key: { http: 409, mensaje: 'Ya existe un restaurante con ese slug' },
+  tasa_cambio_dia_unica: { http: 409, mensaje: 'Ya existe una tasa registrada para esa fecha y fuente' },
+
+  // 23503 — FK
+  plantilla_mesa_restaurante_id_mesa_id_fkey: {
+    http: 422,
+    mensaje: 'La mesa no existe o no pertenece a este restaurante',
+  },
+
+  // 23514 — CHECK / trigger de validación
+  plantilla_mesa_mismo_salon: { http: 422, mensaje: 'Esa mesa pertenece a otro salón' },
+  plantilla_mesa_capacidad_valida: { http: 422, mensaje: 'La capacidad debe estar entre 1 y 50' },
+  plantilla_mesa_rotacion_valida: { http: 422, mensaje: 'La rotación debe estar entre 0 y 359 grados' },
+  plantilla_mesa_tamano_valido: { http: 422, mensaje: 'El ancho y el alto deben ser mayores que 0' },
+  plantilla_mesa_posicion_valida: { http: 422, mensaje: 'La posición no puede ser negativa' },
+  mesa_capacidad_valida: { http: 422, mensaje: 'La capacidad por defecto debe estar entre 1 y 50' },
+  mesa_etiqueta_no_vacia: { http: 422, mensaje: 'La etiqueta de la mesa no puede estar vacía' },
+  plantilla_plano_valido: { http: 422, mensaje: 'El ancho y el alto del plano deben ser mayores que 0' },
+  reservacion_rango_valido: { http: 422, mensaje: 'La reserva debe terminar después de que empieza' },
+  reservacion_personas_valida: { http: 422, mensaje: 'El número de personas debe estar entre 1 y 200' },
+  producto_precio_valido: { http: 422, mensaje: 'El precio no puede ser negativo' },
+  producto_costo_valido: { http: 422, mensaje: 'El costo no puede ser negativo' },
+  comanda_item_cantidad_valida: { http: 422, mensaje: 'La cantidad debe ser mayor que 0' },
+  comanda_item_precio_valido: { http: 422, mensaje: 'El precio del ítem no puede ser negativo' },
+  comanda_item_descuento_valido: { http: 422, mensaje: 'El descuento de línea no puede ser negativo' },
+  comanda_tipo_coherente: {
+    http: 422,
+    mensaje: 'Una comanda de mesa exige mesa, salón y plantilla; una para llevar no lleva mesa',
+  },
+  comanda_totales_validos: { http: 422, mensaje: 'Los totales de la comanda no pueden ser negativos' },
+  comanda_cierre_coherente: { http: 422, mensaje: 'El estado de la comanda es incoherente con su fecha de cierre' },
+  comanda_tasa_congelada: { http: 422, mensaje: 'No se puede cobrar sin congelar antes la tasa de cambio' },
+  pago_monto_valido: { http: 422, mensaje: 'El monto del pago debe ser mayor que 0' },
+  pago_referencia_obligatoria: {
+    http: 422,
+    mensaje: 'Pago móvil y transferencia exigen un número de referencia',
+  },
+  pago_tasa_coherente: {
+    http: 422,
+    mensaje: 'Un pago en Bs exige la tasa aplicada; uno en USD no debe llevarla',
+  },
+  tasa_valor_valido: { http: 422, mensaje: 'La tasa debe ser mayor que 0' },
+};
+
+const MAPA_SQLSTATE: Record<string, TraduccionError> = {
+  '23P01': { http: 409, mensaje: 'Ese recurso ya está reservado / ocupado en ese rango' },
+  '23505': { http: 409, mensaje: 'Ya existe un registro con esos datos' },
+  '23503': { http: 422, mensaje: 'El registro referenciado no existe' },
+  '23514': { http: 422, mensaje: 'Los datos no cumplen una regla de negocio' },
+  '22007': { http: 422, mensaje: 'Fecha u hora con formato inválido' },
+  '22P02': { http: 422, mensaje: 'Valor con formato inválido' },
+};
+
+function extraerNombreConstraint(mensaje: string | undefined): string | undefined {
+  if (!mensaje) return undefined;
+  const patrones = [
+    /constraint "([a-zA-Z0-9_]+)"/,
+    /constraint `([a-zA-Z0-9_]+)`/,
+    /índice "([a-zA-Z0-9_]+)"/,
+    /index "([a-zA-Z0-9_]+)"/,
+  ];
+  for (const patron of patrones) {
+    const m = mensaje.match(patron);
+    if (m) return m[1];
+  }
+  return undefined;
+}
+
+function extraerSqlstate(mensaje: string | undefined): string | undefined {
+  if (!mensaje) return undefined;
+  const m = mensaje.match(/\b(2[0-9A-Z]{4})\b/);
+  return m ? m[1] : undefined;
+}
+
+@Catch()
+export class PgErrorFilter implements ExceptionFilter {
+  private readonly logger = new Logger(PgErrorFilter.name);
+
+  catch(exception: unknown, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const res = ctx.getResponse<Response>();
+
+    // Las excepciones HTTP normales (NotFoundException, BadRequestException de
+    // class-validator, las nuestras propias, etc.) pasan intactas.
+    if (exception instanceof HttpException) {
+      const status = exception.getStatus();
+      const body = exception.getResponse();
+      res.status(status).json(typeof body === 'string' ? { statusCode: status, message: body } : body);
+      return;
+    }
+
+    const traduccion = this.traducir(exception);
+    if (traduccion) {
+      res.status(traduccion.http).json({ statusCode: traduccion.http, message: traduccion.mensaje });
+      return;
+    }
+
+    this.logger.error('Error no controlado', exception instanceof Error ? exception.stack : exception);
+    res.status(500).json({ statusCode: 500, message: 'Error interno del servidor' });
+  }
+
+  private traducir(exception: unknown): TraduccionError | undefined {
+    if (exception instanceof Prisma.PrismaClientKnownRequestError) {
+      if (process.env.DEBUG_PG_ERRORS === '1') {
+        this.logger.warn(`DEBUG code=${exception.code} meta=${JSON.stringify(exception.meta)} msg=${exception.message}`);
+      }
+      // Prisma 7 + @prisma/adapter-pg: el error real del driver `pg` viaja en
+      // meta.driverAdapterError.cause, con el SQLSTATE y el nombre del
+      // constraint/índice ya separados — la fuente más confiable.
+      const driverCause = (exception.meta as any)?.driverAdapterError?.cause;
+      if (driverCause) {
+        const nombreDriver =
+          driverCause.constraint?.index ??
+          driverCause.constraint?.name ??
+          (typeof driverCause.constraint === 'string' ? driverCause.constraint : undefined) ??
+          extraerNombreConstraint(driverCause.originalMessage);
+        if (nombreDriver && MAPA_CONSTRAINTS[nombreDriver]) return MAPA_CONSTRAINTS[nombreDriver];
+
+        const sqlstateDriver = driverCause.originalCode;
+        if (sqlstateDriver && MAPA_SQLSTATE[sqlstateDriver]) return MAPA_SQLSTATE[sqlstateDriver];
+      }
+
+      const metaMensaje =
+        (typeof exception.meta?.message === 'string' && exception.meta.message) ||
+        (typeof (exception.meta as any)?.cause === 'string' && (exception.meta as any).cause) ||
+        undefined;
+      const nombre = extraerNombreConstraint(metaMensaje ?? exception.message);
+      if (nombre && MAPA_CONSTRAINTS[nombre]) return MAPA_CONSTRAINTS[nombre];
+
+      const sqlstate =
+        (typeof exception.meta?.code === 'string' ? exception.meta.code : undefined) ??
+        extraerSqlstate(metaMensaje ?? exception.message);
+      if (sqlstate && MAPA_SQLSTATE[sqlstate]) return MAPA_SQLSTATE[sqlstate];
+
+      switch (exception.code) {
+        case 'P2002':
+          return { http: 409, mensaje: 'Ya existe un registro con esos datos' };
+        case 'P2003':
+          return { http: 422, mensaje: 'El registro referenciado no existe' };
+        case 'P2025':
+          return { http: 404, mensaje: 'Registro no encontrado' };
+        case 'P2004':
+          return { http: 422, mensaje: 'Los datos no cumplen una regla de negocio' };
+        default:
+          return undefined;
+      }
+    }
+
+    if (
+      exception instanceof Prisma.PrismaClientUnknownRequestError ||
+      exception instanceof Prisma.PrismaClientRustPanicError
+    ) {
+      const nombre = extraerNombreConstraint(exception.message);
+      if (nombre && MAPA_CONSTRAINTS[nombre]) return MAPA_CONSTRAINTS[nombre];
+      const sqlstate = extraerSqlstate(exception.message);
+      if (sqlstate && MAPA_SQLSTATE[sqlstate]) return MAPA_SQLSTATE[sqlstate];
+    }
+
+    if (exception instanceof Prisma.PrismaClientValidationError) {
+      return { http: 422, mensaje: 'Datos inválidos para la operación solicitada' };
+    }
+
+    return undefined;
+  }
+}
