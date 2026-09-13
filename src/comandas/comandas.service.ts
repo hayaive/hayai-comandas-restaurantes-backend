@@ -334,9 +334,16 @@ export class ComandasService {
       const total = subtotal.minus(descuento).plus(comanda.impuesto).plus(propina);
       if (total.lt(0)) throw new BadRequestException('El descuento no puede superar el subtotal');
 
+      // ⚠️ El cobro SIEMPRE se hace contra la tasa del dólar (moneda base). El
+      // euro es sólo informativo (ver TasaCambio en prisma/schema.prisma y
+      // docs/DECISIONES-DATOS.md §10.4): filtrar `divisa: 'USD'` no es opcional,
+      // es lo que evita convertir un cobro en bolívares con la cotización del
+      // euro. El desempate `creadaEn: 'desc'` es obligatorio cuando conviven
+      // varias `fuente` (BCV y Binance) para el mismo día — sin él Postgres
+      // puede devolver cualquiera de las dos (§10.6).
       const tasa = await tx.tasaCambio.findFirst({
-        where: { restauranteId },
-        orderBy: { fecha: 'desc' },
+        where: { restauranteId, divisa: 'USD' },
+        orderBy: [{ fecha: 'desc' }, { creadaEn: 'desc' }],
       });
       if (!tasa) {
         throw new BadRequestException('No hay una tasa de cambio registrada; regístrala antes de cobrar');
