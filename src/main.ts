@@ -5,13 +5,8 @@ import { Logger } from '@nestjs/common';
 import { AppModule } from './app.module';
 import { configurarApp } from './configurar-app';
 
-// Postgres devuelve BIGINT (los count(*) de las vistas de reporte) como
-// BigInt en JS vía el driver adapter; JSON.stringify no sabe serializarlo.
-// Los conteos de este dominio (comandas, ítems) nunca acercan
-// Number.MAX_SAFE_INTEGER, así que convertir a Number es seguro.
-(BigInt.prototype as any).toJSON = function () {
-  return Number(this);
-};
+// El parche de serialización de BigInt vive en `configurar-app.ts`, que es lo
+// que comparten producción y los tests e2e (ver comun/json-bigint.ts).
 
 function origenesPermitidos(): string[] {
   const desdeEnv = (process.env.CORS_ORIGIN ?? '')

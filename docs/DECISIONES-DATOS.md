@@ -2,6 +2,7 @@
 
 > Autor: **J.O.R.B.I** (data-engineer) · 2026-09-12
 > Ampliado el 2026-09-13 con §D13/§D14 y §10 (tasa del euro).
+> Ampliado el 2026-09-14 con §D15 y §11 (ventas por mes y por año).
 > Acompaña a `prisma/schema.prisma`, `prisma/sql/` y `CONTRACT.md`.
 >
 > **Estado de verificación:** el esquema completo (DDL de Prisma + los 5 archivos
@@ -30,6 +31,7 @@
 | D12 | FKs compuestas `(restaurante_id, id)` | FK simple por `id` | Referenciar datos de otro restaurante deja de ser un bug de permisos y pasa a ser una violación de constraint |
 | D13 | Enum `Divisa` ('USD','EUR') **aparte** de `Moneda` ('USD','BS') | Añadir `EUR` al enum `Moneda` | `Moneda` es el dominio del COBRO; un `EUR` ahí lo aceptaría el DTO de pago y el cálculo lo trataría como bolívares |
 | D14 | `tasa_cambio.divisa` con `DEFAULT 'USD'`; el cobro sólo admite USD, y lo impide un trigger | Tabla aparte para el euro / confiar en que el código filtre | Una tabla gemela se fusionaría el día que el euro se cobre; y un filtro olvidado cuesta ~8-15 % en cada bolívar cobrado |
+| D15 | Mes y año como `GROUP BY` sobre `v_venta_dia`, sin vistas nuevas | `v_venta_mes` / `v_venta_anio` | El mes ES la suma de sus días operativos; una vista aparte sería una segunda definición de "qué cuenta como venta", y el año ya se agrega en ~77 ms con 73k comandas |
 
 ---
 
@@ -477,3 +479,98 @@ seguro es **exponer el alta de euro con el backend viejo**. El orden es:
 
 Si se invierten 2 y 3, el trigger evita el cobro equivocado —pero convirtiendo
 cada cobro en un 500. La red de seguridad no sustituye al orden correcto.
+
+---
+
+## 11 · Ventas por mes y por año          *(añadido 2026-09-14)*
+
+> **Estado de verificación:** el esquema se aplicó sobre **PostgreSQL 17.5** y
+> `GET /reportes/ventas` se ejercitó de punta a punta contra esa base
+> (`test/reportes-periodo.e2e-spec.ts`, 12 aserciones, todas pasan). Dos
+> defectos aparecieron ahí y no antes; están explicados abajo.
+
+El pedido fue: *"en ventas debo ver un apartado con filtro de lo que se hizo en
+el día, lo que se hizo en el mes y lo que va en el año"*.
+
+### 11.1 Sin objetos nuevos en la base
+
+No se creó ninguna vista. El mes **es** la suma de sus días operativos, y esa
+suma es un `GROUP BY` sobre `v_venta_dia` filtrando `fecha_operativa BETWEEN`.
+Una `v_venta_mes` sería una **segunda definición de "qué cuenta como venta"**
+—hoy: `estado = 'cobrada'`, `ventas_usd` sin propina— capaz de quedarse atrás
+el día que la primera cambie. Es el mismo argumento de §2 contra duplicar
+`salon_id`: una copia crea el problema de mantenerla sincronizada.
+
+Y no compra rendimiento: medido con 73.000 comandas y 219.000 líneas de un año
+(200 comandas diarias, por encima del caso real), el total del año responde en
+**~77 ms** sobre un Postgres wasm de 32 bits. El predicado
+`(restaurante_id, fecha_operativa)` son columnas de agrupación de la vista, así
+que Postgres lo empuja al índice
+`comanda (restaurante_id, fecha_operativa, estado)` en vez de agregar la tabla
+entera.
+
+Cero DDL tiene además un beneficio que este esquema valora: no añade objetos a
+la lista de `99_verificar_objetos.sql` ni superficie a la trampa de §8.
+
+### 11.2 El calendario se calcula en SQL, no en TypeScript
+
+`GET /reportes/ventas` recibe un día ancla opcional y resuelve el rango **en la
+base**, por tres razones:
+
+1. El día operativo sale de `hayai_fecha_operativa(now(), zona, corte)`, la
+   misma función que materializa `comanda.fecha_operativa` (§5). Calcularlo en
+   el backend sería la segunda implementación de la regla.
+2. Fin de mes y bisiestos los sabe el calendario de Postgres:
+   `date '2026-03-31' - interval '1 month'` es el 28 de febrero, sin casos
+   especiales. `setMonth()` en JavaScript da el 3 de marzo.
+3. El proceso Node corre con la zona del servidor, que no es la del restaurante.
+
+Esto **cierra un agujero anterior**: el frontend calculaba el día operativo en
+el navegador asumiendo corte a las 05:00 y zona local (`useSalesReport.ts`, con
+un comentario admitiendo que habría que alimentarlo desde el backend). Ahora
+`fecha` es opcional en los cuatro endpoints de reporte y la respuesta trae el
+día resuelto.
+
+### 11.3 Los dos defectos que sólo aparecieron al verificar
+
+**El promedio de promedios.** `v_venta_dia.ticket_promedio_usd` es un `avg` por
+día y turno. Re-agregarlo con otro `avg` da el promedio de los promedios: con
+un día de 3 comandas (100+200+50) y otro de 2 (40+60) sale 83,33, que no es el
+ticket de nadie. El ticket del período se calcula `sum(total)/sum(comandas)` =
+90,00. Por el mismo motivo **no se devuelve `comensalesPromedio`**: la vista lo
+define como `avg(NULLIF(comensales,0))` y esa definición no se puede re-agregar
+sin exponer `comandas_con_comensales`. Si la pantalla lo pide, se añade esa
+columna a la vista; inventarle otra fórmula daría dos verdades para el mismo
+número.
+
+**La comparación entre meses de distinto largo.** La regla intuitiva —restar un
+mes a `hasta`— rompe en silencio: junio cerrado tiene `hasta = 30-jun`, y
+`30-jun - 1 mes` es el **30 de mayo**, así que la comparación perdía el 31 de
+mayo. La regla correcta distingue: período cerrado → el anterior **completo**;
+período en curso → el **mismo número de días transcurridos**. El fin del
+período anterior es siempre `desde - 1`, porque `desde` es el propio día, el
+día 1 del mes o el 1 de enero. No hace falta un `CASE`.
+
+### 11.4 Detalles que el contrato fija
+
+- **Dinero como texto.** Las columnas son `numeric(14,4)`; se devuelven con
+  `round(...,4)::text`. Un float de JavaScript mete error de redondeo justo
+  donde se cuadra la caja.
+- **Serie densa.** Los turnos sin venta, los días cerrados y los meses que aún
+  no llegaron se devuelven en cero (`generate_series` / `enum_range` +
+  `LEFT JOIN`). Una serie con huecos hace que una gráfica comprima el eje y
+  dibuje un mes sin domingos como si se hubiera vendido todos los días.
+- **`periodo` se valida.** Entra en un `CASE` cuya rama `ELSE` es el año: sin
+  `@IsIn`, un `?periodo=semana` devolvería el año sin avisar de nada.
+- **El cierre de caja sigue siendo diario.** `v_venta_dia_metodo` por rango
+  sería trivial de añadir, pero cuadrar caja es una operación de un día; un
+  acumulado mensual por método es otra pregunta y entrará cuando se pida.
+
+### 11.5 Un efecto colateral que vale la pena conocer
+
+El parche que hace serializable `BigInt` (los `count(*)` de las vistas llegan
+como BigInt por el driver adapter) vivía en `main.ts`, que **los tests e2e no
+ejecutan**: arrancan `AppModule` + `configurarApp`. Resultado: cualquier
+endpoint de reportes respondía 200 en producción y 500 en los tests. Se movió a
+`src/comun/json-bigint.ts` y se llama desde `configurarApp`, que es
+precisamente lo que existe para que producción y tests no diverjan.

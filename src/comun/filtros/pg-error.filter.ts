@@ -105,6 +105,9 @@ const MAPA_SQLSTATE: Record<string, TraduccionError> = {
   '23503': { http: 422, mensaje: 'El registro referenciado no existe' },
   '23514': { http: 422, mensaje: 'Los datos no cumplen una regla de negocio' },
   '22007': { http: 422, mensaje: 'Fecha u hora con formato inválido' },
+  // 31 de febrero: el formato es correcto pero la fecha no existe. Sin esta
+  // línea un `?fecha=2026-02-31` cae en el 500 genérico.
+  '22008': { http: 422, mensaje: 'Esa fecha no existe en el calendario' },
   '22P02': { http: 422, mensaje: 'Valor con formato inválido' },
 };
 

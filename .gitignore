@@ -4,6 +4,8 @@
 # build
 /dist
 /build
+# `incremental: true` en tsconfig deja esto en la raíz en cada `npm run build`.
+*.tsbuildinfo
 
 # prisma client generado
 /src/generated

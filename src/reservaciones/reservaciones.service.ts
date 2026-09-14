@@ -139,7 +139,7 @@ export class ReservacionesService {
       throw new ConflictException('Esa reservación ya no se puede editar');
     }
 
-    let mesaId = dto.mesaId !== undefined ? dto.mesaId : reservacion.mesaId;
+    const mesaId = dto.mesaId !== undefined ? dto.mesaId : reservacion.mesaId;
     if (dto.mesaId) {
       await this.validarMesaDisponibleEnPlantilla(this.prisma, restauranteId, reservacion.plantillaId, dto.mesaId);
     }

@@ -1,0 +1,10 @@
+{
+  "//": "Sólo para ESLint. `tsconfig.json` excluye `test/` (y fija rootDir en src) porque es el de compilar; el script de lint sí cubre `{src,test}`, así que el parser con tipos necesita un proyecto que incluya las dos carpetas.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "./",
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "dist", "src/generated"]
+}

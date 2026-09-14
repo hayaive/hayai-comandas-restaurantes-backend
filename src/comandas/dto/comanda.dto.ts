@@ -9,7 +9,6 @@ import {
   IsPositive,
   IsString,
   IsUUID,
-  Max,
   MaxLength,
   Min,
   ValidateNested,

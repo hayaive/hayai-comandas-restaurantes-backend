@@ -37,7 +37,8 @@ Las tres ideas que hay que entender antes de tocar código:
    `por_cobrar`. La base garantiza que no puede haber dos.
 3. **El día operativo no es `creado_en::date`.** Es `fecha_operativa`, calculada
    al abrir la comanda con la hora de corte del restaurante. Todos los reportes
-   agrupan por ahí.
+   agrupan por ahí — y el mes y el año son la **suma de esos días**, no un rango
+   de timestamps (§5, `GET /reportes/ventas`).
 
 ---
 
@@ -477,13 +478,137 @@ GET    /cocina/cola?destino=cocina|barra                         -> ItemCola[]
 
 ### Reportes y tasa
 ```
-GET    /reportes/dia?fecha=                                      -> { porTurno: VentaDia[], total: VentaDia }
-GET    /reportes/productos?desde=&hasta=&orden=cantidad|ingreso&limite=
+GET    /reportes/ventas?periodo=dia|mes|anio&fecha=              -> ReporteVentas
+GET    /reportes/productos?periodo=&fecha=&desde=&hasta=&orden=cantidad|ingreso&limite=
                                                                  -> ProductoVendido[]
+GET    /reportes/dia?fecha=                                      -> { porTurno: VentaDia[], total: VentaDia }
 GET    /reportes/cierre-caja?fecha=                              -> { porMetodo: VentaMetodo[], descuadres: Descuadre[] }
 GET    /tasa/vigente                                             -> TasasVigentes
 POST   /tasa                       CrearTasaDto                  -> TasaCambio
 ```
+
+En los cuatro endpoints de reporte **`fecha` es opcional**: ausente significa
+*el día operativo en curso*, y lo resuelve el backend. Ver abajo por qué eso
+importa.
+
+#### `GET /reportes/ventas` — el apartado de ventas (día / mes / año)
+
+Un solo endpoint para los tres filtros. La respuesta tiene **la misma forma en
+los tres casos**, así que tres rutas (`/dia`, `/mes`, `/anio`) serían tres
+copias del mismo handler y obligarían al frontend a elegir función según el
+botón pulsado en vez de pasar el filtro como dato.
+
+```ts
+type PeriodoReporte = 'dia' | 'mes' | 'anio';   // sin eñe: viaja en la URL
+type GranularidadSerie = 'turno' | 'dia' | 'mes';
+
+interface ReporteVentas {
+  periodo: PeriodoReporte;
+  /** Día operativo ancla ya resuelto, 'YYYY-MM-DD'. */
+  fecha: string;
+  /** Primer y último día operativo incluidos, ambos inclusive. */
+  desde: string;
+  hasta: string;
+  /** El tramo llega a hoy: la cifra todavía se mueve. */
+  enCurso: boolean;
+  total: VentaResumen;
+  granularidad: GranularidadSerie;
+  /** Desglose interno, DENSO (los buckets sin venta vienen en cero). */
+  serie: VentaPunto[];
+  comparacion: { desde: string; hasta: string; total: VentaResumen };
+}
+
+interface VentaResumen {
+  comandas: number;
+  comensales: number;
+  totalUsd: string;
+  /** Total SIN propina: la propina es del mesero, no ingreso del local. */
+  ventasUsd: string;
+  propinasUsd: string;
+  descuentosUsd: string;
+  impuestosUsd: string;
+  /** totalUsd / comandas. '0.0000' si el tramo no tuvo ventas. */
+  ticketPromedioUsd: string;
+}
+
+interface VentaPunto extends VentaResumen {
+  /** 'almuerzo' | '2026-09-14' | '2026-09', según `granularidad`. */
+  clave: string;
+}
+```
+
+| `periodo` | Rango | `granularidad` | `serie` |
+|---|---|---|---|
+| `dia` | ese día operativo | `turno` | 4 puntos: desayuno, almuerzo, cena, madrugada |
+| `mes` | del 1 al fin de mes, recortado a hoy | `dia` | un punto por día operativo |
+| `anio` | del 1-ene al 31-dic, recortado a hoy | `mes` | un punto por mes |
+
+**Todo se agrega por día operativo, no por calendario.** Es la regla de la que
+cuelga que el reporte sea correcto: `comanda.fecha_operativa` se materializa al
+abrir con `hayai_fecha_operativa(now(), zona, hora_corte)` (§3.1,
+`docs/DECISIONES-DATOS.md §5`), y el mes y el año son la **suma de esos días**,
+no un `BETWEEN` sobre `creado_en`. Con corte a las 05:00, una comanda cobrada
+la 01:00 del 1 de octubre entra en **septiembre**. Verificado en
+`test/reportes-periodo.e2e-spec.ts`.
+
+**`fecha` la resuelve el backend.** Hoy `useSalesReport.ts` calcula el día
+operativo en el navegador asumiendo corte a las 05:00 y zona local — el propio
+comentario del archivo dice que habría que alimentarlo desde el backend. Ya se
+puede: llamar sin `fecha` devuelve el día operativo de verdad en `fecha`, y ese
+valor sirve para las demás llamadas (`cierre-caja`, etc.). El frontend no
+necesita saber ni la zona horaria ni la hora de corte.
+
+**`desde`/`hasta` vienen recortados a hoy.** Un mes en curso responde
+`2026-09-01 .. 2026-09-14`, no `.. 2026-09-30`, para que la UI pueda rotular el
+rango sin prometer un mes entero. `enCurso` dice si la cifra es parcial.
+
+**La comparación es honesta por construcción:** el período anterior **completo**
+si el consultado ya cerró (junio contra mayo entero, aunque mayo tenga 31 días),
+y el **mismo número de días transcurridos** si está en curso (1–14 de septiembre
+contra 1–14 de agosto). Comparar catorce días contra un mes completo, o recortar
+mayo a 30 días para que "quepa" en junio, son las dos formas fáciles de que el
+dashboard mienta.
+
+**El dinero viaja como `string`**, no como `number`: las columnas son
+`numeric(14,4)` y pasarlas por un float de JavaScript mete error de redondeo
+justo donde el dueño cuadra la caja. El frontend formatea; no opera.
+
+**La serie es densa**: los turnos sin venta, los días cerrados y los meses que
+aún no llegaron vienen en cero. Una serie con huecos hace que una gráfica de
+barras comprima el eje y dibuje un mes sin domingos como si se hubiera vendido
+todos los días.
+
+**Errores:** `periodo` fuera de la lista → **400** (sin validarlo, un
+`?periodo=semana` caería en la rama del año y devolvería el año sin avisar);
+`fecha` con formato distinto de `YYYY-MM-DD` → **400**; fecha inexistente
+(`2026-02-31`) → **422**.
+
+> ⚠️ **Convención de mayúsculas.** `/reportes/ventas` responde en camelCase, con
+> una forma propia que no depende de las columnas de la vista. Los otros tres
+> endpoints de reporte siguen devolviendo **filas crudas en snake_case**
+> (`total_usd`, `producto_nombre`) porque el frontend desplegado ya tiene
+> adaptadores para ellas (`httpClient.ts`). No es un descuido: cambiarlas
+> rompería la pantalla de hoy. Lo nuevo se escribe con la forma nueva.
+
+#### `GET /reportes/productos` — el mismo período, el mismo rango
+
+Acepta `periodo` y `fecha` igual que `/reportes/ventas`, para que el ranking del
+mes o del año no dependa de que el frontend adivine el rango de días operativos.
+Orden de resolución del rango:
+
+1. `periodo` (+ `fecha` opcional) — manda sobre todo lo demás;
+2. `desde` + `hasta` — el camino que usa el frontend desplegado, intacto;
+3. nada — el día operativo en curso. (Antes devolvía `[]` aunque el día tuviera
+   ventas: sin `desde`/`hasta` la consulta comparaba contra `NULL`.)
+
+La forma de las filas **no cambia** (snake_case, ver el aviso de arriba).
+
+#### `GET /reportes/dia` — sigue igual, y queda superado
+
+Misma ruta, misma respuesta, mismos nombres de campo. Lo único que cambia es que
+`fecha` pasa a ser opcional. `GET /reportes/ventas?periodo=dia` devuelve lo mismo
+y además el desglose por turno ya sumado, en camelCase: cuando la pantalla de
+ventas migre, este endpoint se puede retirar.
 
 #### `GET /tasa/vigente` — el dólar y el euro en UNA petición
 
@@ -579,6 +704,7 @@ verdad y la base no tiene forma de saber cuál es la magnitud correcta.
 | Pintar el plano con el estado de cada mesa | `SELECT * FROM v_mesa_estado WHERE plantilla_id = $1` |
 | Panel lateral de comandas activas | `SELECT * FROM v_comanda_activa WHERE restaurante_id = $1 ORDER BY abierta_en` |
 | Ventas del día y por turno | `SELECT * FROM v_venta_dia WHERE restaurante_id=$1 AND fecha_operativa=$2` |
+| **Ventas del mes / del año** | La MISMA vista con `fecha_operativa BETWEEN $2 AND $3`. El mes es la suma de sus días operativos: no hay vista nueva ni `date_trunc` sobre `creado_en` |
 | Cierre de caja por método de pago | `v_venta_dia_metodo` |
 | **Producto más vendido** | `SELECT * FROM v_producto_vendido_dia WHERE ... ORDER BY cantidad DESC LIMIT 10` (o `ingreso_usd DESC`) |
 | Cola de cocina | `comanda_item` con `estado IN ('pendiente','en_preparacion')` y `destino_snap = $1` |
@@ -597,11 +723,22 @@ verdad y la base no tiene forma de saber cuál es la magnitud correcta.
 |---|---|
 | Dividir la cuenta entre comensales | Tabla `comanda_cuenta` + `comanda_item.cuenta_id`. No toca lo existente |
 | Modificadores con precio ("extra queso +1$") | `comanda_item_modificador`; el snapshot ya está en la línea |
-| Rollup `resumen_dia` | La tabla ya está modelada. Se llena al cerrar/anular comanda y el dashboard histórico cambia de vista a tabla |
+| Rollup `resumen_dia` | La tabla ya está modelada. Se llena al cerrar/anular comanda y el dashboard histórico cambia de vista a tabla. **Todavía no hace falta**: medido abajo |
 | Vista materializada de reportes | Sólo si `v_producto_vendido_dia` pasa de ~300 ms. Ver `docs/DECISIONES-DATOS.md §Reportes` |
+| Vistas `v_venta_mes` / `v_venta_anio` | **Descartadas.** Serían una segunda definición de "qué cuenta como venta", capaz de quedarse atrás respecto a `v_venta_dia`, a cambio de un `GROUP BY` que ya es barato |
 | Multi-sucursal / SaaS | `restauranteId` ya está en todo: se activa `prisma/sql/03_rls.sql` |
 | Inventario y recetas | Tablas nuevas; `comanda_item` ya tiene el consumo por producto |
 | Auditoría completa | `evento_auditoria` como en hayai-saas. Hoy sólo hay trazas de anulación y cancelación |
+
+**La medida que sostiene "todavía no hace falta rollup"** (2026-09-14): con
+**73.000 comandas y 219.000 líneas** sembradas sobre un año —un restaurante de
+200 comandas diarias, muy por encima del caso real— el total del año completo
+sobre `v_venta_dia` responde en **~77 ms de mediana**. Y eso midiendo sobre un
+PostgreSQL 17 compilado a wasm de 32 bits, que es varias veces más lento que un
+servidor de verdad. El primero en acercarse al umbral será el ranking de
+productos del año (`v_producto_vendido_dia` cruza `comanda_item`), que es
+justo el caso que `docs/DECISIONES-DATOS.md §6` ya marcó en ~300 ms. El orden
+sigue siendo el de §D11: **primero medir, después desnormalizar.**
 
 ---
 
