@@ -2,8 +2,10 @@ import 'dotenv/config';
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { Logger } from '@nestjs/common';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { configurarApp } from './configurar-app';
+import { CARPETA_UPLOADS_RAIZ } from './uploads/uploads.service';
 
 // El parche de serialización de BigInt vive en `configurar-app.ts`, que es lo
 // que comparten producción y los tests e2e (ver comun/json-bigint.ts).
@@ -24,10 +26,17 @@ async function bootstrap() {
   // (wildcard + credentials no es válido). Por eso el login fallaba con CORS
   // error desde el dominio real aunque respondía bien por curl (curl no
   // aplica política de CORS). Hay que declarar el/los orígenes explícitos.
-  const app = await NestFactory.create(AppModule, {
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     cors: { origin: origenesPermitidos(), credentials: true },
   });
   configurarApp(app);
+
+  // Sirve `uploads/` como estáticos, FUERA del prefijo `/api/v1` (a propósito:
+  // así la URL que guarda `Producto.imagenUrl` es la misma que consume el
+  // <img> del frontend, sin que este tenga que conocer el prefijo de la API).
+  // ⚠️ Ver CARPETA_UPLOADS_RAIZ / CONTRACT.md: en Docker/Railway esta carpeta
+  // necesita un volumen persistente o las imágenes se pierden en cada deploy.
+  app.useStaticAssets(CARPETA_UPLOADS_RAIZ, { prefix: '/uploads' });
 
   const port = process.env.PORT ? Number(process.env.PORT) : 3000;
   await app.listen(port);

@@ -10,6 +10,10 @@
 # prisma client generado
 /src/generated
 
+# imágenes subidas por usuarios (ver CONTRACT.md: necesita volumen persistente
+# en producción, no vive en el control de versiones)
+/uploads
+
 # entorno
 .env
 .env.*.local

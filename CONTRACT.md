@@ -459,6 +459,57 @@ PATCH  /productos/:id/disponibilidad { disponible }              -> Producto
 DELETE /productos/:id                                            -> 204   (activo=false)
 ```
 
+### Uploads (imágenes)
+```
+POST   /uploads/productos          multipart/form-data { archivo: File } -> { url: string }
+```
+
+Sube la foto de un producto. **No** está acoplado a `POST /productos`: el
+frontend llama primero a este endpoint, y guarda la `url` que devuelve como
+`imagenUrl` en el `POST`/`PATCH` de producto ya existente — así el usuario
+puede subir/reemplazar la foto sin que eso dispare por sí solo un cambio de
+producto.
+
+- Campo del `multipart/form-data`: **`archivo`** (un solo archivo).
+- Exige sesión igual que el resto de `/productos` (no cuelga de `/publico`).
+- Tipos aceptados: `image/jpeg`, `image/png`, `image/webp`. Cualquier otro
+  mimetype → **400** `"Solo se permiten imágenes JPG, PNG o WEBP"`.
+- Tamaño máximo: **5MB**. Si se excede → **413** (Payload Too Large).
+- El nombre de archivo en disco es un `uuid` generado en el servidor con la
+  extensión derivada del mimetype ya validado — **nunca** el `originalname`
+  del cliente, ni para el nombre ni para la extensión (evita path traversal y
+  colisiones).
+- Se guarda en disco, LOCAL al proyecto backend, en `uploads/productos/` (raíz
+  del repo, hermano de `src/` — no dentro de `src/`, que se borra en cada
+  build). Constante: `CARPETA_UPLOADS_RAIZ` en `src/uploads/uploads.service.ts`.
+- Se sirve como estático con `app.useStaticAssets(...)` (`main.ts`), montado en
+  el prefijo `/uploads`, **fuera** de `/api/v1` a propósito: la URL que
+  devuelve el endpoint (`{ "url": "/uploads/productos/<uuid>.jpg" }`) es
+  exactamente la que consume el `<img>` del frontend, sin que este tenga que
+  conocer el prefijo de la API. Para pedirla completa: `<URL_BACKEND>` + esa
+  ruta (mismo host que el resto de la API).
+
+> ⚠️ **Infraestructura — pendiente de decisión antes de confiar en esto en
+> producción.** `uploads/` vive en el filesystem del contenedor. El
+> `Dockerfile` actual no declara ningún volumen: en Railway (o cualquier
+> despliegue basado en contenedores), el filesystem de un contenedor es
+> efímero y **cada redeploy crea un contenedor nuevo con el disco en blanco**.
+> Con la configuración de hoy, las imágenes subidas **se pierden en el
+> siguiente deploy**. Para que sobrevivan hace falta:
+> 1. Un **volumen persistente** en Railway montado en `/app/uploads` (el
+>    `WORKDIR` del `Dockerfile` es `/app`), o el equivalente si cambia el
+>    despliegue.
+> 2. Si el servicio llega a correr con más de una réplica a la vez, un volumen
+>    normal de Railway es de un solo adjunto (single-attach): con varias
+>    réplicas cada una vería un disco distinto y la imagen subida en una no
+>    se vería en las demás. Para ese escenario habría que migrar a storage
+>    compartido (S3-compatible) en vez de disco local — pero **hoy no hace
+>    falta**: el pedido explícito fue "guardar local dentro del proyecto
+>    backend", y una sola réplica no tiene este problema.
+> Esta decisión de infraestructura no se resuelve desde el código: la deja
+> documentada D.A.N.I para que el dueño del producto la tome antes de
+> considerar esto listo para producción.
+
 ### Comandas
 ```
 GET    /comandas/activas                                         -> ComandaActiva[]  (panel lateral, vista v_comanda_activa)

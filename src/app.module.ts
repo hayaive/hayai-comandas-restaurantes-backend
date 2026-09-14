@@ -12,6 +12,7 @@ import { MenuModule } from './menu/menu.module';
 import { ComandasModule } from './comandas/comandas.module';
 import { ReservacionesModule } from './reservaciones/reservaciones.module';
 import { ReportesModule } from './reportes/reportes.module';
+import { UploadsModule } from './uploads/uploads.module';
 
 @Module({
   imports: [
@@ -26,6 +27,7 @@ import { ReportesModule } from './reportes/reportes.module';
     ComandasModule,
     ReservacionesModule,
     ReportesModule,
+    UploadsModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },
