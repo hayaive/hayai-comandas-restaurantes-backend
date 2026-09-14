@@ -52,6 +52,18 @@ const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
     http: 422,
     mensaje: 'La mesa no existe o no pertenece a este restaurante',
   },
+  // DELETE /plantillas/:id: comanda/reservacion son RESTRICT hacia plantilla
+  // (schema.prisma) a propósito — no se puede borrar una plantilla con
+  // histórico. Sin esta entrada caían en el genérico de MAPA_SQLSTATE
+  // ('El registro referenciado no existe'), que no dice qué hacer.
+  comanda_restaurante_id_plantilla_id_fkey: {
+    http: 422,
+    mensaje: 'No se puede eliminar: esta plantilla tiene comandas asociadas',
+  },
+  reservacion_restaurante_id_plantilla_id_fkey: {
+    http: 422,
+    mensaje: 'No se puede eliminar: esta plantilla tiene reservaciones asociadas',
+  },
 
   // 23514 — CHECK / trigger de validación
   plantilla_mesa_mismo_salon: { http: 422, mensaje: 'Esa mesa pertenece a otro salón' },

@@ -362,6 +362,8 @@ El backend **debe** capturarlos; son reglas de negocio, no fallos técnicos.
 | `23505` | `comanda_numero_dia_unico` | 500 | Bug: el número se pidió sin el contador |
 | `23514` | cualquier CHECK | 422 | Según el constraint (ver `01_constraints_y_triggers.sql`) |
 | `23503` | cualquier FK | 422 | "El registro referenciado no existe" |
+| `23503` | `comanda_restaurante_id_plantilla_id_fkey` | 422 | "No se puede eliminar: esta plantilla tiene comandas asociadas" (`DELETE /plantillas/:id` con histórico) |
+| `23503` | `reservacion_restaurante_id_plantilla_id_fkey` | 422 | "No se puede eliminar: esta plantilla tiene reservaciones asociadas" (`DELETE /plantillas/:id` con histórico) |
 | `23514` | `plantilla_mesa_mismo_salon` | 422 | "Esa mesa pertenece a otro salón" |
 | `23505` | `tasa_cambio_dia_unica` | 409 | "Ya existe una tasa para esa divisa, fecha y fuente" — **no debería verse**: `POST /tasa` es upsert |
 | `23514` | `comanda_tasa_base` | **500** | Bug: se cobró con una tasa que no es la del dólar. Es un error del backend, no del usuario |
