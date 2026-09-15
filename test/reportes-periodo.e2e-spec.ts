@@ -22,12 +22,17 @@ import { nuevoId } from '../src/comun/id';
  * que importan están construidos a mano:
  *   · 2025-05-11 02:00 Caracas → día operativo 2025-05-10 (madrugada)
  *   · 2025-06-01 03:00 Caracas → día operativo 2025-05-31, o sea MAYO
- *   · una comanda anulada y otra abierta, que no pueden entrar en ningún total
+ *   · un cobro anulado y una comanda sin cobrar, que no entran en ningún total
  *
- * La fecha de apertura y el turno NO se escriben a mano: se calculan con
- * `hayai_fecha_operativa` / `hayai_turno`, las mismas funciones que usa
- * `POST /comandas`. Si el test las replicara en TypeScript, verificaría su
- * propia copia de la regla en vez de la del sistema.
+ * La fecha y el turno NO se escriben a mano: se calculan con
+ * `hayai_fecha_operativa` / `hayai_turno`, las mismas funciones que usa el
+ * cobro. Si el test las replicara en TypeScript, verificaría su propia copia de
+ * la regla en vez de la del sistema.
+ *
+ * ⚠️ Desde el rediseño de comandas múltiples la unidad de venta es el COBRO, y
+ * el día operativo que cuenta es el del cobro, no el del pedido. Por eso el
+ * seed siembra facturas (cada una con su comanda detrás) en vez de comandas
+ * cobradas, y el resumen devuelve `cobros` donde antes decía `comandas`.
  */
 describe('Reportes de ventas por período (e2e)', () => {
   let app: INestApplication;
@@ -38,55 +43,100 @@ describe('Reportes de ventas por período (e2e)', () => {
   let auth: { Authorization: string };
   let productoEmpanadaId: string;
   let productoPabellonId: string;
+  let tasaId: string;
 
   const ZONA = 'America/Caracas';
   const CORTE = '05:00';
 
-  /** Comanda ya cobrada, con su día operativo resuelto por la base. */
-  async function sembrarComanda(opciones: {
+  /**
+   * Una venta completa: la comanda despachada y la factura que la cubre, con el
+   * día operativo y el turno resueltos por la base.
+   *
+   * Va todo en UNA transacción por obligación del esquema: `cobro_no_vacio` es
+   * un constraint trigger diferido que se evalúa en el COMMIT, así que un cobro
+   * insertado suelto —sin la comanda apuntándolo— revienta. Es el mismo
+   * invariante que protege de la factura fantasma en producción.
+   *
+   * El orden dentro de la transacción tampoco es libre:
+   *   1. comanda (nace `pendiente`)
+   *   2. sus líneas — `comanda_item_solo_pendiente` las rechaza si la comanda
+   *      ya está despachada
+   *   3. `despachada_en` — `comanda_cobro_tras_despacho` exige que lo esté
+   *      antes de cobrarla
+   *   4. el cobro, y las comandas apuntándolo
+   */
+  async function sembrarVenta(opciones: {
     momento: string;
     total: number;
     propina?: number;
-    estado?: 'cobrada' | 'anulada' | 'abierta';
+    anulado?: boolean;
+    /** Sin cobrar: la comanda se queda viva y no puede entrar en ningún total. */
+    sinCobrar?: boolean;
     numero: number;
-  }): Promise<string> {
-    const { momento, total, propina = 0, estado = 'cobrada', numero } = opciones;
-    const id = nuevoId();
-    const cerrada = estado === 'abierta' ? null : momento;
-    const tasa = estado === 'cobrada' ? 900 : null;
-    const totalBs = estado === 'cobrada' ? total * 900 : null;
+    items?: { productoId: string; nombre: string; cantidad: number; total: number }[];
+  }): Promise<void> {
+    const { momento, total, propina = 0, anulado = false, sinCobrar = false, numero, items = [] } = opciones;
+    const comandaId = nuevoId();
+    const cobroId = nuevoId();
+    const subtotal = total - propina;
+    // `comanda.total` es sólo la suma de sus líneas: sin propina ni descuento.
+    const totalLineas = subtotal;
 
-    await prisma.$executeRaw`
-      INSERT INTO "comanda" (
-        "id", "restaurante_id", "tipo", "numero_dia", "fecha_operativa", "turno",
-        "comensales", "estado", "abierta_en", "cerrada_en",
-        "subtotal", "propina", "total", "tasa_valor", "total_bs", "actualizada_en"
-      ) VALUES (
-        ${id}::uuid, ${restauranteId}::uuid, 'para_llevar', ${numero},
-        hayai_fecha_operativa(${momento}::timestamptz, ${ZONA}, ${CORTE}::time),
-        hayai_turno(${momento}::timestamptz, ${ZONA}),
-        2, ${estado}::"estado_comanda",
-        ${momento}::timestamptz, ${cerrada}::timestamptz,
-        ${total - propina}, ${propina}, ${total}, ${tasa}, ${totalBs}, now()
-      )
-    `;
-    return id;
-  }
+    await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`
+        INSERT INTO "comanda" (
+          "id", "restaurante_id", "tipo", "numero_dia", "fecha_operativa", "turno",
+          "comensales", "total", "creada_en", "actualizada_en"
+        ) VALUES (
+          ${comandaId}::uuid, ${restauranteId}::uuid, 'para_llevar', ${numero},
+          hayai_fecha_operativa(${momento}::timestamptz, ${ZONA}, ${CORTE}::time),
+          hayai_turno(${momento}::timestamptz, ${ZONA}),
+          2, ${totalLineas}, ${momento}::timestamptz, now()
+        )
+      `;
 
-  async function sembrarItem(comandaId: string, productoId: string, nombre: string, cantidad: number, total: number) {
-    await prisma.comandaItem.create({
-      data: {
-        id: nuevoId(),
-        restauranteId,
-        comandaId,
-        productoId,
-        nombreSnap: nombre,
-        precioUnitarioSnap: total / cantidad,
-        destinoSnap: 'cocina',
-        cantidad,
-        totalLinea: total,
-        estado: 'servido',
-      },
+      for (const [i, it] of items.entries()) {
+        await tx.comandaItem.create({
+          data: {
+            id: nuevoId(),
+            restauranteId,
+            comandaId,
+            productoId: it.productoId,
+            orden: i,
+            nombreSnap: it.nombre,
+            precioUnitarioSnap: it.total / it.cantidad,
+            destinoSnap: 'cocina',
+            cantidad: it.cantidad,
+            totalLinea: it.total,
+          },
+        });
+      }
+
+      if (sinCobrar) return;
+
+      await tx.comanda.update({
+        where: { id: comandaId },
+        data: { despachadaEn: new Date(momento) },
+      });
+
+      await tx.$executeRaw`
+        INSERT INTO "cobro" (
+          "id", "restaurante_id", "numero_dia", "fecha_operativa", "turno",
+          "comensales", "subtotal", "propina", "total",
+          "tasa_id", "tasa_valor", "total_bs", "cobrado_en", "anulado_en",
+          "motivo_anulacion", "actualizado_en"
+        ) VALUES (
+          ${cobroId}::uuid, ${restauranteId}::uuid, ${numero},
+          hayai_fecha_operativa(${momento}::timestamptz, ${ZONA}, ${CORTE}::time),
+          hayai_turno(${momento}::timestamptz, ${ZONA}),
+          2, ${subtotal}, ${propina}, ${total},
+          ${tasaId}::uuid, 900, ${total * 900}, ${momento}::timestamptz,
+          ${anulado ? momento : null}::timestamptz,
+          ${anulado ? 'prueba' : null}, now()
+        )
+      `;
+
+      await tx.comanda.update({ where: { id: comandaId }, data: { cobroId } });
     });
   }
 
@@ -127,28 +177,44 @@ describe('Reportes de ventas por período (e2e)', () => {
       data: { id: productoPabellonId, restauranteId, categoriaId, nombre: 'Pabellón', precio: 12.5 },
     });
 
+    // `cobro.tasa_id` es NOT NULL y el trigger `cobro_tasa_base` sólo admite
+    // USD: sin esta fila no se puede emitir ninguna factura.
+    tasaId = nuevoId();
+    await prisma.tasaCambio.create({
+      data: { id: tasaId, restauranteId, fecha: new Date('2025-05-01'), divisa: 'USD', valor: 900 },
+    });
+
     // ── Mayo 2025 ────────────────────────────────────────────────────────────
     // Día operativo 2025-05-10: almuerzo 100 (+10 de propina), cena 200 y una
     // madrugada de 50 que el calendario fecharía el 11.
-    const almuerzo10 = await sembrarComanda({ momento: '2025-05-10T13:00:00-04:00', total: 100, propina: 10, numero: 1 });
-    await sembrarComanda({ momento: '2025-05-10T20:00:00-04:00', total: 200, numero: 2 });
-    await sembrarComanda({ momento: '2025-05-11T02:00:00-04:00', total: 50, propina: 5, numero: 3 });
+    // La empanada sólo se vendió en mayo, el pabellón sólo en junio.
+    await sembrarVenta({
+      momento: '2025-05-10T13:00:00-04:00',
+      total: 100,
+      propina: 10,
+      numero: 1,
+      items: [{ productoId: productoEmpanadaId, nombre: 'Empanada', cantidad: 6, total: 9 }],
+    });
+    await sembrarVenta({ momento: '2025-05-10T20:00:00-04:00', total: 200, numero: 2 });
+    await sembrarVenta({ momento: '2025-05-11T02:00:00-04:00', total: 50, propina: 5, numero: 3 });
 
     // Día operativo 2025-05-31: una cena del 31 y una madrugada que el
     // calendario fecharía en JUNIO. Las dos tienen que sumar en mayo.
-    await sembrarComanda({ momento: '2025-05-31T22:00:00-04:00', total: 40, numero: 4 });
-    await sembrarComanda({ momento: '2025-06-01T03:00:00-04:00', total: 60, numero: 5 });
+    await sembrarVenta({ momento: '2025-05-31T22:00:00-04:00', total: 40, numero: 4 });
+    await sembrarVenta({ momento: '2025-06-01T03:00:00-04:00', total: 60, numero: 5 });
 
-    // Ruido que no puede contar en ningún total.
-    await sembrarComanda({ momento: '2025-05-12T13:00:00-04:00', total: 999, estado: 'anulada', numero: 6 });
-    await sembrarComanda({ momento: '2025-05-13T13:00:00-04:00', total: 888, estado: 'abierta', numero: 7 });
+    // Ruido que no puede contar en ningún total: una factura anulada y una
+    // comanda que nunca se cobró.
+    await sembrarVenta({ momento: '2025-05-12T13:00:00-04:00', total: 999, anulado: true, numero: 6 });
+    await sembrarVenta({ momento: '2025-05-13T13:00:00-04:00', total: 888, sinCobrar: true, numero: 7 });
 
     // ── Junio 2025 ───────────────────────────────────────────────────────────
-    const junio5 = await sembrarComanda({ momento: '2025-06-05T13:00:00-04:00', total: 500, numero: 8 });
-
-    // Ítems: la empanada sólo se vendió en mayo, el pabellón sólo en junio.
-    await sembrarItem(almuerzo10, productoEmpanadaId, 'Empanada', 6, 9);
-    await sembrarItem(junio5, productoPabellonId, 'Pabellón', 2, 25);
+    await sembrarVenta({
+      momento: '2025-06-05T13:00:00-04:00',
+      total: 500,
+      numero: 8,
+      items: [{ productoId: productoPabellonId, nombre: 'Pabellón', cantidad: 2, total: 25 }],
+    });
 
     const login = await request(app.getHttpServer())
       .post('/api/v1/auth/login')
@@ -172,7 +238,7 @@ describe('Reportes de ventas por período (e2e)', () => {
     expect(body.desde).toBe('2025-05-10');
     expect(body.hasta).toBe('2025-05-10');
     expect(body.enCurso).toBe(false);
-    expect(body.total.comandas).toBe(3);
+    expect(body.total.cobros).toBe(3);
     expect(body.total.totalUsd).toBe('350.0000');
     // La propina no es ingreso del restaurante (v_venta_dia, CONTRACT.md §6).
     expect(body.total.propinasUsd).toBe('15.0000');
@@ -186,7 +252,7 @@ describe('Reportes de ventas por período (e2e)', () => {
 
     // El día siguiente NO hereda la madrugada.
     const { body: dia11 } = await ventas('?periodo=dia&fecha=2025-05-11');
-    expect(dia11.total.comandas).toBe(0);
+    expect(dia11.total.cobros).toBe(0);
     expect(dia11.total.totalUsd).toBe('0.0000');
   });
 
@@ -195,8 +261,8 @@ describe('Reportes de ventas por período (e2e)', () => {
 
     expect(body.desde).toBe('2025-05-01');
     expect(body.hasta).toBe('2025-05-31');
-    expect(body.total.comandas).toBe(5);
-    // 100 + 200 + 50 + 40 + 60. Las de estado anulada y abierta no entran.
+    expect(body.total.cobros).toBe(5);
+    // 100 + 200 + 50 + 40 + 60. El cobro anulado y la comanda sin cobrar no entran.
     expect(body.total.totalUsd).toBe('450.0000');
     expect(body.total.propinasUsd).toBe('15.0000');
     // Ticket promedio ponderado (450/5), no el promedio de los promedios
@@ -209,7 +275,7 @@ describe('Reportes de ventas por período (e2e)', () => {
     expect(porDia['2025-05-10']).toBe('350.0000');
     expect(porDia['2025-05-11']).toBe('0.0000');
     expect(porDia['2025-05-31']).toBe('100.0000'); // 40 del 31 + 60 de la madrugada del 1-jun
-    expect(porDia['2025-05-12']).toBe('0.0000'); // la anulada no cuenta
+    expect(porDia['2025-05-12']).toBe('0.0000'); // la factura anulada no cuenta
 
     // Invariante: la serie tiene que sumar exactamente el total del período.
     const sumaSerie = body.serie.reduce((a: number, p: any) => a + Number(p.totalUsd), 0);
@@ -220,7 +286,7 @@ describe('Reportes de ventas por período (e2e)', () => {
     const { body } = await ventas('?periodo=mes&fecha=2025-06-15');
     expect(body.desde).toBe('2025-06-01');
     expect(body.hasta).toBe('2025-06-30');
-    expect(body.total.comandas).toBe(1);
+    expect(body.total.cobros).toBe(1);
     expect(body.total.totalUsd).toBe('500.0000');
   });
 
@@ -229,7 +295,7 @@ describe('Reportes de ventas por período (e2e)', () => {
 
     expect(body.desde).toBe('2025-01-01');
     expect(body.hasta).toBe('2025-12-31');
-    expect(body.total.comandas).toBe(6);
+    expect(body.total.cobros).toBe(6);
     expect(body.total.totalUsd).toBe('950.0000');
 
     expect(body.granularidad).toBe('mes');
@@ -256,7 +322,7 @@ describe('Reportes de ventas por período (e2e)', () => {
 
     const anio = await ventas('?periodo=anio&fecha=2025-07-15');
     expect(anio.body.comparacion).toMatchObject({ desde: '2024-01-01', hasta: '2024-12-31' });
-    expect(anio.body.comparacion.total.comandas).toBe(0);
+    expect(anio.body.comparacion.total.cobros).toBe(0);
   });
 
   it('un período en curso se compara contra el mismo tramo, no contra el mes entero', async () => {
@@ -336,7 +402,7 @@ describe('Reportes de ventas por período (e2e)', () => {
       .expect(200);
 
     expect(body.porTurno).toHaveLength(3); // almuerzo, cena, madrugada
-    expect(body.total.comandas).toBe(3);
+    expect(body.total.cobros).toBe(3);
     expect(Number(body.total.total_usd)).toBe(350);
   });
 });

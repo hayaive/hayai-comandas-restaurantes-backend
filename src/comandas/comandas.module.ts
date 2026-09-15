@@ -1,9 +1,21 @@
 import { Module } from '@nestjs/common';
-import { ComandasController, CocinaController } from './comandas.controller';
+import {
+  CobrosController,
+  ComandasController,
+  CuentaMesaController,
+  CuentasPorCobrarController,
+  DespachoController,
+} from './comandas.controller';
 import { ComandasService } from './comandas.service';
 
 @Module({
-  controllers: [ComandasController, CocinaController],
+  controllers: [
+    ComandasController,
+    DespachoController,
+    CuentasPorCobrarController,
+    CuentaMesaController,
+    CobrosController,
+  ],
   providers: [ComandasService],
   exports: [ComandasService],
 })

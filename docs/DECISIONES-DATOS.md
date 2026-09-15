@@ -5,6 +5,15 @@
 > Ampliado el 2026-09-14 con §D15 y §11 (ventas por mes y por año).
 > Acompaña a `prisma/schema.prisma`, `prisma/sql/` y `CONTRACT.md`.
 >
+> ⚠️ **§D5, §4 y parte de §6/§7 quedaron SUPERADOS el 2026-09-15** por el
+> rediseño de *comandas múltiples por mesa + cobro consolidado* (migración
+> `20260915183000_comandas_multiples_y_cobro`, diseño de J.O.R.B.I verificado
+> contra Postgres 17 con 43 aserciones). Una comanda ya no es la cuenta de la
+> mesa sino UN pedido; la cuenta es la suma de las comandas vivas y se factura
+> con la entidad nueva `Cobro`. Se conservan tal cual porque explican por qué el
+> modelo era así y qué obligó a cambiarlo; los apartados afectados llevan una
+> nota al principio. Lo vigente está en `CONTRACT.md` §0, §2.9-§2.12 y §3.
+>
 > **Estado de verificación:** el esquema completo (DDL de Prisma + los 5 archivos
 > de `prisma/sql/`) se aplicó sobre **PostgreSQL 17.10** en un contenedor
 > efímero y se ejecutó una batería de 22 aserciones sobre los invariantes
@@ -141,6 +150,17 @@ no autoriza nada.
 
 ## 4 · Comandas: una cuenta viva por mesa, garantizada
 
+> ⚠️ **SUPERADO (2026-09-15).** Este apartado describe el modelo anterior. El
+> índice `comanda_mesa_activa_unica` ya no existe: cada envío a cocina es una
+> comanda propia y una mesa tiene N vivas a la vez. Lo que sí sobrevive es el
+> razonamiento —el invariante que de verdad importa se expresa en la base, no en
+> la aplicación—; lo que cambió es CUÁL es el invariante. Su sucesor sin el
+> UNIQUE es `comanda_cuenta_abierta_idx`, que conserva los beneficios 2 y 3 de
+> la lista de abajo (liberación automática y panel barato) y suelta el 1, que
+> dejó de ser cierto. La unicidad que sí quedó es la de la factura:
+> `cobro_numero_dia_unico`, más el trigger diferido `cobro_no_vacio` contra la
+> factura fantasma de dos cajeros concurrentes.
+
 ```sql
 CREATE UNIQUE INDEX comanda_mesa_activa_unica
   ON comanda (restaurante_id, mesa_id)
@@ -230,11 +250,12 @@ compuesto**, o el día que se active RLS la política fuerza escaneos.
 
 | Índice | Para qué | Por qué parcial |
 |---|---|---|
-| `comanda_mesa_activa_unica` | Panel lateral + invariante | Sólo mesas ocupadas: índice diminuto y constante |
+| ~~`comanda_mesa_activa_unica`~~ → `comanda_cuenta_abierta_idx` | Plano + cuentas por cobrar | Sólo comandas vivas: índice diminuto. Perdió el UNIQUE en el rediseño de 2026-09-15 |
+| `comanda_cola_despacho_idx` | Cola del KDS, FIFO global | Sólo lo que la cocina no ha sacado; ya viene ordenado por `creada_en` |
 | `plantilla_activa_unica` | Resolver la plantilla vigente | Una fila por salón |
-| `comanda_item_cocina_idx` | Cola de cocina/barra | Sólo lo no despachado; lo servido no se consulta más |
+
 | `reservacion_agenda_idx` | Agenda del día | Canceladas y no-show no estorban |
-| `comanda_por_cobrar_idx` | Cola del cajero | Suelen ser 2 o 3 filas |
+
 | `mesa_etiqueta_unica` | "Mesa 5" única | Por expresión (`lower`) y sólo entre las vivas: permite reutilizar el número de una mesa borrada |
 | `comanda (restaurante_id, fecha_operativa, estado)` | Reporte del día | — |
 | `comanda_item (restaurante_id, producto_id)` | Producto más vendido | — |

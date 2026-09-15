@@ -56,36 +56,42 @@ CREATE UNIQUE INDEX "plantilla_activa_unica"
   ON "plantilla" ("restaurante_id", "salon_id")
   WHERE "activa";
 
--- ⭐⭐ EL invariante de comandas: UNA cuenta viva por mesa.
--- Sin esto, dos meseros abriendo la misma mesa a la vez crean dos comandas y
--- el cliente paga una sola. No es prevenible de forma fiable en la aplicación
--- (dos procesos, dos transacciones), y aquí además es el índice que sirve al
--- panel lateral: contiene SOLO las mesas ocupadas ahora mismo, así que
--- "listar comandas activas" lee un índice diminuto, no la tabla histórica.
-CREATE UNIQUE INDEX "comanda_mesa_activa_unica"
-  ON "comanda" ("restaurante_id", "mesa_id")
-  WHERE "mesa_id" IS NOT NULL AND "estado" IN ('abierta', 'por_cobrar');
+-- ⚠️ AQUÍ VIVÍA `comanda_mesa_activa_unica` (UNA cuenta viva por mesa).
+-- Murió con el rediseño de comandas múltiples (migración
+-- 20260915183000_comandas_multiples_y_cobro): ahora cada envío a cocina es una
+-- comanda propia y una mesa tiene N vivas a la vez. Su sucesor sin el UNIQUE es
+-- `comanda_cuenta_abierta_idx`, en §2 — conserva los dos beneficios de
+-- rendimiento (el plano y las cuentas por cobrar leen un índice minúsculo) y
+-- pierde sólo el invariante que dejó de aplicar.
+-- No se reintroduce: si alguien lo recrea, la segunda comanda de una mesa
+-- empieza a fallar con 23505 en plena cena.
 
 
 -- ───────────────────────────────────────────────────────────────────────────
 -- 2 · Índices parciales de operación
--- Cubren las tres pantallas que se consultan cada pocos segundos.
+-- Cubren las pantallas que se consultan cada pocos segundos.
 -- ───────────────────────────────────────────────────────────────────────────
 
--- Cola de cocina / barra (KDS): sólo lo que falta por despachar.
-CREATE INDEX "comanda_item_cocina_idx"
-  ON "comanda_item" ("restaurante_id", "destino_snap", "enviado_en")
-  WHERE "estado" IN ('pendiente', 'en_preparacion');
+-- ⭐ Cola de despacho GLOBAL (KDS), estrictamente por orden de llegada.
+-- Índice diminuto: sólo contiene lo que la cocina todavía no sacó, y ya viene
+-- ordenado, así que la pantalla del KDS es una lectura secuencial del índice.
+-- Sustituye a `comanda_item_cocina_idx`: la cola ya no es por ítem, porque
+-- cocina y barra despachan la comanda como una sola unidad.
+CREATE INDEX "comanda_cola_despacho_idx"
+  ON "comanda" ("restaurante_id", "creada_en")
+  WHERE "despachada_en" IS NULL AND "anulada_en" IS NULL;
+
+-- ⭐ La cuenta viva de una mesa: toda comanda no cobrada y no anulada, esté en
+-- cocina o esperando pago. Sirve a `v_mesa_estado` y a `v_cuenta_mesa`.
+-- Sustituye a `comanda_por_cobrar_idx` (ya no existe el estado `por_cobrar`).
+CREATE INDEX "comanda_cuenta_abierta_idx"
+  ON "comanda" ("restaurante_id", "mesa_id")
+  WHERE "mesa_id" IS NOT NULL AND "cobro_id" IS NULL AND "anulada_en" IS NULL;
 
 -- Agenda de reservas: sólo las que todavía pueden ocupar una mesa.
 CREATE INDEX "reservacion_agenda_idx"
   ON "reservacion" ("restaurante_id", "inicia_en")
   WHERE "estado" IN ('pendiente', 'confirmada');
-
--- Comandas por cobrar: el cajero las pide constantemente.
-CREATE INDEX "comanda_por_cobrar_idx"
-  ON "comanda" ("restaurante_id", "abierta_en")
-  WHERE "estado" = 'por_cobrar';
 
 
 -- ───────────────────────────────────────────────────────────────────────────
@@ -249,40 +255,65 @@ ALTER TABLE "producto"
 ALTER TABLE "comanda_item"
   ADD CONSTRAINT "comanda_item_cantidad_valida" CHECK ("cantidad" > 0),
   ADD CONSTRAINT "comanda_item_precio_valido"   CHECK ("precio_unitario_snap" >= 0),
-  ADD CONSTRAINT "comanda_item_descuento_valido" CHECK ("descuento_linea" >= 0);
+  ADD CONSTRAINT "comanda_item_descuento_valido" CHECK ("descuento_linea" >= 0),
+  -- La traza de cancelación sólo existe si hubo cancelación.
+  ADD CONSTRAINT "comanda_item_cancelacion_coherente" CHECK (
+    "cancelado_en" IS NOT NULL OR ("cancelado_por_id" IS NULL AND "motivo_cancelacion" IS NULL)
+  );
 
 -- Una comanda de mesa necesita mesa, salón y plantilla; una de para llevar,
 -- ninguna de las tres. Sin esto aparecen comandas de mesa sin mesa, que es el
--- estado que rompe el panel lateral.
+-- estado que rompe el plano.
 ALTER TABLE "comanda"
   ADD CONSTRAINT "comanda_tipo_coherente" CHECK (
     ("tipo" = 'mesa'        AND "mesa_id" IS NOT NULL AND "salon_id" IS NOT NULL AND "plantilla_id" IS NOT NULL)
     OR
     ("tipo" = 'para_llevar' AND "mesa_id" IS NULL)
   ),
-  ADD CONSTRAINT "comanda_totales_validos" CHECK (
-    "subtotal" >= 0 AND "descuento" >= 0 AND "impuesto" >= 0 AND "propina" >= 0 AND "total" >= 0
+  -- `comanda.total` es sólo la suma de sus líneas vivas. Descuento, impuesto y
+  -- propina se negocian sobre la cuenta de la mesa y viven en `cobro`, así que
+  -- el viejo `comanda_totales_validos` (que los cubría a los cinco) se partió
+  -- en esto y en `cobro_totales_validos`.
+  ADD CONSTRAINT "comanda_total_valido" CHECK ("total" >= 0),
+  -- Una comanda anulada no se cobra, y una cobrada no se anula.
+  ADD CONSTRAINT "comanda_anulada_no_cobrada" CHECK ("anulada_en" IS NULL OR "cobro_id" IS NULL),
+  -- La traza de anulación sólo existe si hubo anulación.
+  ADD CONSTRAINT "comanda_anulacion_coherente" CHECK (
+    "anulada_en" IS NOT NULL OR ("anulada_por_id" IS NULL AND "motivo_anulacion" IS NULL)
   ),
-  ADD CONSTRAINT "comanda_cierre_coherente" CHECK (
-    ("estado" IN ('cobrada', 'anulada') AND "cerrada_en" IS NOT NULL)
-    OR
-    ("estado" IN ('abierta', 'por_cobrar') AND "cerrada_en" IS NULL)
+  -- No se factura lo que no salió de cocina. Es lo que hace segura la regla del
+  -- dueño "si la mesa tiene algo pendiente, se cobra sólo lo despachado".
+  -- Sustituye a `comanda_cierre_coherente` y a `comanda_tasa_congelada`: el
+  -- cierre ya no es un estado + una fecha, son tres hechos independientes, y la
+  -- tasa se congela en `cobro`, donde es NOT NULL por columna.
+  ADD CONSTRAINT "comanda_cobro_tras_despacho" CHECK (
+    "cobro_id" IS NULL OR "despachada_en" IS NOT NULL
+  );
+
+-- La factura consolidada.
+ALTER TABLE "cobro"
+  ADD CONSTRAINT "cobro_totales_validos" CHECK (
+    "subtotal" >= 0 AND "descuento" >= 0 AND "impuesto" >= 0 AND "propina" >= 0
+    AND "total" >= 0 AND "total_bs" >= 0
   ),
-  -- Si se cobró, la tasa quedó congelada. Reimprimir el ticket un mes después
-  -- tiene que dar el mismo monto en bolívares.
-  ADD CONSTRAINT "comanda_tasa_congelada" CHECK (
-    "estado" <> 'cobrada' OR ("tasa_valor" IS NOT NULL AND "total_bs" IS NOT NULL)
+  -- Si hay mesa, hay salón. Un cobro sin mesa es una comanda para llevar.
+  ADD CONSTRAINT "cobro_tipo_coherente" CHECK (
+    ("mesa_id" IS NOT NULL AND "salon_id" IS NOT NULL) OR "mesa_id" IS NULL
+  ),
+  ADD CONSTRAINT "cobro_anulacion_coherente" CHECK (
+    "anulado_en" IS NOT NULL OR ("anulado_por_id" IS NULL AND "motivo_anulacion" IS NULL)
   );
 
 -- Pago móvil y transferencia sin referencia = un pago que no se puede conciliar
 -- con el banco. Se bloquea en la base, no en el formulario.
-ALTER TABLE "comanda_pago"
-  ADD CONSTRAINT "pago_monto_valido" CHECK ("monto" > 0 AND "monto_usd" > 0),
-  ADD CONSTRAINT "pago_referencia_obligatoria" CHECK (
+-- (Los tres CHECKs se llamaban `pago_*` cuando la tabla era `comanda_pago`.)
+ALTER TABLE "cobro_pago"
+  ADD CONSTRAINT "cobro_pago_monto_valido" CHECK ("monto" > 0 AND "monto_usd" > 0),
+  ADD CONSTRAINT "cobro_pago_referencia_obligatoria" CHECK (
     "metodo" NOT IN ('pago_movil', 'transferencia') OR (length(btrim(coalesce("referencia", ''))) > 0)
   ),
   -- USD es la moneda base: no lleva tasa. Bs siempre la lleva.
-  ADD CONSTRAINT "pago_tasa_coherente" CHECK (
+  ADD CONSTRAINT "cobro_pago_tasa_coherente" CHECK (
     ("moneda" = 'USD' AND "tasa_aplicada" IS NULL)
     OR
     ("moneda" = 'BS'  AND "tasa_aplicada" IS NOT NULL AND "tasa_aplicada" > 0)
@@ -356,24 +387,24 @@ $$;
 -- `Comanda` hacia el frontend a cambio de nada.
 -- ───────────────────────────────────────────────────────────────────────────
 
--- ⭐⭐ Una comanda sólo congela tasas de la divisa BASE (USD).
--- 'USD' va literal, igual que en `pago_tasa_coherente`: la moneda base es un
--- invariante del producto, no un parámetro. Si algún día un restaurante opera
--- con otra base, se cambia aquí y en ese CHECK a la vez, a propósito.
-CREATE OR REPLACE FUNCTION "hayai_comanda_tasa_base"()
+-- ⭐⭐ Un cobro sólo congela tasas de la divisa BASE (USD).
+-- 'USD' va literal, igual que en `cobro_pago_tasa_coherente`: la moneda base es
+-- un invariante del producto, no un parámetro. Si algún día un restaurante
+-- opera con otra base, se cambia aquí y en ese CHECK a la vez, a propósito.
+--
+-- ⚠️ Este trigger vivía en `comanda` y se llamaba `comanda_tasa_base`. Viajó a
+-- `cobro` en la migración 20260915183000, que es donde pasó a congelarse la
+-- tasa. El invariante es idéntico; si se perdiera en el traslado, el agujero
+-- de §10.4 de DECISIONES-DATOS se reabre sin que nada falle.
+CREATE OR REPLACE FUNCTION "hayai_cobro_tasa_base"()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 DECLARE
   v_divisa "divisa";
 BEGIN
-  IF NEW."tasa_id" IS NULL THEN
-    RETURN NEW;
-  END IF;
-
-  -- Salida temprana. La comanda se UPDATEa en cada ronda (recálculo de
-  -- totales) y sólo interesa mirar cuando `tasa_id` entra o cambia; así el
-  -- SELECT extra ocurre una vez por cobro y no en el camino caliente.
+  -- Salida temprana: sólo interesa mirar cuando `tasa_id` entra o cambia, así
+  -- el SELECT extra ocurre una vez por cobro y no al anular o editar notas.
   -- El TG_OP es obligatorio: en un trigger de INSERT, OLD no está asignado y
   -- leer OLD."tasa_id" sería un error de ejecución de plpgsql.
   IF TG_OP = 'UPDATE' AND NEW."tasa_id" IS NOT DISTINCT FROM OLD."tasa_id" THEN
@@ -386,23 +417,23 @@ BEGIN
      AND t."id"             = NEW."tasa_id";
 
   -- Si no hay fila, NO se lanza aquí: que hable la FK compuesta
-  -- (`comanda_restaurante_id_tasa_id_fkey`, 23503), cuyo mensaje es el correcto
+  -- (`cobro_restaurante_id_tasa_id_fkey`, 23503), cuyo mensaje es el correcto
   -- para "esa tasa no existe o es de otro restaurante".
   IF v_divisa IS NOT NULL AND v_divisa <> 'USD'::"divisa" THEN
     RAISE EXCEPTION
-      'La comanda % intenta congelar una tasa de %; el cobro sólo admite la divisa base (USD)',
+      'El cobro % intenta congelar una tasa de %; el cobro sólo admite la divisa base (USD)',
       NEW."id", v_divisa
-      USING ERRCODE = '23514', CONSTRAINT = 'comanda_tasa_base';
+      USING ERRCODE = '23514', CONSTRAINT = 'cobro_tasa_base';
   END IF;
 
   RETURN NEW;
 END;
 $$;
 
-CREATE TRIGGER "comanda_tasa_base"
-  BEFORE INSERT OR UPDATE ON "comanda"
+CREATE TRIGGER "cobro_tasa_base"
+  BEFORE INSERT OR UPDATE ON "cobro"
   FOR EACH ROW
-  EXECUTE FUNCTION "hayai_comanda_tasa_base"();
+  EXECUTE FUNCTION "hayai_cobro_tasa_base"();
 
 -- La divisa de una tasa es inmutable. Sin esto, el trigger de arriba tiene una
 -- puerta trasera: se congela una tasa USD en la comanda y DESPUÉS alguien hace
@@ -433,3 +464,133 @@ CREATE TRIGGER "tasa_divisa_inmutable"
   BEFORE UPDATE ON "tasa_cambio"
   FOR EACH ROW
   EXECUTE FUNCTION "hayai_tasa_divisa_inmutable"();
+
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- 8 · `comanda.estado` es DERIVADO          (añadido 2026-09-15)
+--
+-- El ciclo de vida de una comanda son TRES hechos independientes que sí se
+-- escriben —`despachada_en`, `cobro_id`, `anulada_en`— y `estado` es la lectura
+-- de una palabra que el frontend, los filtros de Prisma y los predicados de las
+-- vistas necesitan. Este trigger es la ÚNICA definición de esa derivación:
+-- escriba quien escriba (Prisma, un $executeRaw, un UPDATE a mano), la columna
+-- no puede desincronizarse de los hechos.
+--
+-- No es una columna GENERATED porque el cast texto->enum no es IMMUTABLE — la
+-- misma trampa que impidió generar `reservacion.periodo` (§3).
+--
+-- ⚠️ Consecuencia para el código de aplicación: mandar `estado` en un INSERT o
+-- UPDATE de Prisma no hace nada, el trigger lo pisa. Para mover una comanda se
+-- escribe el HECHO (`despachadaEn`, `anuladaEn`, `cobroId`), nunca el estado.
+-- ───────────────────────────────────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION "hayai_comanda_estado"()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW."estado" := CASE
+    WHEN NEW."anulada_en"    IS NOT NULL THEN 'anulada'
+    WHEN NEW."cobro_id"      IS NOT NULL THEN 'cobrada'
+    WHEN NEW."despachada_en" IS NOT NULL THEN 'despachada'
+    ELSE                                      'pendiente'
+  END::"estado_comanda";
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER "comanda_estado"
+  BEFORE INSERT OR UPDATE ON "comanda"
+  FOR EACH ROW
+  EXECUTE FUNCTION "hayai_comanda_estado"();
+
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- 9 · Los ítems sólo se tocan mientras la comanda esté pendiente
+--
+-- Cubre las tres reglas del dueño de una vez:
+--   · se puede anular un ítem ANTES de despachar la comanda;
+--   · no se le agregan ítems a una comanda que ya salió — rompería el FIFO: el
+--     pedido entró a la cola con un contenido y saldría con otro;
+--   · no se toca nada de una comanda ya cobrada — eso cambiaría el monto de una
+--     factura ya emitida.
+--
+-- Sólo INSERT/UPDATE: el DELETE de un ítem no existe en el producto (cancelar
+-- es lógico, con `cancelado_en`) y vigilarlo aquí rompería el DELETE en cascada
+-- del restaurante.
+-- ───────────────────────────────────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION "hayai_comanda_item_solo_pendiente"()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_estado "estado_comanda";
+BEGIN
+  SELECT c."estado" INTO v_estado
+    FROM "comanda" c
+   WHERE c."restaurante_id" = NEW."restaurante_id" AND c."id" = NEW."comanda_id";
+
+  -- Sin fila: que hable la FK compuesta (23503), cuyo mensaje es el correcto.
+  IF v_estado IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  IF v_estado <> 'pendiente' THEN
+    RAISE EXCEPTION
+      'La comanda % está % : sus ítems ya no se pueden modificar',
+      NEW."comanda_id", v_estado
+      USING ERRCODE = '23514', CONSTRAINT = 'comanda_item_solo_pendiente';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER "comanda_item_solo_pendiente"
+  BEFORE INSERT OR UPDATE ON "comanda_item"
+  FOR EACH ROW
+  EXECUTE FUNCTION "hayai_comanda_item_solo_pendiente"();
+
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- 10 · ⭐⭐ Un cobro SIEMPRE cubre al menos una comanda
+--
+-- Es la red que convierte la carrera de dos cajeros cobrando la misma mesa en
+-- un error limpio en vez de en una factura fantasma: con pagos dentro, contada
+-- en el reporte de ventas, y ninguna venta detrás.
+--
+-- La receta de cobro del servicio bloquea las comandas con `SELECT ... FOR
+-- UPDATE` y ésa es la defensa principal; esto es el último recurso para
+-- cualquier camino que no pase por ahí.
+--
+-- DEFERRABLE INITIALLY DEFERRED porque la transacción legítima es
+-- `INSERT cobro` -> `UPDATE comanda SET cobro_id`, y en el instante del INSERT
+-- todavía no hay ninguna comanda apuntando. Se evalúa en el COMMIT.
+-- No desactivarlo con SET CONSTRAINTS en el código de aplicación.
+-- ───────────────────────────────────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION "hayai_cobro_no_vacio"()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW."anulado_en" IS NULL
+     AND NOT EXISTS (
+           SELECT 1 FROM "comanda" c
+            WHERE c."restaurante_id" = NEW."restaurante_id" AND c."cobro_id" = NEW."id")
+  THEN
+    RAISE EXCEPTION
+      'El cobro % no cubre ninguna comanda (¿la mesa ya la cobró otro cajero?)',
+      NEW."id"
+      USING ERRCODE = '23514', CONSTRAINT = 'cobro_no_vacio';
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER "cobro_no_vacio"
+  AFTER INSERT OR UPDATE ON "cobro"
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW
+  EXECUTE FUNCTION "hayai_cobro_no_vacio"();

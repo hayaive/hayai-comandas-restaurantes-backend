@@ -22,6 +22,7 @@ describe('Plantillas — borrado lógico (e2e)', () => {
   let restauranteId: string;
   let salonId: string;
   let mesaId: string;
+  let productoId: string;
   let token: string;
 
   beforeAll(async () => {
@@ -55,6 +56,15 @@ describe('Plantillas — borrado lógico (e2e)', () => {
 
     mesaId = nuevoId();
     await prisma.mesa.create({ data: { id: mesaId, restauranteId, salonId, etiqueta: 'B1' } });
+
+    // Una comanda es un PEDIDO y exige al menos una línea, así que este test
+    // necesita un producto para poder generar el histórico que va a proteger.
+    const categoriaId = nuevoId();
+    await prisma.categoria.create({ data: { id: categoriaId, restauranteId, nombre: 'Cocina' } });
+    productoId = nuevoId();
+    await prisma.producto.create({
+      data: { id: productoId, restauranteId, categoriaId, nombre: 'Arepa', precio: 3 },
+    });
 
     const login = await request(app.getHttpServer())
       .post('/api/v1/auth/login')
@@ -92,12 +102,13 @@ describe('Plantillas — borrado lógico (e2e)', () => {
     const comanda = await request(app.getHttpServer())
       .post('/api/v1/comandas')
       .set(auth)
-      .send({ tipo: 'mesa', mesaId, comensales: 2 })
+      .send({ tipo: 'mesa', mesaId, comensales: 2, items: [{ productoId, cantidad: 1 }] })
       .expect(201);
     expect(comanda.body.plantillaId).toBe(plantilla1Id);
-    // Cierra la comanda para no interferir con el resto del test (la
-    // plantilla_id ya quedó grabada; no se toca al cerrar).
-    await prisma.comanda.update({ where: { id: comanda.body.id }, data: { estado: 'anulada', cerradaEn: new Date() } });
+    // Saca la comanda de la cuenta de la mesa para no interferir con el resto
+    // del test. `estado` es derivado: se escribe el HECHO (`anuladaEn`) y el
+    // trigger `comanda_estado` deriva 'anulada'.
+    await prisma.comanda.update({ where: { id: comanda.body.id }, data: { anuladaEn: new Date() } });
 
     const reservacion = await request(app.getHttpServer())
       .post('/api/v1/reservaciones')

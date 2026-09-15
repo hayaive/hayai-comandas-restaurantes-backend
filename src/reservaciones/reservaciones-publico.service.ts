@@ -1,6 +1,5 @@
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../comun/prisma/prisma.service';
-import { ComandasService } from '../comandas/comandas.service';
 import { ReservacionesService } from './reservaciones.service';
 import { Reservacion } from '../generated/prisma/client';
 import { CrearReservacionPublicaDto } from './dto/reservacion-publica.dto';
@@ -32,7 +31,6 @@ export class ReservacionesPublicoService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly reservaciones: ReservacionesService,
-    private readonly comandas: ComandasService,
   ) {}
 
   private async restaurantePorSlug(slug: string) {
@@ -184,7 +182,18 @@ export class ReservacionesPublicoService {
     return aReservacionPublica(actualizada, mesa?.etiqueta);
   }
 
-  /** CONTRACT.md §3: check-in por QR — valida y marca la mesa ocupada abriendo su comanda. */
+  /**
+   * CONTRACT.md §3: check-in por QR — valida la reserva y la deja `sentada`.
+   *
+   * ⚠️ Ya NO abre comanda (mismo motivo que `ReservacionesService.sentar`): una
+   * comanda es un PEDIDO y exige al menos una línea, así que el check-in no
+   * puede crearla — y menos desde un endpoint público sin sesión, donde nadie
+   * ha tomado nota todavía. La primera comanda la crea el mesero después.
+   *
+   * ⭐ Aun así la mesa queda OCUPADA desde este mismo instante: `v_mesa_estado`
+   * cuenta una reserva `sentada` como ocupación, sin necesidad de comanda. Es
+   * exactamente lo que el escaneo del QR tiene que producir en el plano.
+   */
   async checkin(codigoPublico: string) {
     const reservacion = await this.obtenerPorCodigo(codigoPublico);
     if (reservacion.estado !== 'pendiente' && reservacion.estado !== 'confirmada') {
@@ -201,11 +210,9 @@ export class ReservacionesPublicoService {
       reservacion.mesaId,
     );
 
-    await this.comandas.abrirComanda(reservacion.restauranteId, null, {
-      tipo: 'mesa',
-      mesaId: reservacion.mesaId,
-      comensales: reservacion.personas,
-      reservacionId: reservacion.id,
+    await this.prisma.reservacion.update({
+      where: { id: reservacion.id },
+      data: { estado: 'sentada', sentadaEn: new Date() },
     });
 
     const actualizada = await this.obtenerPorCodigo(codigoPublico);

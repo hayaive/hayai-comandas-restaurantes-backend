@@ -25,20 +25,32 @@ DECLARE
     'producto_nombre_unico',
     'producto_codigo_unico',
     'plantilla_activa_unica',
-    'comanda_mesa_activa_unica',
-    'comanda_item_cocina_idx',
     'reservacion_agenda_idx',
-    'comanda_por_cobrar_idx'
+    -- Los dos que sostienen la operación tras el rediseño de comandas
+    -- múltiples. Si se pierden nada falla: el KDS y el plano simplemente pasan
+    -- a escanear la tabla histórica entera cada pocos segundos.
+    'comanda_cola_despacho_idx',
+    'comanda_cuenta_abierta_idx'
   ];
 
   -- Constraints de tabla.
   constraints text[] := ARRAY[
     'reservacion_sin_solape',
     'comanda_tipo_coherente',
-    'comanda_cierre_coherente',
-    'comanda_tasa_congelada',
-    'pago_referencia_obligatoria',
-    'pago_tasa_coherente',
+    'comanda_total_valido',
+    'comanda_anulada_no_cobrada',
+    'comanda_anulacion_coherente',
+    -- No se factura lo que no salió de cocina.
+    'comanda_cobro_tras_despacho',
+    'comanda_item_cancelacion_coherente',
+    'cobro_totales_validos',
+    'cobro_tipo_coherente',
+    'cobro_anulacion_coherente',
+    'cobro_pago_referencia_obligatoria',
+    'cobro_pago_tasa_coherente',
+    -- ⚠️ La FK que el borrador de la migración se dejó: sin ella un pago puede
+    -- quedar apuntando a un cobro que no existe.
+    'cobro_pago_restaurante_id_cobro_id_fkey',
     'plantilla_mesa_capacidad_valida',
     'reservacion_rango_valido',
     'plantilla_eliminada_no_activa'
@@ -48,10 +60,18 @@ DECLARE
     'reservacion_periodo',
     'plantilla_mesa_mismo_salon',
     'mesa_cambio_salon',
-    -- Impiden que una comanda congele la tasa del EURO en vez de la del dólar.
-    -- Si se pierden, el cobro sigue funcionando y cobra mal: nada falla.
-    'comanda_tasa_base',
-    'tasa_divisa_inmutable'
+    -- Impide que un cobro congele la tasa del EURO en vez de la del dólar.
+    -- Si se pierde, el cobro sigue funcionando y cobra mal: nada falla.
+    'cobro_tasa_base',
+    'tasa_divisa_inmutable',
+    -- `comanda.estado` es derivado: sin este trigger la columna se queda en el
+    -- valor que escriba quien sea y deja de coincidir con los hechos.
+    'comanda_estado',
+    -- Sin éste se le pueden meter líneas a una comanda ya despachada (rompe el
+    -- FIFO) o cambiarle el monto a una factura ya emitida.
+    'comanda_item_solo_pendiente',
+    -- Último recurso contra la factura fantasma de dos cajeros simultáneos.
+    'cobro_no_vacio'
   ];
 
   funciones text[] := ARRAY[
@@ -60,18 +80,37 @@ DECLARE
     'hayai_mesa_cambio_salon',
     'hayai_fecha_operativa',
     'hayai_turno',
-    'hayai_comanda_tasa_base',
-    'hayai_tasa_divisa_inmutable'
+    'hayai_cobro_tasa_base',
+    'hayai_tasa_divisa_inmutable',
+    'hayai_comanda_estado',
+    'hayai_comanda_item_solo_pendiente',
+    'hayai_cobro_no_vacio'
   ];
 
   vistas text[] := ARRAY[
     'v_mesa_estado',
-    'v_comanda_activa',
+    'v_cola_despacho',
+    'v_cuenta_mesa',
     'v_venta_dia',
     'v_venta_dia_metodo',
     'v_producto_vendido_dia',
-    'v_comanda_descuadre',
+    'v_cobro_descuadre',
     'v_reservacion_huerfana'
+  ];
+
+  -- Objetos del modelo viejo que NO deben volver. Un `git revert` a medias o un
+  -- prisma/sql/ desincronizado los recrearía, y entonces la segunda comanda de
+  -- una mesa empezaría a fallar con 23505 en plena cena — o peor, `v_venta_dia`
+  -- volvería a contar comandas en vez de cobros y el reporte cambiaría solo.
+  difuntos text[] := ARRAY[
+    'comanda_mesa_activa_unica',
+    'comanda_item_cocina_idx',
+    'comanda_por_cobrar_idx',
+    'comanda_reservacion_unica'
+  ];
+  vistas_difuntas text[] := ARRAY[
+    'v_comanda_activa',
+    'v_comanda_descuadre'
   ];
 
   n text;
@@ -103,6 +142,19 @@ BEGIN
   FOREACH n IN ARRAY vistas LOOP
     IF NOT EXISTS (SELECT 1 FROM pg_views WHERE viewname = n AND schemaname = current_schema())
     THEN faltan := faltan || ('vista ' || n); END IF;
+  END LOOP;
+
+  -- Lo que resucitó y no debería.
+  FOREACH n IN ARRAY difuntos LOOP
+    IF EXISTS (SELECT 1 FROM pg_class c
+                JOIN pg_namespace ns ON ns.oid = c.relnamespace
+               WHERE c.relkind = 'i' AND c.relname = n AND ns.nspname = current_schema())
+    THEN faltan := faltan || ('índice REVIVIDO del modelo viejo: ' || n); END IF;
+  END LOOP;
+
+  FOREACH n IN ARRAY vistas_difuntas LOOP
+    IF EXISTS (SELECT 1 FROM pg_views WHERE viewname = n AND schemaname = current_schema())
+    THEN faltan := faltan || ('vista REVIVIDA del modelo viejo: ' || n); END IF;
   END LOOP;
 
   -- Las vistas deben ser security_invoker, o RLS no las filtra.

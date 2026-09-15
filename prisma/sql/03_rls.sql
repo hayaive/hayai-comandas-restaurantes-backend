@@ -49,7 +49,11 @@ DECLARE
   tablas text[] := ARRAY[
     'usuario', 'salon', 'mesa', 'plantilla', 'plantilla_mesa',
     'categoria', 'producto', 'reservacion', 'comanda', 'comanda_item',
-    'comanda_pago', 'tasa_cambio', 'contador_comanda', 'resumen_dia'
+    -- `cobro` y `cobro_pago` llevan el dinero cobrado: si se olvidaran aquí,
+    -- el día que se active RLS un tenant vería la facturación de otro.
+    -- `cobro_pago` y `contador_dia` se llamaban `comanda_pago` y
+    -- `contador_comanda` antes de la migración 20260915183000.
+    'cobro', 'cobro_pago', 'tasa_cambio', 'contador_dia', 'resumen_dia'
   ];
 BEGIN
   FOREACH t IN ARRAY tablas LOOP

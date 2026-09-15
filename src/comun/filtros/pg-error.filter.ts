@@ -27,7 +27,10 @@ const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
   reservacion_sin_solape: { http: 409, mensaje: 'Esa mesa ya está reservada en ese horario' },
 
   // 23505 — únicos (parciales o normales)
-  comanda_mesa_activa_unica: { http: 409, mensaje: 'La mesa ya tiene una comanda abierta' },
+  // ⚠️ `comanda_mesa_activa_unica` y `comanda_reservacion_unica` ya NO están
+  // aquí: murieron con el rediseño de comandas múltiples. Una mesa puede tener
+  // varias comandas vivas y una reserva puede generar varias. Si alguien los
+  // recrea en la base, `99_verificar_objetos.sql` lo grita (lista `difuntos`).
   plantilla_activa_unica: { http: 409, mensaje: 'Ese salón ya tiene una plantilla activa' },
   mesa_etiqueta_unica: { http: 409, mensaje: 'Ya existe una mesa con ese número' },
   salon_nombre_unico: { http: 409, mensaje: 'Ya existe un salón con ese nombre' },
@@ -38,7 +41,10 @@ const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
     http: 500,
     mensaje: 'Error interno: el número de comanda se generó sin pasar por el contador',
   },
-  comanda_reservacion_unica: { http: 409, mensaje: 'Esa reservación ya tiene una comanda abierta' },
+  cobro_numero_dia_unico: {
+    http: 500,
+    mensaje: 'Error interno: el número de factura se generó sin pasar por el contador del día',
+  },
   usuario_unico_por_restaurante: { http: 409, mensaje: 'Ya existe un usuario con ese nombre de usuario' },
   reservacion_codigo_publico_key: { http: 500, mensaje: 'Error interno generando el código de la reserva' },
   restaurante_slug_key: { http: 409, mensaje: 'Ya existe un restaurante con ese slug' },
@@ -90,15 +96,50 @@ const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
     http: 422,
     mensaje: 'Una comanda de mesa exige mesa, salón y plantilla; una para llevar no lleva mesa',
   },
-  comanda_totales_validos: { http: 422, mensaje: 'Los totales de la comanda no pueden ser negativos' },
-  comanda_cierre_coherente: { http: 422, mensaje: 'El estado de la comanda es incoherente con su fecha de cierre' },
-  comanda_tasa_congelada: { http: 422, mensaje: 'No se puede cobrar sin congelar antes la tasa de cambio' },
-  pago_monto_valido: { http: 422, mensaje: 'El monto del pago debe ser mayor que 0' },
-  pago_referencia_obligatoria: {
+  comanda_total_valido: { http: 422, mensaje: 'El total de la comanda no puede ser negativo' },
+  comanda_anulada_no_cobrada: {
+    http: 409,
+    mensaje: 'Una comanda cobrada no se puede anular, ni una anulada cobrar',
+  },
+  comanda_anulacion_coherente: {
+    http: 422,
+    mensaje: 'El motivo de anulación sólo se guarda al anular la comanda',
+  },
+  // Regla de negocio confirmada por el dueño: se cobra sólo lo que ya salió de
+  // cocina; lo pendiente se queda y arranca la cuenta siguiente de la mesa.
+  comanda_cobro_tras_despacho: {
+    http: 409,
+    mensaje: 'No se puede cobrar una comanda que la cocina todavía no despachó',
+  },
+  // El guardián de las líneas. Es 409 y no 422 porque no son datos malos: es
+  // que el pedido ya salió y llega tarde.
+  comanda_item_solo_pendiente: {
+    http: 409,
+    mensaje: 'Esa comanda ya salió de cocina o se cobró: sus líneas no se pueden cambiar',
+  },
+  comanda_item_cancelacion_coherente: {
+    http: 422,
+    mensaje: 'El motivo de cancelación sólo se guarda al anular la línea',
+  },
+  cobro_totales_validos: { http: 422, mensaje: 'Los totales del cobro no pueden ser negativos' },
+  cobro_tipo_coherente: { http: 422, mensaje: 'Un cobro con mesa exige también su salón' },
+  cobro_anulacion_coherente: {
+    http: 422,
+    mensaje: 'El motivo de anulación sólo se guarda al anular el cobro',
+  },
+  // ⭐ La factura fantasma: dos cajeros cobraron la misma mesa y el segundo se
+  // quedó sin comandas que cubrir. Es 409 porque el cajero tiene que saber que
+  // no cobre otra vez — la mesa ya está paga.
+  cobro_no_vacio: {
+    http: 409,
+    mensaje: 'Esa cuenta ya la cobró otro cajero: la factura no cubriría ninguna comanda',
+  },
+  cobro_pago_monto_valido: { http: 422, mensaje: 'El monto del pago debe ser mayor que 0' },
+  cobro_pago_referencia_obligatoria: {
     http: 422,
     mensaje: 'Pago móvil y transferencia exigen un número de referencia',
   },
-  pago_tasa_coherente: {
+  cobro_pago_tasa_coherente: {
     http: 422,
     mensaje: 'Un pago en Bs exige la tasa aplicada; uno en USD no debe llevarla',
   },
@@ -106,7 +147,9 @@ const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
   // Estos dos son la red que impide cobrar en bolívares usando la cotización
   // del euro. Si alguna vez aparecen en producción, NO es un error del
   // usuario: es que una consulta de tasa perdió su filtro `divisa: 'USD'`.
-  comanda_tasa_base: {
+  // `comanda_tasa_base` se llama `cobro_tasa_base` desde que la tasa se congela
+  // en la factura y no en la comanda.
+  cobro_tasa_base: {
     http: 500,
     mensaje: 'Error interno: se intentó cobrar con una tasa que no es la del dólar',
   },

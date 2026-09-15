@@ -1,7 +1,6 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import * as QRCode from 'qrcode';
 import { PrismaService } from '../comun/prisma/prisma.service';
-import { ComandasService } from '../comandas/comandas.service';
 import { nuevoId } from '../comun/id';
 import { generarCodigoCorto, generarCodigoPublico } from '../comun/codigos';
 import { Prisma } from '../generated/prisma/client';
@@ -30,7 +29,6 @@ interface DatosReservacionInterna {
 export class ReservacionesService {
   constructor(
     private readonly prisma: PrismaService,
-    private readonly comandas: ComandasService,
   ) {}
 
   async resolverPlantillaActiva(
@@ -195,8 +193,30 @@ export class ReservacionesService {
     return this.prisma.reservacion.update({ where: { id }, data: { estado: 'no_show' } });
   }
 
-  /** El cliente llegó: se sienta (mesa asignada si faltaba) y se abre comanda. */
-  async sentar(restauranteId: string, id: string, meseroId: string, dto: { mesaId?: string; comensales?: number }) {
+  /**
+   * El cliente llegó: se le asigna mesa (si faltaba) y la reserva queda
+   * `sentada`.
+   *
+   * ⚠️ Ya NO abre comanda, y por eso devuelve sólo `{ reservacion }`. Antes la
+   * abría porque la comanda ERA la ocupación de la mesa; desde el rediseño una
+   * comanda es un PEDIDO y exige al menos una línea, así que abrir una vacía
+   * metería un ticket en blanco en la cola de cocina. La primera comanda la
+   * crea el mesero al tomar la nota, pasando `reservacionId`, y es la que
+   * ocupa la mesa.
+   *
+   * ⭐ La mesa SÍ queda ocupada en el acto, aunque no haya pedido: `v_mesa_estado`
+   * trata una reserva en estado `sentada` como ocupación por sí sola. Es lo que
+   * pidió el dueño —al escanear el QR la mesa se toma ya, no cuando el mesero
+   * apunta— y lo que impide que el refresco del plano pise el estado optimista
+   * que el frontend pinta tras el check-in. Se libera al cobrar la mesa, o
+   * explícitamente cancelando la reserva / marcándola no-show.
+   */
+  async sentar(
+    restauranteId: string,
+    id: string,
+    _meseroId: string,
+    dto: { mesaId?: string; comensales?: number },
+  ) {
     const reservacion = await this.obtener(restauranteId, id);
     if (reservacion.estado !== 'pendiente' && reservacion.estado !== 'confirmada') {
       throw new ConflictException('Esa reservación no está lista para sentarse');
@@ -206,19 +226,12 @@ export class ReservacionesService {
     if (!mesaId) throw new BadRequestException('Falta asignar una mesa antes de sentar');
     await this.validarMesaDisponibleEnPlantilla(this.prisma, restauranteId, reservacion.plantillaId, mesaId);
 
-    if (dto.mesaId && dto.mesaId !== reservacion.mesaId) {
-      await this.prisma.reservacion.update({ where: { id }, data: { mesaId: dto.mesaId } });
-    }
-
-    const comanda = await this.comandas.abrirComanda(restauranteId, meseroId, {
-      tipo: 'mesa',
-      mesaId,
-      comensales: dto.comensales ?? reservacion.personas,
-      reservacionId: id,
+    await this.prisma.reservacion.update({
+      where: { id },
+      data: { mesaId, estado: 'sentada', sentadaEn: new Date() },
     });
 
-    const actualizada = await this.obtener(restauranteId, id);
-    return { reservacion: actualizada, comanda };
+    return { reservacion: await this.obtener(restauranteId, id) };
   }
 
   async huerfanas(restauranteId: string) {

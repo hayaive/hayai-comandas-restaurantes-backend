@@ -11,7 +11,14 @@
     "outDir": "./dist",
     "rootDir": "./src",
     "baseUrl": "./",
-    "incremental": true,
+    // ⚠️ NO reactivar `"incremental": true` mientras `nest-cli.json` tenga
+    // `deleteOutDir: true`. Juntos producen un build roto EN SILENCIO: nest
+    // borra `dist/`, tsc lee el `.tsbuildinfo` de la corrida anterior, concluye
+    // que no hay nada que recompilar y no emite nada. El comando termina con
+    // éxito y `dist/` queda VACÍO — con lo que `npm run start:prod`
+    // (`node dist/main.js`) falla con MODULE_NOT_FOUND en el despliegue.
+    // Sólo se notaba en la segunda corrida seguida; la primera, tras un clone
+    // limpio, funcionaba.
     "skipLibCheck": true,
     "strictNullChecks": true,
     "noImplicitAny": false,

@@ -15,7 +15,15 @@ export type GranularidadSerie = 'turno' | 'dia' | 'mes';
  * redondeo en el mismo sitio donde el dueño cuadra la caja.
  */
 export interface VentaResumen {
-  comandas: number;
+  /**
+   * Facturas emitidas en el tramo = mesas atendidas. Se llamaba `comandas`
+   * cuando una comanda ERA la cuenta de la mesa; desde el rediseño una mesa
+   * genera varias comandas y una sola factura, así que contar comandas ya no
+   * respondía "cuántas mesas vendimos" ni servía de denominador del ticket.
+   * "Cuántos pedidos salieron" es otra pregunta, y se responde por
+   * `comanda.despachada_en` (el día que la cocina trabajó), no por el del pago.
+   */
+  cobros: number;
   comensales: number;
   totalUsd: string;
   /** Total sin propina: la propina es del mesero, no ingreso del restaurante. */
@@ -23,7 +31,7 @@ export interface VentaResumen {
   propinasUsd: string;
   descuentosUsd: string;
   impuestosUsd: string;
-  /** totalUsd / comandas. "0.0000" cuando el tramo no tuvo ventas. */
+  /** totalUsd / cobros. "0.0000" cuando el tramo no tuvo ventas. */
   ticketPromedioUsd: string;
 }
 
@@ -66,7 +74,7 @@ interface RangoResuelto {
 
 /** Fila cruda de agregación; el dinero llega en texto desde Postgres. */
 interface FilaResumen {
-  comandas: number | string;
+  cobros: number | string;
   comensales: number | string;
   total_usd: string;
   ventas_usd: string;
@@ -78,7 +86,7 @@ interface FilaResumen {
 
 function aResumen(f: FilaResumen): VentaResumen {
   return {
-    comandas: Number(f.comandas),
+    cobros: Number(f.cobros),
     comensales: Number(f.comensales),
     totalUsd: String(f.total_usd),
     ventasUsd: String(f.ventas_usd),
@@ -90,7 +98,7 @@ function aResumen(f: FilaResumen): VentaResumen {
 }
 
 const RESUMEN_VACIO: VentaResumen = {
-  comandas: 0,
+  cobros: 0,
   comensales: 0,
   totalUsd: '0.0000',
   ventasUsd: '0.0000',
@@ -106,17 +114,17 @@ const RESUMEN_VACIO: VentaResumen = {
  * el total del año y el de un turno no puedan divergir por un copy-paste.
  *
  * `ticket_promedio` es sum/sum y no avg(avg): promediar promedios de días con
- * distinto número de comandas da un número que no es el ticket de nadie.
+ * distinto número de cobros da un número que no es el ticket de nadie.
  */
 const METRICAS = `
-  coalesce(sum(v."comandas"), 0)::int                                  AS "comandas",
+  coalesce(sum(v."cobros"), 0)::int                                    AS "cobros",
   coalesce(sum(v."comensales"), 0)::int                                AS "comensales",
   round(coalesce(sum(v."total_usd"), 0), 4)::text                      AS "total_usd",
   round(coalesce(sum(v."ventas_usd"), 0), 4)::text                     AS "ventas_usd",
   round(coalesce(sum(v."propinas_usd"), 0), 4)::text                   AS "propinas_usd",
   round(coalesce(sum(v."descuentos_usd"), 0), 4)::text                 AS "descuentos_usd",
   round(coalesce(sum(v."impuestos_usd"), 0), 4)::text                  AS "impuestos_usd",
-  round(coalesce(sum(v."total_usd") / nullif(sum(v."comandas"), 0), 0), 4)::text AS "ticket_promedio_usd"
+  round(coalesce(sum(v."total_usd") / nullif(sum(v."cobros"), 0), 0), 4)::text AS "ticket_promedio_usd"
 `;
 
 @Injectable()
@@ -254,14 +262,18 @@ export class ReportesService {
   /**
    * Suma de un tramo de días operativos, leída de `v_venta_dia`.
    *
-   * Se agrega sobre la vista y no sobre `comanda` a propósito: la vista es la
-   * definición única de "qué cuenta como venta" (sólo `estado = 'cobrada'`,
+   * Se agrega sobre la vista y no sobre `cobro` a propósito: la vista es la
+   * definición única de "qué cuenta como venta" (una factura no anulada,
    * `ventas_usd` sin propina). Repetir ese WHERE aquí crearía una segunda
    * definición que puede quedarse atrás. El predicado por
    * `(restaurante_id, fecha_operativa)` son columnas de agrupación de la
    * vista, así que Postgres lo empuja al índice
-   * `comanda (restaurante_id, fecha_operativa, estado)` en vez de agregar la
-   * tabla entera.
+   * `cobro_dia_idx (restaurante_id, fecha_operativa, turno)` en vez de agregar
+   * la tabla entera.
+   *
+   * ⚠️ La `fecha_operativa` que se agrega es la DEL COBRO, no la de la comanda:
+   * la venta se reconoce cuando entra el dinero, para que el reporte cuadre con
+   * la caja física al cerrar el turno.
    */
   private async totalesDelRango(restauranteId: string, desde: string, hasta: string): Promise<VentaResumen> {
     const filas = await this.prisma.$queryRawUnsafe<FilaResumen[]>(
@@ -328,7 +340,7 @@ export class ReportesService {
     const filas = await this.prisma.$queryRawUnsafe<(FilaResumen & { clave: string })[]>(
       `
       WITH "datos" AS (
-        SELECT "fecha_operativa", "turno", "comandas", "comensales",
+        SELECT "fecha_operativa", "turno", "cobros", "comensales",
                "total_usd", "ventas_usd", "propinas_usd", "descuentos_usd", "impuestos_usd"
           FROM "v_venta_dia"
          WHERE "restaurante_id" = $1::uuid
@@ -362,7 +374,7 @@ export class ReportesService {
       SELECT
         ${restauranteId}::uuid AS restaurante_id,
         ${fecha}::date AS fecha_operativa,
-        coalesce(sum(comandas), 0)::int AS comandas,
+        coalesce(sum(cobros), 0)::int AS cobros,
         coalesce(sum(comensales), 0)::int AS comensales,
         coalesce(sum(total_usd), 0) AS total_usd,
         coalesce(sum(ventas_usd), 0) AS ventas_usd,
@@ -441,7 +453,7 @@ export class ReportesService {
        ORDER BY metodo, moneda
     `;
     const descuadres = await this.prisma.$queryRaw<any[]>`
-      SELECT * FROM v_comanda_descuadre
+      SELECT * FROM v_cobro_descuadre
        WHERE restaurante_id = ${restauranteId}::uuid AND fecha_operativa = ${fecha}::date
     `;
     return { porMetodo, descuadres };
