@@ -52,10 +52,12 @@ const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
     http: 422,
     mensaje: 'La mesa no existe o no pertenece a este restaurante',
   },
-  // DELETE /plantillas/:id: comanda/reservacion son RESTRICT hacia plantilla
-  // (schema.prisma) a propósito — no se puede borrar una plantilla con
-  // histórico. Sin esta entrada caían en el genérico de MAPA_SQLSTATE
-  // ('El registro referenciado no existe'), que no dice qué hacer.
+  // `DELETE /plantillas/:id` es un borrado lógico (UPDATE) desde
+  // `PlantillasService.eliminar`, así que ya NO dispara estas dos FK RESTRICT
+  // (comanda/reservacion → plantilla). Se dejan como red de seguridad: si
+  // algún otro camino intentara un DELETE físico, esto sigue explicando el
+  // 422 en vez de caer en el genérico de MAPA_SQLSTATE ('El registro
+  // referenciado no existe'), que no dice qué hacer.
   comanda_restaurante_id_plantilla_id_fkey: {
     http: 422,
     mensaje: 'No se puede eliminar: esta plantilla tiene comandas asociadas',
@@ -66,6 +68,9 @@ const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
   },
 
   // 23514 — CHECK / trigger de validación
+  // Borrado lógico de plantilla: una plantilla borrada no puede reactivarse
+  // ni quedar como la activa del salón (ver PlantillasService.eliminar/activar).
+  plantilla_eliminada_no_activa: { http: 422, mensaje: 'No se puede activar una distribución eliminada' },
   plantilla_mesa_mismo_salon: { http: 422, mensaje: 'Esa mesa pertenece a otro salón' },
   plantilla_mesa_capacidad_valida: { http: 422, mensaje: 'La capacidad debe estar entre 1 y 50' },
   plantilla_mesa_rotacion_valida: { http: 422, mensaje: 'La rotación debe estar entre 0 y 359 grados' },

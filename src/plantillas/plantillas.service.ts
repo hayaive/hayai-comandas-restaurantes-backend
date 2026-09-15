@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../comun/prisma/prisma.service';
 import { nuevoId } from '../comun/id';
 import { CrearPlantillaDto } from './dto/crear-plantilla.dto';
@@ -11,13 +11,13 @@ export class PlantillasService {
 
   listarPorSalon(restauranteId: string, salonId: string) {
     return this.prisma.plantilla.findMany({
-      where: { restauranteId, salonId },
+      where: { restauranteId, salonId, eliminadaEn: null },
       orderBy: { creadaEn: 'asc' },
     });
   }
 
   async obtener(restauranteId: string, id: string) {
-    const plantilla = await this.prisma.plantilla.findFirst({ where: { restauranteId, id } });
+    const plantilla = await this.prisma.plantilla.findFirst({ where: { restauranteId, id, eliminadaEn: null } });
     if (!plantilla) throw new NotFoundException('Plantilla no encontrada');
     return plantilla;
   }
@@ -58,11 +58,18 @@ export class PlantillasService {
     });
   }
 
+  /**
+   * DELETE /plantillas/:id — borrado lógico. `plantilla_mesa` NO se toca a
+   * propósito: es lo que preserva el layout histórico de la distribución
+   * borrada, y las comandas/reservaciones que apuntan a esta plantilla
+   * conservan su `plantilla_id` intacto.
+   */
   async eliminar(restauranteId: string, id: string) {
-    await this.obtener(restauranteId, id);
-    // Cascade en plantilla_mesa; reservacion/comanda son RESTRICT, así que una
-    // plantilla con historial no se puede borrar (23503 → 422, ver PgErrorFilter).
-    await this.prisma.plantilla.delete({ where: { id } });
+    const plantilla = await this.obtener(restauranteId, id);
+    if (plantilla.activa) {
+      throw new ConflictException('No se puede eliminar la distribución activa del salón: activa otra primero');
+    }
+    await this.prisma.plantilla.update({ where: { id }, data: { eliminadaEn: new Date() } });
   }
 
   /** CONTRACT.md §3.4: clonar copia el layout completo, activa=false, con trazabilidad. */
@@ -242,6 +249,7 @@ export class PlantillasService {
   }
 
   async actualizarMesa(restauranteId: string, plantillaId: string, mesaId: string, dto: ActualizarPlantillaMesaDto) {
+    await this.obtener(restauranteId, plantillaId);
     const existente = await this.prisma.plantillaMesa.findFirst({ where: { restauranteId, plantillaId, mesaId } });
     if (!existente) throw new NotFoundException('Esa mesa no está en esta plantilla');
 
@@ -262,6 +270,7 @@ export class PlantillasService {
 
   /** DELETE /plantillas/:id/mesas/:mesaId — la quita del plano, NO borra la mesa. */
   async quitarMesa(restauranteId: string, plantillaId: string, mesaId: string) {
+    await this.obtener(restauranteId, plantillaId);
     const existente = await this.prisma.plantillaMesa.findFirst({ where: { restauranteId, plantillaId, mesaId } });
     if (!existente) throw new NotFoundException('Esa mesa no está en esta plantilla');
     await this.prisma.plantillaMesa.delete({ where: { plantillaId_mesaId: { plantillaId, mesaId } } });

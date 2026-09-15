@@ -40,7 +40,8 @@ DECLARE
     'pago_referencia_obligatoria',
     'pago_tasa_coherente',
     'plantilla_mesa_capacidad_valida',
-    'reservacion_rango_valido'
+    'reservacion_rango_valido',
+    'plantilla_eliminada_no_activa'
   ];
 
   triggers text[] := ARRAY[

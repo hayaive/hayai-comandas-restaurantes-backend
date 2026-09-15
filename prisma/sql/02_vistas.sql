@@ -83,7 +83,8 @@ LEFT JOIN LATERAL (
                              AND now() + interval '2 hours'
      ORDER BY r."inicia_en"
      LIMIT 1
-) rsv ON TRUE;
+) rsv ON TRUE
+WHERE pl."eliminada_en" IS NULL;
 
 
 -- ───────────────────────────────────────────────────────────────────────────

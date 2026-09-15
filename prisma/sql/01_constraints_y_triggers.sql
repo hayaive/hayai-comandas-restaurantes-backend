@@ -232,7 +232,11 @@ ALTER TABLE "mesa"
   ADD CONSTRAINT "mesa_etiqueta_no_vacia" CHECK (length(btrim("etiqueta")) > 0);
 
 ALTER TABLE "plantilla"
-  ADD CONSTRAINT "plantilla_plano_valido" CHECK ("ancho_plano" > 0 AND "alto_plano" > 0);
+  ADD CONSTRAINT "plantilla_plano_valido" CHECK ("ancho_plano" > 0 AND "alto_plano" > 0),
+  -- Borrado lógico: una plantilla eliminada no puede ser a la vez la activa
+  -- del salón. Cierra la puerta trasera de reactivar una plantilla borrada
+  -- con un UPDATE directo a "activa" que se salte `PlantillasService`.
+  ADD CONSTRAINT "plantilla_eliminada_no_activa" CHECK ("eliminada_en" IS NULL OR NOT "activa");
 
 ALTER TABLE "reservacion"
   ADD CONSTRAINT "reservacion_rango_valido" CHECK ("termina_en" > "inicia_en"),

@@ -133,6 +133,7 @@ zona. Los importes son **string** en el wire (Prisma serializa `Decimal`), no
 | `activa` | bool | **Sólo una en `true` por salón** (garantizado por la base) |
 | `clonadaDeId` | uuid? | NULL = creada desde plano vacío |
 | `creadaPorId` | uuid? | |
+| `eliminadaEn` | date? | Borrado lógico. Nunca puede coexistir con `activa=true` (la base lo garantiza) |
 
 ### 2.6 PlantillaMesa — la mesa en el plano
 
@@ -343,9 +344,13 @@ anfitrión (no bloquear: es una decisión suya).
 |---|---|
 | "Quitar esta mesa del plano" | `DELETE FROM plantilla_mesa WHERE plantilla_id=$p AND mesa_id=$m` |
 | "Esta mesa ya no existe" | `UPDATE mesa SET eliminada_en=now(), activa=false` + quitarla de todas las plantillas |
+| "Eliminar una distribución" | `UPDATE plantilla SET eliminada_en = now() WHERE id=$p`. Prohibido si es la activa del salón (409) |
 
 Nunca `DELETE FROM mesa`: hay comandas y reservas históricas apuntando ahí, y la
-FK es `RESTRICT` precisamente para que ese error salte en desarrollo.
+FK es `RESTRICT` precisamente para que ese error salte en desarrollo. Lo mismo
+aplica a `plantilla`: nunca `DELETE FROM plantilla` — es lo que preserva
+`plantilla_mesa` y el histórico de comandas/reservaciones que apuntan a esa
+distribución. `DELETE /plantillas/:id` es, por dentro, el UPDATE de arriba.
 
 ---
 
@@ -362,8 +367,10 @@ El backend **debe** capturarlos; son reglas de negocio, no fallos técnicos.
 | `23505` | `comanda_numero_dia_unico` | 500 | Bug: el número se pidió sin el contador |
 | `23514` | cualquier CHECK | 422 | Según el constraint (ver `01_constraints_y_triggers.sql`) |
 | `23503` | cualquier FK | 422 | "El registro referenciado no existe" |
-| `23503` | `comanda_restaurante_id_plantilla_id_fkey` | 422 | "No se puede eliminar: esta plantilla tiene comandas asociadas" (`DELETE /plantillas/:id` con histórico) |
-| `23503` | `reservacion_restaurante_id_plantilla_id_fkey` | 422 | "No se puede eliminar: esta plantilla tiene reservaciones asociadas" (`DELETE /plantillas/:id` con histórico) |
+| `23503` | `comanda_restaurante_id_plantilla_id_fkey` | 422 | "No se puede eliminar: esta plantilla tiene comandas asociadas" — red de seguridad; `DELETE /plantillas/:id` es un borrado lógico y ya no dispara esta FK |
+| `23503` | `reservacion_restaurante_id_plantilla_id_fkey` | 422 | "No se puede eliminar: esta plantilla tiene reservaciones asociadas" — red de seguridad, mismo caso |
+| 409 (aplicación) | — | 409 | "No se puede eliminar la distribución activa del salón: activa otra primero" (`DELETE /plantillas/:id` sobre la plantilla activa, ver §3.6) |
+| `23514` | `plantilla_eliminada_no_activa` | 422 | "No se puede activar una distribución eliminada" |
 | `23514` | `plantilla_mesa_mismo_salon` | 422 | "Esa mesa pertenece a otro salón" |
 | `23505` | `tasa_cambio_dia_unica` | 409 | "Ya existe una tasa para esa divisa, fecha y fuente" — **no debería verse**: `POST /tasa` es upsert |
 | `23514` | `comanda_tasa_base` | **500** | Bug: se cobró con una tasa que no es la del dólar. Es un error del backend, no del usuario |
@@ -402,7 +409,8 @@ GET    /salones/:salonId/plantillas                              -> Plantilla[]
 POST   /salones/:salonId/plantillas { nombre, anchoPlano?, altoPlano? } -> Plantilla
 GET    /plantillas/:id                                           -> Plantilla & { mesas: PlantillaMesa[] }
 PATCH  /plantillas/:id             { nombre?, descripcion?, anchoPlano?, altoPlano? } -> Plantilla
-DELETE /plantillas/:id                                           -> 204
+DELETE /plantillas/:id                                           -> 204 | 409 si es la activa | 404 si no existe
+       // Borrado lógico (§3.6): no borra `plantilla_mesa` ni el histórico.
 POST   /plantillas/:id/clonar      { nombre }                    -> Plantilla
 POST   /plantillas/:id/activar                                   -> { plantilla, reservacionesHuerfanas: Reservacion[] }
 

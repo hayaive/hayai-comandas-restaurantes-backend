@@ -360,6 +360,10 @@ model Plantilla {
   clonadaDeId String? @map("clonada_de_id") @db.Uuid
   creadaPorId String? @map("creada_por_id") @db.Uuid
 
+  /// Borrado lógico. Preserva `plantilla_mesa` y el histórico de
+  /// reservacion/comanda que apunta a esta plantilla. Nunca puede ser no-nulo
+  /// junto con `activa=true` (constraint `plantilla_eliminada_no_activa`).
+  eliminadaEn   DateTime? @map("eliminada_en") @db.Timestamptz(6)
   creadaEn      DateTime @default(now()) @map("creada_en") @db.Timestamptz(6)
   actualizadaEn DateTime @updatedAt @map("actualizada_en") @db.Timestamptz(6)
 
