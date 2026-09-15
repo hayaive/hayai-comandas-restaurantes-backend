@@ -98,25 +98,60 @@ export class TasaService {
    */
   async actualizarDesdeApiExterna(restauranteId: string): Promise<TasasVigentes> {
     const restaurante = await this.prisma.restaurante.findFirstOrThrow({ where: { id: restauranteId } });
-    const { fecha } = hoyEnZona(restaurante.zonaHoraria);
+    const { fecha: fechaHoy } = hoyEnZona(restaurante.zonaHoraria);
 
-    const [usdPromedio, eurPromedio] = await Promise.all([
-      this.fetchPromedioOficial(URL_DOLARES),
-      this.fetchPromedioOficial(URL_EUROS),
+    const [usd, eur] = await Promise.all([
+      this.fetchCotizacionOficial(URL_DOLARES),
+      this.fetchCotizacionOficial(URL_EUROS),
     ]);
 
-    if (usdPromedio == null && eurPromedio == null) {
+    if (usd == null && eur == null) {
       this.logger.warn(
         `dolarapi.com no respondió para restaurante ${restauranteId}; se conserva la última tasa registrada (manual o de un fetch anterior)`,
       );
     }
 
     await Promise.all([
-      usdPromedio != null ? this.upsertBcv(restauranteId, fecha, 'USD', usdPromedio) : Promise.resolve(),
-      eurPromedio != null ? this.upsertBcv(restauranteId, fecha, 'EUR', eurPromedio) : Promise.resolve(),
+      usd != null
+        ? this.upsertBcv(
+            restauranteId,
+            this.resolverFechaValor(restaurante.zonaHoraria, usd.fechaActualizacion, fechaHoy),
+            'USD',
+            usd.promedio,
+          )
+        : Promise.resolve(),
+      eur != null
+        ? this.upsertBcv(
+            restauranteId,
+            this.resolverFechaValor(restaurante.zonaHoraria, eur.fechaActualizacion, fechaHoy),
+            'EUR',
+            eur.promedio,
+          )
+        : Promise.resolve(),
     ]);
 
     return this.vigente(restauranteId);
+  }
+
+  /**
+   * El BCV a veces publica la "fecha valor" ADELANTADA a hoy (ej. un viernes
+   * en la tarde ya publica el valor que rige el lunes, porque no hay mercado
+   * el fin de semana, o antes de un feriado publica el del siguiente día
+   * hábil). Cuando `fechaActualizacion` viene y es válida, esa es la fecha
+   * real de vigencia de la tasa y se usa como clave del upsert en vez de
+   * "hoy" — así una tasa fechada a futuro queda disponible apenas exista,
+   * sin esperar a que el calendario la alcance (`vigente()` ya ordena por
+   * `fecha DESC` sin filtrar "no mayor a hoy").
+   *
+   * Se trunca al mismo patrón de día calendario que `hoyEnZona()` usa para
+   * "hoy", pasándole el instante de `fechaActualizacion` como `momento` en
+   * vez de reimplementar el truncamiento.
+   */
+  private resolverFechaValor(zonaHoraria: string, fechaActualizacion: string | null, fechaHoy: Date): Date {
+    if (fechaActualizacion == null) return fechaHoy;
+    const momento = new Date(fechaActualizacion);
+    if (Number.isNaN(momento.getTime())) return fechaHoy;
+    return hoyEnZona(zonaHoraria, momento).fecha;
   }
 
   private upsertBcv(restauranteId: string, fecha: Date, divisa: Divisa, valor: number) {
@@ -132,15 +167,22 @@ export class TasaService {
   /**
    * `GET https://ve.dolarapi.com/v1/dolares` y `.../v1/euros` (verificado en
    * vivo el 2026-09-13: ambos devuelven hoy un array
-   * `[{ fuente, promedio, ... }]`, con `fuente: "oficial"` para el BCV — NO
-   * `{ oficial: { promedio } }` como en versiones anteriores de la API que
-   * usaba `/v1/euro` en singular, ese path ahora da 404). Se soportan las dos
-   * formas por si la API vuelve a cambiar de shape sin aviso.
+   * `[{ fuente, promedio, fechaActualizacion, ... }]`, con `fuente: "oficial"`
+   * para el BCV — NO `{ oficial: { promedio } }` como en versiones anteriores
+   * de la API que usaba `/v1/euro` en singular, ese path ahora da 404). Se
+   * soportan las dos formas por si la API vuelve a cambiar de shape sin
+   * aviso. `fechaActualizacion` llega como ISO con offset, ej.
+   * `"2026-09-11T00:00:00-04:00"`.
    *
    * Nunca lanza: un timeout o un error de red aquí no puede tumbar el cron ni
    * el arranque del servidor — se loguea y la tasa manual sigue de respaldo.
+   * El parsing de `fechaActualizacion` es defensivo igual que el de
+   * `promedio`: si falta o es inválida, se devuelve `null` en su lugar y el
+   * llamador cae de vuelta a "hoy" (`resolverFechaValor`).
    */
-  private async fetchPromedioOficial(url: string): Promise<number | null> {
+  private async fetchCotizacionOficial(
+    url: string,
+  ): Promise<{ promedio: number; fechaActualizacion: string | null } | null> {
     const controlador = new AbortController();
     const timeout = setTimeout(() => controlador.abort(), TIMEOUT_MS);
     try {
@@ -152,19 +194,25 @@ export class TasaService {
       const data: unknown = await res.json();
 
       let promedio: unknown;
+      let fechaActualizacion: unknown;
       if (Array.isArray(data)) {
         const oficial = data.find((d) => (d as { fuente?: string })?.fuente === 'oficial');
         promedio = (oficial as { promedio?: unknown } | undefined)?.promedio;
+        fechaActualizacion = (oficial as { fechaActualizacion?: unknown } | undefined)?.fechaActualizacion;
       } else if (data && typeof data === 'object') {
-        const obj = data as { oficial?: { promedio?: unknown }; promedio?: unknown };
+        const obj = data as { oficial?: { promedio?: unknown; fechaActualizacion?: unknown }; promedio?: unknown; fechaActualizacion?: unknown };
         promedio = obj.oficial?.promedio ?? obj.promedio;
+        fechaActualizacion = obj.oficial?.fechaActualizacion ?? obj.fechaActualizacion;
       }
 
       if (typeof promedio !== 'number' || !Number.isFinite(promedio) || promedio <= 0) {
         this.logger.warn(`dolarapi.com devolvió una respuesta sin "promedio" oficial válido en ${url}`);
         return null;
       }
-      return promedio;
+      return {
+        promedio,
+        fechaActualizacion: typeof fechaActualizacion === 'string' ? fechaActualizacion : null,
+      };
     } catch (err) {
       this.logger.warn(`No se pudo consultar ${url}: ${(err as Error).message}`);
       return null;
