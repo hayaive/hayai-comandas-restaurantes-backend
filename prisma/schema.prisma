@@ -183,29 +183,50 @@ enum FuenteTasa {
   @@map("fuente_tasa")
 }
 
+/// Temas de notificación push. Son GRANULARES a propósito: la tablet de barra y
+/// la de cocina entran las dos con rol `cocina` (no existe un rol `barra`), así
+/// que lo único que las distingue es a qué se suscribió cada aparato.
+///
+/// Los dos últimos valores YA existen aunque todavía nadie los emita: declarar
+/// ahora un valor de enum es gratis, y añadirlo después obliga a
+/// `ALTER TYPE ... ADD VALUE` y a desplegar el backend antes que el frontend.
+/// El día que se pidan las "cuentas por cobrar" no habrá que tocar el esquema.
+enum TemaNotificacion {
+  /// Entró una comanda con líneas cuyo `destino_snap` = cocina.
+  comanda_cocina
+  /// Entró una comanda con líneas cuyo `destino_snap` = barra.
+  comanda_barra
+  /// Reservado: la mesa pidió la cuenta / hay cuentas vivas sin cobrar.
+  cuenta_por_cobrar
+  /// Reservado: entró una reserva por el enlace público.
+  reservacion_nueva
+
+  @@map("tema_notificacion")
+}
+
 // ═══════════════════ 1 · RESTAURANTE Y PERSONAS ════════════════════════════
 
 /// Raíz del tenant. Existe desde el día 1 aunque hoy haya un solo restaurante:
 /// añadir `restaurante_id` después obliga a rehacer cada PK, cada índice y cada
 /// consulta del sistema (ver docs/DECISIONES-DATOS.md §D1).
 model Restaurante {
-  id     String @id @db.Uuid
+  id     String  @id @db.Uuid
   /// Namespace de la URL pública de reservas: /r/<slug>/reservar
-  slug   String @unique @db.Citext
+  slug   String  @unique @db.Citext
   nombre String
   rif    String?
 
   /// Moneda en la que se fijan los precios del menú. En Venezuela: USD.
   /// El cobro en Bs se convierte a la tasa del momento y NO se persiste derivado.
-  monedaBase   Moneda @default(USD) @map("moneda_base")
-  zonaHoraria  String @default("America/Caracas") @map("zona_horaria")
+  monedaBase   Moneda   @default(USD) @map("moneda_base")
+  zonaHoraria  String   @default("America/Caracas") @map("zona_horaria")
   /// Hora de corte del día contable. Lo cobrado antes de esta hora pertenece a
   /// la fecha_operativa del día anterior. Default 05:00 (cierre de madrugada).
   horaCorteDia DateTime @default(dbgenerated("'05:00'::time")) @map("hora_corte_dia") @db.Time(0)
 
   /// Duración por defecto de una reservación, en minutos. Define el rango que
   /// el EXCLUDE usa para impedir doble reserva de la misma mesa.
-  duracionReservaMin Int     @default(90) @map("duracion_reserva_min")
+  duracionReservaMin   Int     @default(90) @map("duracion_reserva_min")
   /// Si el cliente puede elegir mesa desde el enlace público.
   permiteAutoseleccion Boolean @default(true) @map("permite_autoseleccion")
 
@@ -213,21 +234,22 @@ model Restaurante {
   creadoEn      DateTime @default(now()) @map("creado_en") @db.Timestamptz(6)
   actualizadoEn DateTime @updatedAt @map("actualizado_en") @db.Timestamptz(6)
 
-  usuarios      Usuario[]
-  salones       Salon[]
-  mesas         Mesa[]
-  plantillas    Plantilla[]
-  plantillaMesas PlantillaMesa[]
-  categorias    Categoria[]
-  productos     Producto[]
-  reservaciones Reservacion[]
-  comandas      Comanda[]
-  comandaItems  ComandaItem[]
-  cobros        Cobro[]
-  pagos         CobroPago[]
-  tasas         TasaCambio[]
-  contadores    ContadorDia[]
-  resumenes     ResumenDia[]
+  usuarios          Usuario[]
+  salones           Salon[]
+  mesas             Mesa[]
+  plantillas        Plantilla[]
+  plantillaMesas    PlantillaMesa[]
+  categorias        Categoria[]
+  productos         Producto[]
+  reservaciones     Reservacion[]
+  comandas          Comanda[]
+  comandaItems      ComandaItem[]
+  cobros            Cobro[]
+  pagos             CobroPago[]
+  tasas             TasaCambio[]
+  contadores        ContadorDia[]
+  resumenes         ResumenDia[]
+  suscripcionesPush SuscripcionPush[]
 
   @@map("restaurante")
 }
@@ -236,32 +258,33 @@ model Restaurante {
 /// acciones × 4 roles de hayai-saas — sería sobre-ingeniería para un MVP de
 /// comandas. Si más adelante se pide, `rol` pasa a FK sin tocar el resto.
 model Usuario {
-  id            String     @id @db.Uuid
-  restauranteId String     @map("restaurante_id") @db.Uuid
-  nombre        String
+  id             String     @id @db.Uuid
+  restauranteId  String     @map("restaurante_id") @db.Uuid
+  nombre         String
   /// Único por restaurante, no global.
-  usuario       String     @db.Citext
-  claveHash     String     @map("clave_hash")
+  usuario        String     @db.Citext
+  claveHash      String     @map("clave_hash")
   /// PIN corto para el login de mostrador del mesero (Argon2id, igual que la
   /// clave). Nullable: cocina y caja entran con usuario/clave.
-  pinHash       String?    @map("pin_hash")
-  rol           RolUsuario
-  activo        Boolean    @default(true)
-  ultimoAccesoEn DateTime? @map("ultimo_acceso_en") @db.Timestamptz(6)
-  creadoEn      DateTime   @default(now()) @map("creado_en") @db.Timestamptz(6)
-  actualizadoEn DateTime   @updatedAt @map("actualizado_en") @db.Timestamptz(6)
+  pinHash        String?    @map("pin_hash")
+  rol            RolUsuario
+  activo         Boolean    @default(true)
+  ultimoAccesoEn DateTime?  @map("ultimo_acceso_en") @db.Timestamptz(6)
+  creadoEn       DateTime   @default(now()) @map("creado_en") @db.Timestamptz(6)
+  actualizadoEn  DateTime   @updatedAt @map("actualizado_en") @db.Timestamptz(6)
 
   restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
 
-  plantillasCreadas Plantilla[]    @relation("plantilla_creada_por")
-  reservaciones     Reservacion[]  @relation("reservacion_creada_por")
-  comandasAtendidas Comanda[]      @relation("comanda_mesero")
-  comandasAnuladas  Comanda[]      @relation("comanda_anulada_por")
-  itemsCancelados   ComandaItem[]  @relation("item_cancelado_por")
-  cobrosRealizados  Cobro[]        @relation("cobro_cobrado_por")
-  cobrosAnulados    Cobro[]        @relation("cobro_anulado_por")
-  pagosRegistrados  CobroPago[]    @relation("pago_registrado_por")
-  tasasRegistradas  TasaCambio[]   @relation("tasa_registrada_por")
+  plantillasCreadas Plantilla[]       @relation("plantilla_creada_por")
+  reservaciones     Reservacion[]     @relation("reservacion_creada_por")
+  comandasAtendidas Comanda[]         @relation("comanda_mesero")
+  comandasAnuladas  Comanda[]         @relation("comanda_anulada_por")
+  itemsCancelados   ComandaItem[]     @relation("item_cancelado_por")
+  cobrosRealizados  Cobro[]           @relation("cobro_cobrado_por")
+  cobrosAnulados    Cobro[]           @relation("cobro_anulado_por")
+  pagosRegistrados  CobroPago[]       @relation("pago_registrado_por")
+  tasasRegistradas  TasaCambio[]      @relation("tasa_registrada_por")
+  suscripcionesPush SuscripcionPush[]
 
   @@unique([restauranteId, id], map: "usuario_restaurante_id_key")
   @@unique([restauranteId, usuario], map: "usuario_unico_por_restaurante")
@@ -366,8 +389,8 @@ model Plantilla {
   /// reservacion/comanda que apunta a esta plantilla. Nunca puede ser no-nulo
   /// junto con `activa=true` (constraint `plantilla_eliminada_no_activa`).
   eliminadaEn   DateTime? @map("eliminada_en") @db.Timestamptz(6)
-  creadaEn      DateTime @default(now()) @map("creada_en") @db.Timestamptz(6)
-  actualizadaEn DateTime @updatedAt @map("actualizada_en") @db.Timestamptz(6)
+  creadaEn      DateTime  @default(now()) @map("creada_en") @db.Timestamptz(6)
+  actualizadaEn DateTime  @updatedAt @map("actualizada_en") @db.Timestamptz(6)
 
   restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
   salon       Salon       @relation(fields: [restauranteId, salonId], references: [restauranteId, id], onDelete: Restrict)
@@ -392,22 +415,22 @@ model PlantillaMesa {
   mesaId        String @map("mesa_id") @db.Uuid
 
   /// Esquina superior izquierda del bounding box, en unidades del plano.
-  posX Decimal @map("pos_x") @db.Decimal(10, 2)
-  posY Decimal @map("pos_y") @db.Decimal(10, 2)
+  posX     Decimal @map("pos_x") @db.Decimal(10, 2)
+  posY     Decimal @map("pos_y") @db.Decimal(10, 2)
   /// Tamaño dibujado. Para `redonda`, ancho == alto == diámetro.
-  ancho Decimal @default(80) @db.Decimal(10, 2)
-  alto  Decimal @default(80) @db.Decimal(10, 2)
+  ancho    Decimal @default(80) @db.Decimal(10, 2)
+  alto     Decimal @default(80) @db.Decimal(10, 2)
   /// Grados, 0-359. Una mesa rectangular girada 90° sigue siendo la misma mesa.
-  rotacion Int @default(0) @db.SmallInt
+  rotacion Int     @default(0) @db.SmallInt
 
-  forma FormaMesa
+  forma     FormaMesa
   /// Sillas EN ESTA distribución: la misma mesa redonda puede ser de 4 en el
   /// día a día y de 10 en un banquete. Por eso la capacidad vive aquí y es
   /// NOT NULL (nada de COALESCE en cada consulta de disponibilidad).
   capacidad Int
   /// Fuera de servicio en esta distribución (en obra, reservada para el paso).
   /// No admite reservas ni comandas nuevas.
-  bloqueada Boolean @default(false)
+  bloqueada Boolean   @default(false)
 
   creadaEn      DateTime @default(now()) @map("creada_en") @db.Timestamptz(6)
   actualizadaEn DateTime @updatedAt @map("actualizada_en") @db.Timestamptz(6)
@@ -459,15 +482,15 @@ model Producto {
   precio Decimal  @db.Decimal(14, 4)
   costo  Decimal? @db.Decimal(14, 4)
 
-  destino DestinoPreparacion @default(cocina)
+  destino       DestinoPreparacion @default(cocina)
   /// Disponible HOY (el clásico "se acabó"). Se apaga y se enciende a diario.
-  disponible Boolean @default(true)
+  disponible    Boolean            @default(true)
   /// Está en la carta. Apagarlo lo saca del menú sin borrar su historia.
-  activo     Boolean @default(true)
-  orden      Int     @default(0)
-  imagenUrl  String? @map("imagen_url")
+  activo        Boolean            @default(true)
+  orden         Int                @default(0)
+  imagenUrl     String?            @map("imagen_url")
   /// Minutos estimados de preparación; alimenta la vista de cocina.
-  tiempoPrepMin Int? @map("tiempo_prep_min")
+  tiempoPrepMin Int?               @map("tiempo_prep_min")
 
   creadoEn      DateTime @default(now()) @map("creado_en") @db.Timestamptz(6)
   actualizadoEn DateTime @updatedAt @map("actualizado_en") @db.Timestamptz(6)
@@ -492,28 +515,28 @@ model Producto {
 /// estados vivos. Sin eso hace falta SERIALIZABLE o advisory locks, y el bug
 /// aparece justo el sábado a las 8pm. Ver prisma/sql/02_constraints_a_mano.sql.
 model Reservacion {
-  id            String @id @db.Uuid
-  restauranteId String @map("restaurante_id") @db.Uuid
-  salonId       String @map("salon_id") @db.Uuid
+  id            String  @id @db.Uuid
+  restauranteId String  @map("restaurante_id") @db.Uuid
+  salonId       String  @map("salon_id") @db.Uuid
   /// Contra qué distribución se reservó. Si luego se activa otra plantilla que
   /// no incluye esa mesa, la reserva queda detectable como huérfana en vez de
   /// apuntar al vacío (consulta en CONTRACT.md §Reservas huérfanas).
-  plantillaId   String @map("plantilla_id") @db.Uuid
+  plantillaId   String  @map("plantilla_id") @db.Uuid
   /// NULL = reservada sin mesa asignada; el cliente la elige por el enlace
   /// público, o el anfitrión al llegar.
   mesaId        String? @map("mesa_id") @db.Uuid
 
-  clienteNombre   String  @map("cliente_nombre")
-  clienteTelefono String? @map("cliente_telefono")
+  clienteNombre    String  @map("cliente_nombre")
+  clienteTelefono  String? @map("cliente_telefono")
   /// Cédula/RIF venezolano (V/E/J/P/G + 6-9 dígitos) cuando se pide.
   clienteDocumento String? @map("cliente_documento")
-  personas        Int
+  personas         Int
 
-  iniciaEn  DateTime @map("inicia_en") @db.Timestamptz(6)
+  iniciaEn  DateTime                  @map("inicia_en") @db.Timestamptz(6)
   /// Calculado al crear a partir de restaurante.duracion_reserva_min, o fijado
   /// a mano. Es columna real y no expresión porque `timestamptz + interval` es
   /// STABLE, no IMMUTABLE, y por tanto no sirve en una columna generada.
-  terminaEn DateTime @map("termina_en") @db.Timestamptz(6)
+  terminaEn DateTime                  @map("termina_en") @db.Timestamptz(6)
   /// tstzrange [inicia_en, termina_en) mantenido por trigger. La app nunca lo
   /// escribe; sólo existe para que el EXCLUDE pueda comparar solapes.
   periodo   Unsupported("tstzrange")?
@@ -529,11 +552,11 @@ model Reservacion {
 
   notas String?
 
-  creadaPorId String? @map("creada_por_id") @db.Uuid
-  confirmadaEn DateTime? @map("confirmada_en") @db.Timestamptz(6)
-  sentadaEn    DateTime? @map("sentada_en") @db.Timestamptz(6)
-  canceladaEn  DateTime? @map("cancelada_en") @db.Timestamptz(6)
-  motivoCancelacion String? @map("motivo_cancelacion")
+  creadaPorId       String?   @map("creada_por_id") @db.Uuid
+  confirmadaEn      DateTime? @map("confirmada_en") @db.Timestamptz(6)
+  sentadaEn         DateTime? @map("sentada_en") @db.Timestamptz(6)
+  canceladaEn       DateTime? @map("cancelada_en") @db.Timestamptz(6)
+  motivoCancelacion String?   @map("motivo_cancelacion")
 
   creadaEn      DateTime @default(now()) @map("creada_en") @db.Timestamptz(6)
   actualizadaEn DateTime @updatedAt @map("actualizada_en") @db.Timestamptz(6)
@@ -579,25 +602,25 @@ model Reservacion {
 /// `estado` es la lectura derivada de los tres, y la calcula el trigger
 /// `comanda_estado`, nunca la aplicación.
 model Comanda {
-  id            String @id @db.Uuid
-  restauranteId String @map("restaurante_id") @db.Uuid
+  id            String      @id @db.Uuid
+  restauranteId String      @map("restaurante_id") @db.Uuid
   tipo          TipoComanda @default(mesa)
   /// NULL sólo cuando tipo = para_llevar (CHECK a mano).
-  salonId       String? @map("salon_id") @db.Uuid
-  mesaId        String? @map("mesa_id") @db.Uuid
-  plantillaId   String? @map("plantilla_id") @db.Uuid
-  reservacionId String? @map("reservacion_id") @db.Uuid
+  salonId       String?     @map("salon_id") @db.Uuid
+  mesaId        String?     @map("mesa_id") @db.Uuid
+  plantillaId   String?     @map("plantilla_id") @db.Uuid
+  reservacionId String?     @map("reservacion_id") @db.Uuid
 
   /// Número visible del día ("Comanda #14"). Se asigna con un UPSERT atómico
   /// sobre `contador_dia.ultimo_comanda`, nunca con MAX()+1.
-  numeroDia Int @map("numero_dia")
+  numeroDia      Int           @map("numero_dia")
   /// Día contable del PEDIDO, calculado al crearlo con la hora de corte.
   /// ⚠️ No es el día en que se reconoce la VENTA: ese es `cobro.fecha_operativa`
   /// (el dinero entra al cobrar). Los reportes de venta usan el del cobro.
-  fechaOperativa DateTime @map("fecha_operativa") @db.Date
+  fechaOperativa DateTime      @map("fecha_operativa") @db.Date
   turno          TurnoServicio
 
-  comensales Int    @default(1)
+  comensales Int     @default(1)
   meseroId   String? @map("mesero_id") @db.Uuid
 
   /// DERIVADO por el trigger `comanda_estado`. Ver el enum `EstadoComanda`.
@@ -617,9 +640,9 @@ model Comanda {
   /// ticket de cocina no tiene propina. Lo recalcula el servidor, nunca el cliente.
   total Decimal @default(0) @db.Decimal(14, 4)
 
-  anuladaPorId      String? @map("anulada_por_id") @db.Uuid
-  motivoAnulacion   String? @map("motivo_anulacion")
-  notas             String?
+  anuladaPorId    String? @map("anulada_por_id") @db.Uuid
+  motivoAnulacion String? @map("motivo_anulacion")
+  notas           String?
 
   creadaEn      DateTime @default(now()) @map("creada_en") @db.Timestamptz(6)
   actualizadaEn DateTime @updatedAt @map("actualizada_en") @db.Timestamptz(6)
@@ -664,14 +687,14 @@ model ComandaItem {
 
   orden Int @default(0)
 
-  nombreSnap          String  @map("nombre_snap")
-  precioUnitarioSnap  Decimal @map("precio_unitario_snap") @db.Decimal(14, 4)
-  destinoSnap         DestinoPreparacion @map("destino_snap")
-  cantidad            Decimal @db.Decimal(14, 3)
-  descuentoLinea      Decimal @default(0) @map("descuento_linea") @db.Decimal(14, 4)
+  nombreSnap         String             @map("nombre_snap")
+  precioUnitarioSnap Decimal            @map("precio_unitario_snap") @db.Decimal(14, 4)
+  destinoSnap        DestinoPreparacion @map("destino_snap")
+  cantidad           Decimal            @db.Decimal(14, 3)
+  descuentoLinea     Decimal            @default(0) @map("descuento_linea") @db.Decimal(14, 4)
   /// cantidad * precio_unitario_snap - descuento_linea. Se persiste para que
   /// los reportes sumen una columna en vez de recalcular en cada consulta.
-  totalLinea          Decimal @map("total_linea") @db.Decimal(14, 4)
+  totalLinea         Decimal            @map("total_linea") @db.Decimal(14, 4)
 
   nota String?
 
@@ -727,12 +750,12 @@ model Cobro {
   /// Número visible de la factura del día ("Factura #7"). UPSERT atómico sobre
   /// `contador_dia.ultimo_cobro`, nunca MAX()+1. Va en su propio contador
   /// porque es un número distinto del de la comanda y el cliente ve los dos.
-  numeroDia      Int      @map("numero_dia")
-  fechaOperativa DateTime @map("fecha_operativa") @db.Date
+  numeroDia      Int           @map("numero_dia")
+  fechaOperativa DateTime      @map("fecha_operativa") @db.Date
   turno          TurnoServicio
   /// El máximo de las comandas cubiertas: la mesa tiene UN número de comensales
   /// y si creció durante la noche manda el mayor.
-  comensales     Int      @default(1)
+  comensales     Int           @default(1)
 
   /// Totales en moneda base (USD). Los calcula el servidor a partir de las
   /// comandas bloqueadas con FOR UPDATE; jamás se toman del cliente.
@@ -752,10 +775,10 @@ model Cobro {
   cobradoEn    DateTime @default(now()) @map("cobrado_en") @db.Timestamptz(6)
   cobradoPorId String?  @map("cobrado_por_id") @db.Uuid
 
-  anuladoEn        DateTime? @map("anulado_en") @db.Timestamptz(6)
-  anuladoPorId     String?   @map("anulado_por_id") @db.Uuid
-  motivoAnulacion  String?   @map("motivo_anulacion")
-  notas            String?
+  anuladoEn       DateTime? @map("anulado_en") @db.Timestamptz(6)
+  anuladoPorId    String?   @map("anulado_por_id") @db.Uuid
+  motivoAnulacion String?   @map("motivo_anulacion")
+  notas           String?
 
   creadoEn      DateTime @default(now()) @map("creado_en") @db.Timestamptz(6)
   actualizadoEn DateTime @updatedAt @map("actualizado_en") @db.Timestamptz(6)
@@ -792,15 +815,15 @@ model CobroPago {
   restauranteId String @map("restaurante_id") @db.Uuid
   cobroId       String @map("cobro_id") @db.Uuid
 
-  metodo MetodoPago
-  moneda Moneda
+  metodo       MetodoPago
+  moneda       Moneda
   /// Monto en la moneda de `moneda`.
-  monto  Decimal @db.Decimal(18, 4)
+  monto        Decimal    @db.Decimal(18, 4)
   /// Tasa usada para convertir. NULL si moneda = USD (moneda base).
-  tasaAplicada Decimal? @map("tasa_aplicada") @db.Decimal(18, 8)
-  montoUsd     Decimal  @map("monto_usd") @db.Decimal(14, 4)
+  tasaAplicada Decimal?   @map("tasa_aplicada") @db.Decimal(18, 8)
+  montoUsd     Decimal    @map("monto_usd") @db.Decimal(14, 4)
   /// Obligatoria para pago_movil y transferencia (CHECK a mano).
-  referencia String?
+  referencia   String?
 
   recibidoEn      DateTime @default(now()) @map("recibido_en") @db.Timestamptz(6)
   registradoPorId String?  @map("registrado_por_id") @db.Uuid
@@ -831,17 +854,17 @@ model CobroPago {
 /// Esa regla no depende del código — la hace cumplir el trigger
 /// `comanda_tasa_base` (prisma/sql/01_constraints_y_triggers.sql §7).
 model TasaCambio {
-  id            String     @id @db.Uuid
-  restauranteId String     @map("restaurante_id") @db.Uuid
-  fecha         DateTime   @db.Date
+  id              String     @id @db.Uuid
+  restauranteId   String     @map("restaurante_id") @db.Uuid
+  fecha           DateTime   @db.Date
   /// Qué divisa cotiza esta fila. El default existe para que el camino de
   /// cobro y el registro rápido de "la tasa del día" sigan significando dólar
   /// sin tener que nombrarlo (ver docs/DECISIONES-DATOS.md §D14).
-  divisa        Divisa     @default(USD)
-  valor         Decimal    @db.Decimal(18, 8)
-  fuente        FuenteTasa @default(bcv)
-  registradaPorId String?  @map("registrada_por_id") @db.Uuid
-  creadaEn      DateTime   @default(now()) @map("creada_en") @db.Timestamptz(6)
+  divisa          Divisa     @default(USD)
+  valor           Decimal    @db.Decimal(18, 8)
+  fuente          FuenteTasa @default(bcv)
+  registradaPorId String?    @map("registrada_por_id") @db.Uuid
+  creadaEn        DateTime   @default(now()) @map("creada_en") @db.Timestamptz(6)
 
   restaurante   Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
   registradaPor Usuario?    @relation("tasa_registrada_por", fields: [restauranteId, registradaPorId], references: [restauranteId, id], onDelete: Restrict)
@@ -882,17 +905,17 @@ model ContadorDia {
 /// recalcula desde comanda/comanda_item y se mantiene al cerrar o anular una
 /// comanda. El día EN CURSO no se lee de aquí (ver docs/DECISIONES-DATOS.md §Reportes).
 model ResumenDia {
-  restauranteId  String   @map("restaurante_id") @db.Uuid
-  fechaOperativa DateTime @map("fecha_operativa") @db.Date
+  restauranteId  String        @map("restaurante_id") @db.Uuid
+  fechaOperativa DateTime      @map("fecha_operativa") @db.Date
   turno          TurnoServicio
 
-  comandas      Int     @default(0)
-  comensales    Int     @default(0)
-  totalUsd      Decimal @default(0) @map("total_usd") @db.Decimal(16, 4)
-  propinasUsd   Decimal @default(0) @map("propinas_usd") @db.Decimal(16, 4)
-  descuentosUsd Decimal @default(0) @map("descuentos_usd") @db.Decimal(16, 4)
+  comandas            Int      @default(0)
+  comensales          Int      @default(0)
+  totalUsd            Decimal  @default(0) @map("total_usd") @db.Decimal(16, 4)
+  propinasUsd         Decimal  @default(0) @map("propinas_usd") @db.Decimal(16, 4)
+  descuentosUsd       Decimal  @default(0) @map("descuentos_usd") @db.Decimal(16, 4)
   /// { "efectivo_usd": 120.5, "pago_movil": 43.0, ... } en equivalente USD.
-  porMetodo     Json    @default("{}") @map("por_metodo")
+  porMetodo           Json     @default("{}") @map("por_metodo")
   /// Producto más vendido del día por cantidad, ya resuelto.
   productoTopId       String?  @map("producto_top_id") @db.Uuid
   productoTopCantidad Decimal? @map("producto_top_cantidad") @db.Decimal(14, 3)
@@ -903,4 +926,106 @@ model ResumenDia {
 
   @@id([restauranteId, fechaOperativa, turno])
   @@map("resumen_dia")
+}
+
+// ═══════════════════ 7 · NOTIFICACIONES WEB PUSH ═══════════════════════════
+
+/// Un NAVEGADOR autorizado a recibir notificaciones push, y qué quiere recibir.
+///
+/// Existe porque el aviso de "entró una comanda" era puro frontend y moría con
+/// la pestaña: la cocina y el dueño necesitan enterarse con la app cerrada.
+///
+/// ⚠️ Esta tabla rompe DOS convenciones del esquema, las dos a propósito y las
+///    dos justificadas en docs/DECISIONES-DATOS.md §12:
+///
+///  1. `endpoint` es único GLOBALMENTE, sin `restaurante_id` delante. El
+///     endpoint no es un dato del tenant: es la identidad física de una
+///     instalación de navegador (misma máquina + mismo origen + mismo service
+///     worker + misma clave VAPID = el mismo endpoint, aunque cambie quién
+///     tiene la sesión abierta). Si la unicidad fuera por restaurante, un
+///     aparato que cambia de manos quedaría registrado en los dos y seguiría
+///     recibiendo los pedidos del anterior.
+///
+///  2. NO hay `eliminada_en`. Es la única tabla del esquema que hace DELETE
+///     real. El borrado lógico está en el resto para proteger histórico, y de
+///     esta fila no cuelga nada: ninguna FK la referencia, ningún reporte la
+///     suma. Una suscripción muerta no es historia, es ruido — y además es el
+///     registro de "esta persona usaba este aparato", que es justo lo que no
+///     conviene conservar. Muerta (404/410 del servicio de push) = borrada.
+model SuscripcionPush {
+  id            String @id @db.Uuid
+  restauranteId String @map("restaurante_id") @db.Uuid
+  /// Quién tiene la sesión abierta en ESE navegador ahora mismo. NOT NULL: una
+  /// suscripción sin dueño no tiene rol con el que decidir qué puede recibir.
+  /// Al cerrar sesión se borra la fila; si el logout no llega (token vencido,
+  /// pestaña cerrada), el siguiente login en ese aparato se apropia de ella.
+  usuarioId     String @map("usuario_id") @db.Uuid
+
+  /// URL que el servicio de push (FCM, Mozilla, Apple, WNS) emitió para este
+  /// navegador. Es un CANAL DE ESCRITURA hacia el dispositivo de una persona:
+  /// no sale nunca por la API ni por los logs (§12.7 del doc).
+  /// Longitud real observada: 180-1200 caracteres según el servicio.
+  endpoint String    @unique(map: "suscripcion_push_endpoint_unico")
+  /// Clave pública P-256 del navegador (65 bytes en base64 => 87-88 chars).
+  p256dh   String
+  /// Secreto de autenticación del cifrado (16 bytes => 22-24 chars).
+  /// Se llama así porque es el nombre del campo en la especificación W3C: el
+  /// servicio de envío arma `{ endpoint, keys: { p256dh, auth } }` tal cual.
+  auth     String
+  /// `PushSubscription.expirationTime`. Casi siempre NULL — hoy ningún
+  /// navegador de los que importan lo rellena. Se guarda porque es dato que el
+  /// navegador nos dio y tirarlo no aporta nada.
+  expiraEn DateTime? @map("expira_en") @db.Timestamptz(6)
+
+  /// Qué quiere recibir ESTE aparato. Vacío = registrado pero en silencio.
+  /// ⚠️ Es lo que el aparato QUIERE, no lo que puede: el permiso lo decide el
+  /// rol del usuario en el momento del envío (la matriz `ROLES_POR_TEMA` vive
+  /// en código, no en una tabla). Falla cerrado: un array vacío —o NULL— no
+  /// casa con ningún `@>` y no recibe nada.
+  temas TemaNotificacion[] @default([])
+
+  /// Identificador del par de claves VAPID con el que se creó la suscripción
+  /// (los 12 primeros caracteres de la clave pública). Una suscripción sólo
+  /// funciona con la clave con la que nació: si algún día se rotan las VAPID,
+  /// esta columna es lo que permite dejar de enviarles y barrerlas, en vez de
+  /// comerse un 403 por cada fila y no saber por qué. Es la única columna que
+  /// no se puede añadir después sin inventarle valor a las filas existentes.
+  vapidKid String @map("vapid_kid")
+
+  /// Nombre que le puso la persona al aparato ("Tablet cocina"). Opcional.
+  etiqueta      String?
+  /// User-Agent recortado, tomado del request al registrar. Existe sólo para
+  /// que la pantalla "tus dispositivos" sea usable: sin esto la lista dice
+  /// "suscripción creada el 18/09" y nadie sabe cuál revocar.
+  agenteUsuario String? @map("agente_usuario")
+
+  creadaEn      DateTime @default(now()) @map("creada_en") @db.Timestamptz(6)
+  /// Latido. El frontend revalida la suscripción en cada arranque de la app
+  /// (`pushManager.getSubscription()`) y la reenvía; ese POST pone esto en
+  /// now(). Un aparato que nadie abre deja de renovarse y el barrido lo borra.
+  /// Es lo que mata a los zombis: un endpoint de FCM no caduca solo, así que
+  /// sin esto un teléfono olvidado en una gaveta vibra para siempre.
+  renovadaEn    DateTime @default(now()) @map("renovada_en") @db.Timestamptz(6)
+  actualizadaEn DateTime @updatedAt @map("actualizada_en") @db.Timestamptz(6)
+
+  restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  /// FK COMPUESTA: hace imposible suscribir a un usuario de otro restaurante.
+  /// `Cascade` y no `Restrict` — y es coherente con la regla del esquema, no
+  /// una excepción: `Restrict` está ahí para que no se borre a quien firmó
+  /// comandas. Una suscripción no es historia; bloquear el borrado de un
+  /// usuario porque tiene un teléfono registrado sería absurdo.
+  usuario     Usuario     @relation(fields: [restauranteId, usuarioId], references: [restauranteId, id], onDelete: Cascade)
+
+  @@unique([restauranteId, id], map: "suscripcion_push_restaurante_id_key")
+  /// EL índice de la consulta caliente (abanico de envío por restaurante).
+  /// Doble uso: el prefijo `restaurante_id` sirve al envío, y las dos columnas
+  /// juntas a "los aparatos de este usuario" (lista de dispositivos, logout).
+  /// Es además el índice de la FK compuesta, que Postgres no crea solo.
+  ///
+  /// No es parcial ni GIN a propósito: la tabla está acotada por el número de
+  /// navegadores de un restaurante (decenas), y a ese tamaño un GIN sobre
+  /// `temas` es más lento que filtrar en el heap y obligaría a instalar
+  /// btree_gin para poder llevar `restaurante_id` dentro del mismo índice.
+  @@index([restauranteId, usuarioId], map: "suscripcion_push_envio_idx")
+  @@map("suscripcion_push")
 }

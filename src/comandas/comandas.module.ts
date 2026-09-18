@@ -7,8 +7,14 @@ import {
   DespachoController,
 } from './comandas.controller';
 import { ComandasService } from './comandas.service';
+import { NotificacionesModule } from '../notificaciones/notificaciones.module';
 
+// Importa NotificacionesModule para avisar por push cuando entra una comanda
+// nueva (fuera de la transacción, ver ComandasService.crearComanda). La
+// dependencia va en este sentido nada más: NotificacionesModule no conoce
+// ComandasModule.
 @Module({
+  imports: [NotificacionesModule],
   controllers: [
     ComandasController,
     DespachoController,

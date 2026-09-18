@@ -41,6 +41,9 @@
 | D13 | Enum `Divisa` ('USD','EUR') **aparte** de `Moneda` ('USD','BS') | Añadir `EUR` al enum `Moneda` | `Moneda` es el dominio del COBRO; un `EUR` ahí lo aceptaría el DTO de pago y el cálculo lo trataría como bolívares |
 | D14 | `tasa_cambio.divisa` con `DEFAULT 'USD'`; el cobro sólo admite USD, y lo impide un trigger | Tabla aparte para el euro / confiar en que el código filtre | Una tabla gemela se fusionaría el día que el euro se cobre; y un filtro olvidado cuesta ~8-15 % en cada bolívar cobrado |
 | D15 | Mes y año como `GROUP BY` sobre `v_venta_dia`, sin vistas nuevas | `v_venta_mes` / `v_venta_anio` | El mes ES la suma de sus días operativos; una vista aparte sería una segunda definición de "qué cuenta como venta", y el año ya se agrega en ~77 ms con 73k comandas |
+| D16 | `suscripcion_push.endpoint` único **global**, sin `restaurante_id` | `@@unique([restaurante_id, endpoint])` | El endpoint identifica un NAVEGADOR, no un tenant. Por restaurante, un aparato que cambia de manos queda registrado en los dos y sigue recibiendo los pedidos del anterior |
+| D17 | La suscripción push se **borra de verdad**; no hay `eliminada_en` | Borrado lógico como en el resto del esquema | De esa fila no cuelga histórico: el borrado lógico existe para protegerlo. Conservarla sólo guarda "esta persona usaba este aparato" y ensucia el índice único |
+| D18 | Temas por **aparato** (`temas[]`) intersectados con el **rol** al enviar | Sólo el rol / sólo la preferencia | Barra y cocina entran ambas con rol `cocina`: sin temas no se distinguen. Y el rol cambia, así que congelarlo en la fila la deja mintiendo |
 
 ---
 
@@ -259,6 +262,8 @@ compuesto**, o el día que se active RLS la política fuerza escaneos.
 | `mesa_etiqueta_unica` | "Mesa 5" única | Por expresión (`lower`) y sólo entre las vivas: permite reutilizar el número de una mesa borrada |
 | `comanda (restaurante_id, fecha_operativa, estado)` | Reporte del día | — |
 | `comanda_item (restaurante_id, producto_id)` | Producto más vendido | — |
+| `suscripcion_push_envio_idx` | Abanico de notificaciones + lista de dispositivos + índice de la FK compuesta | No es parcial ni GIN: la tabla la acota el nº de navegadores del restaurante (decenas), y a ese tamaño filtrar `temas` en el heap gana (§12.4) |
+| `suscripcion_push_endpoint_unico` | Identidad del aparato; hace del traspaso un UPDATE | **Global, sin `restaurante_id`** — la única excepción a la regla de arriba, y a propósito (D16) |
 
 Todas las FK tienen índice: Postgres **no** lo crea solo, y sin él un `DELETE` en
 el padre escanea la hija entera.
@@ -595,3 +600,174 @@ ejecutan**: arrancan `AppModule` + `configurarApp`. Resultado: cualquier
 endpoint de reportes respondía 200 en producción y 500 en los tests. Se movió a
 `src/comun/json-bigint.ts` y se llama desde `configurarApp`, que es
 precisamente lo que existe para que producción y tests no diverjan.
+
+---
+
+## 12 · Notificaciones Web Push          *(añadido 2026-09-18)*
+
+El aviso de "entró una comanda" era puro frontend y moría con la pestaña. Se
+añade **una sola tabla**, `suscripcion_push`, verificada con 30 aserciones
+contra PostgreSQL 17 real antes de escribirse.
+
+La tabla es a la vez el **aparato** y la **preferencia**. Cuelga de `usuario`
+(NOT NULL) pero su clave natural es el `endpoint`, que identifica al navegador.
+
+### 12.1 El endpoint identifica un navegador, no a una persona
+
+Un endpoint de push lo emite el servicio para la tupla **(máquina + navegador +
+origen + service worker + clave VAPID)**. De ahí salen las dos consecuencias que
+definen todo el diseño:
+
+- Un usuario con tres aparatos son **tres filas**.
+- El mismo aparato, tras un logout y el login de otra persona, devuelve **el
+  mismo endpoint**. No es una fila nueva: es la misma fila cambiando de dueño.
+
+Por eso el registro es siempre `INSERT ... ON CONFLICT ("endpoint") DO UPDATE`,
+y por eso el índice único es **global** (D16). Con `@@unique([restaurante_id,
+endpoint])`, un aparato que pasa del restaurante A al B quedaría registrado en
+los dos y seguiría vibrando con los pedidos de A.
+
+Verificado: el upsert no duplica, cambia el dueño, **conserva el `id` original**
+de la fila (así que la API puede devolverlo sin sorpresas) y mantiene la
+`etiqueta` mientras el restaurante no cambie.
+
+### 12.2 Quién recibe qué: dos preguntas, dos sitios
+
+| | Dónde vive | Quién la decide | Cuándo se evalúa |
+|---|---|---|---|
+| **Permiso** — ¿puede esta persona ver esto? | `usuario.rol` + matriz en código | el negocio | en cada envío |
+| **Preferencia** — ¿quiere este aparato que le suene? | `suscripcion_push.temas` | la persona, por aparato | al registrar |
+
+**El rol solo no alcanza:** no existe un rol `barra`. La tablet de barra y la de
+cocina entran las dos con `RolUsuario.cocina`, y lo único que las distingue es a
+qué se suscribió cada aparato. Lo mismo con el dueño, que quiere el aviso en el
+teléfono y no en la laptop de casa: eso es propiedad del aparato, no del rol.
+
+**Los temas solos no alcanzan:** los roles cambian. Congelar el permiso en la
+fila obligaría a reescribir suscripciones en cada cambio de puesto, y el que se
+fue seguiría recibiendo. Verificado: desactivar al usuario saca su aparato del
+abanico en el acto, sin tocar la suscripción.
+
+La matriz `ROLES_POR_TEMA` vive **en código** (`src/notificaciones/temas.ts`):
+es política, se versiona con el código y nadie pidió una pantalla para
+configurarla. Si algún día la piden, entra como tabla `rol_tema` y la constante
+pasa a ser su seed.
+
+Los cuatro valores del enum se declararon de una vez. El día que se pidan las
+"cuentas por cobrar" **no hay migración**: se emite el tema y los aparatos se
+suscriben. Verificado.
+
+### 12.3 Caducidad: dos muertes, dos mecanismos
+
+- **Muerte declarada (404/410):** el servicio dice que el endpoint ya no existe.
+  `DELETE ... WHERE endpoint = $1`, en el acto, dentro del bucle de envío.
+  ⚠️ **Por endpoint, nunca por `id`.** Si entre la lectura y el fallo ese aparato
+  se re-registró, la fila tiene ya un endpoint nuevo y borrar por id mataría una
+  suscripción viva. Verificado en los dos sentidos.
+- **Muerte silenciosa:** un endpoint de FCM no caduca solo. El teléfono que el
+  mesero dejó de usar nunca devuelve 410 y seguiría vibrando para siempre.
+  Contra eso está `renovada_en`, que el frontend refresca en cada arranque, y un
+  barrido diario de 90 días.
+
+⚠️ Ese barrido **ve cero filas si corre sin contexto de tenant cuando RLS esté
+activo**, y no falla: simplemente no borra nada durante meses. Tiene que iterar
+restaurantes con `SET LOCAL app.restaurante_id` o correr con un rol `BYPASSRLS`
+de mantenimiento.
+
+**Descartado `fallos_consecutivos` / `ultimo_error_en`.** Un dispositivo apagado
+**no falla**: el servicio acepta el POST con 201 y encola, así que el contador no
+mide lo que uno cree. Lo que sí lo incrementaría son las caídas del servicio de
+push, que son globales y se ven mejor en los logs. Y el coste es el que duele:
+convertiría un abanico de sólo lectura en una escritura por comanda y por fila.
+
+### 12.4 El índice
+
+```sql
+CREATE INDEX "suscripcion_push_envio_idx"
+  ON "suscripcion_push" ("restaurante_id", "usuario_id");
+```
+
+Btree normal, sin parcialidad y sin GIN. La tabla está acotada por el número de
+**navegadores** de un restaurante, no por su facturación: doce filas típicas,
+cuarenta en el peor caso. A ese tamaño un GIN sobre `temas` es más lento
+(bitmap + recheck) y obligaría a instalar `btree_gin` para poder llevar
+`restaurante_id` dentro del mismo índice. Sirve además a la lista de
+dispositivos, al logout, y es el índice de la FK compuesta.
+
+**Disparador de revisión:** si un tenant pasa de ~5.000 suscripciones,
+`EXPLAIN ANALYZE` primero y `btree_gin` sobre `(restaurante_id, temas)` después.
+
+### 12.5 Aislamiento, y el caso raro que aparece con RLS
+
+Todo el patrón del esquema: `restaurante_id` primero, `@@unique([restauranteId,
+id])`, FK compuesta a `usuario(restaurante_id, id)` —verificado: suscribir a un
+usuario de otro restaurante da 23503— y `'suscripcion_push'` añadido al array de
+`prisma/sql/03_rls.sql`.
+
+El caso raro: con RLS activo, un navegador ya registrado en A que intenta
+registrarse en B choca contra una fila que la política no deja ver. El backend
+traduce **tanto el 23505 como el 42501** al mismo **409** con código
+`SUSCRIPCION_DE_OTRO_RESTAURANTE`; el frontend responde con `unsubscribe()` y
+vuelve a suscribirse, lo que produce un endpoint nuevo y un INSERT limpio. La
+fila huérfana de A muere sola en el siguiente envío, porque `unsubscribe()`
+invalidó ese endpoint y ahora devuelve 410. Se autolimpia.
+
+Se descartó una función `SECURITY DEFINER` para hacer el traspaso entre tenants:
+`03_rls.sql` usa `FORCE ROW LEVEL SECURITY`, que **alcanza también al dueño de
+las tablas**, así que no bypassearía nada. Haría falta un rol dedicado con su
+propia política; mucha ceremonia para algo que el 409 resuelve gratis.
+
+### 12.6 Lo que el servicio de envío debe cumplir
+
+1. **Enviar DESPUÉS del commit**, nunca dentro del `$transaction` de
+   `crearComanda()`: un abanico HTTP dentro de la transacción mantiene los
+   bloqueos abiertos, y si hay rollback ya se avisó de un pedido inexistente.
+2. **Un fallo de push jamás tumba la comanda.** `POST /comandas` devuelve 201
+   aunque fallen todos los envíos.
+3. **410/404 → borrar por endpoint.** **403/401 → NO borrar**: significan que la
+   clave VAPID no es la que creó la suscripción, y borrar ahí vaciaría la tabla
+   durante un despliegue con la variable mal puesta. 429 → respetar
+   `Retry-After`. 5xx → no borrar.
+4. **El camino de envío es de sólo lectura** salvo esos DELETE.
+5. **Registro con `ON CONFLICT`**, nunca SELECT-luego-INSERT: dos pestañas
+   registrando a la vez pierden la carrera contra el índice único.
+6. ⚠️ **`actualizada_en` no tiene DEFAULT** (`@updatedAt` lo pone Prisma): todo
+   SQL crudo tiene que darle valor o muere con 23502. Verificado.
+7. **Filtrar por `vapid_kid`** en el abanico: convierte una rotación de claves en
+   un no-evento en vez de una tormenta de 403. Verificado.
+8. **`TTL` corto** (900 s) para los temas de comanda y **sin cabecera `Topic`**:
+   colapsar avisos de comanda perdería pedidos.
+
+### 12.7 Privacidad
+
+Un endpoint no es un identificador: es una **capacidad**, un canal de escritura
+hacia la pantalla de bloqueo de una persona. Se trata como `clave_hash`:
+
+- **No sale por la API.** `GET /push/suscripciones` devuelve
+  `{ id, etiqueta, agenteUsuario, temas, creadaEn, renovadaEn, esEsteDispositivo }`
+  y nunca `endpoint`, `p256dh` ni `auth`. El precedente exacto es `sanitizar()`
+  en `src/auth/auth.service.ts`.
+- **No sale por los logs.** Los errores de `web-push` traen el endpoint dentro:
+  redactarlo al host + los últimos 8 caracteres. Revisar también que
+  `PgErrorFilter` no eche el `detail` de un 23505 sobre esta tabla.
+- **Payload mínimo y sin PII.** Va cifrado extremo a extremo, pero se muestra en
+  la pantalla de bloqueo de un teléfono que puede estar sobre una mesa. Nunca
+  `cliente_nombre`, `cliente_telefono` ni `cliente_documento`. El payload lleva
+  ids y el clic abre la app, que trae lo real con la sesión.
+- **Consentimiento** desde un botón explícito, nunca al cargar: Chrome penaliza
+  los orígenes que lo piden en frío y puede bloquear el permiso para todo el
+  dominio.
+
+### 12.8 Dos avisos que no son de datos pero deciden si la función sirve
+
+1. **En iPhone, "con la app cerrada" sólo es verdad si la instalan.** Safari
+   entrega Web Push únicamente si el sitio está añadido a la pantalla de inicio
+   como PWA (iOS 16.4+). Una pestaña cerrada no recibe nada. Como el caso de uso
+   que justifica toda la función es el dueño fuera del local, el frontend
+   necesita manifest, `display: standalone` y una pantalla que explique cómo
+   instalarlo.
+2. **`POST /comandas/:id/items` no avisa a nadie.** Una comanda pendiente admite
+   líneas nuevas hasta despacharse; si ya se notificó, los platos añadidos
+   después entran en silencio. El enum ya soporta lo que haga falta, pero hay que
+   decidir si `agregarItems` emite también `comanda_cocina` con otro texto o si
+   se acepta explícitamente que no avise.

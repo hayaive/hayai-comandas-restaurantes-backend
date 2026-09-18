@@ -30,7 +30,14 @@ DECLARE
     -- múltiples. Si se pierden nada falla: el KDS y el plano simplemente pasan
     -- a escanear la tabla histórica entera cada pocos segundos.
     'comanda_cola_despacho_idx',
-    'comanda_cuenta_abierta_idx'
+    'comanda_cuenta_abierta_idx',
+    -- Éste SÍ lo declara Prisma (`@unique` sobre `endpoint`), pero se vigila
+    -- igual porque su pérdida es silenciosa y cara: es GLOBAL, sin
+    -- restaurante_id, y es lo único que hace que el traspaso de un aparato
+    -- (logout de uno, login de otro en la misma tablet) sea un UPDATE. Sin él
+    -- aparecen dos filas para el mismo endpoint, el dueño anterior sigue
+    -- recibiendo y el aparato recibe cada aviso por duplicado.
+    'suscripcion_push_endpoint_unico'
   ];
 
   -- Constraints de tabla.
@@ -53,7 +60,18 @@ DECLARE
     'cobro_pago_restaurante_id_cobro_id_fkey',
     'plantilla_mesa_capacidad_valida',
     'reservacion_rango_valido',
-    'plantilla_eliminada_no_activa'
+    'plantilla_eliminada_no_activa',
+    -- Notificaciones push. Si estos CHECK se pierden, nada falla al escribir:
+    -- el error aparece después, dentro del bucle de envío, como un 400 del
+    -- servicio de push que no dice qué fila lo causó.
+    'suscripcion_push_endpoint_valido',
+    'suscripcion_push_claves_validas',
+    'suscripcion_push_agente_acotado',
+    'suscripcion_push_etiqueta_acotada',
+    -- La FK compuesta: es lo que hace imposible suscribir a un usuario de otro
+    -- restaurante. Sin ella el aislamiento depende de que el servicio no se
+    -- equivoque.
+    'suscripcion_push_restaurante_id_usuario_id_fkey'
   ];
 
   triggers text[] := ARRAY[

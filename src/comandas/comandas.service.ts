@@ -1,8 +1,9 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../comun/prisma/prisma.service';
 import { DiaOperativoService } from '../comun/dia-operativo/dia-operativo.service';
 import { nuevoId } from '../comun/id';
 import { Prisma } from '../generated/prisma/client';
+import { NotificacionesService } from '../notificaciones/notificaciones.service';
 import {
   AgregarItemsDto,
   CobrarMesaDto,
@@ -33,9 +34,12 @@ const TOLERANCIA_CUADRE = new Prisma.Decimal('0.01');
  */
 @Injectable()
 export class ComandasService {
+  private readonly logger = new Logger(ComandasService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly diaOperativo: DiaOperativoService,
+    private readonly notificaciones: NotificacionesService,
   ) {}
 
   // ═════════════════════════ Lectura ═════════════════════════
@@ -213,7 +217,7 @@ export class ComandasService {
   async crearComanda(restauranteId: string, meseroId: string | null, dto: CrearComandaDto) {
     const restaurante = await this.prisma.restaurante.findFirstOrThrow({ where: { id: restauranteId } });
 
-    return this.prisma.$transaction(async (tx) => {
+    const comanda = await this.prisma.$transaction(async (tx) => {
       let salonId: string | null = null;
       let plantillaId: string | null = null;
 
@@ -291,6 +295,19 @@ export class ComandasService {
         include: { items: { orderBy: { orden: 'asc' } } },
       });
     });
+
+    // Aviso por push, DESPUÉS del commit y SIN esperar el abanico completo:
+    // regla dura del diseño de notificaciones — un envío HTTP lento dentro de
+    // la transacción mantendría bloqueos abiertos, y esperar aquí demoraría el
+    // 201 de cada comanda por el peor `endpoint` de push del momento. Un fallo
+    // de push (o que no haya VAPID configurado) jamás tumba la comanda, que ya
+    // quedó guardada: por eso el `.catch` en vez de dejar que la excepción
+    // se propague o quede como unhandled rejection.
+    this.notificaciones
+      .notificarComandaNueva(restauranteId, comanda)
+      .catch((error) => this.logger.error('Fallo notificando comanda nueva por push', error));
+
+    return comanda;
   }
 
   /** POST /comandas/:id/items — añadir líneas a un pedido que todavía no salió. */

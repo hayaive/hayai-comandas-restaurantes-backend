@@ -53,7 +53,19 @@ DECLARE
     -- el día que se active RLS un tenant vería la facturación de otro.
     -- `cobro_pago` y `contador_dia` se llamaban `comanda_pago` y
     -- `contador_comanda` antes de la migración 20260915183000.
-    'cobro', 'cobro_pago', 'tasa_cambio', 'contador_dia', 'resumen_dia'
+    'cobro', 'cobro_pago', 'tasa_cambio', 'contador_dia', 'resumen_dia',
+    -- `suscripcion_push` guarda un CANAL DE ESCRITURA hacia el teléfono de una
+    -- persona. Olvidarla aquí no filtraría datos de lectura: permitiría que un
+    -- tenant empujara notificaciones a los aparatos de otro.
+    -- ⚠️ Su índice único de `endpoint` es GLOBAL a propósito (ver la migración
+    -- 20260918120000_notificaciones_push), así que bajo RLS el registro de un
+    -- navegador que ya pertenece a otro restaurante choca contra una fila que
+    -- la política no deja ver. El backend traduce tanto el 23505 como el 42501
+    -- al mismo 409, y el frontend responde con `unsubscribe()` + volver a
+    -- suscribirse: eso da un endpoint nuevo y la fila huérfana muere sola en
+    -- el siguiente 410. Verificar el SQLSTATE real contra un Postgres con RLS
+    -- activo el día que se encienda este archivo.
+    'suscripcion_push'
   ];
 BEGIN
   FOREACH t IN ARRAY tablas LOOP

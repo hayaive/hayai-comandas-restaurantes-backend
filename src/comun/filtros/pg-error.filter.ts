@@ -157,6 +157,35 @@ const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
     http: 422,
     mensaje: 'No se puede cambiar la divisa de una tasa ya registrada; registra otra',
   },
+
+  // Notificaciones push. Mensajes genéricos a propósito: ninguno repite el
+  // `endpoint`, `p256dh` ni `auth` que llegaron en el body (regla dura de
+  // privacidad §2 del diseño — un endpoint es un canal de escritura hacia el
+  // teléfono de una persona, se trata como `clave_hash`).
+  suscripcion_push_endpoint_unico: {
+    http: 409,
+    mensaje: 'Ese aparato ya está registrado',
+  },
+  suscripcion_push_endpoint_valido: {
+    http: 422,
+    mensaje: 'El endpoint de la suscripción no es válido',
+  },
+  suscripcion_push_claves_validas: {
+    http: 422,
+    mensaje: 'Las claves de cifrado de la suscripción no son válidas',
+  },
+  suscripcion_push_agente_acotado: {
+    http: 422,
+    mensaje: 'El User-Agent recibido es demasiado largo',
+  },
+  suscripcion_push_etiqueta_acotada: {
+    http: 422,
+    mensaje: 'La etiqueta debe tener entre 1 y 60 caracteres',
+  },
+  suscripcion_push_restaurante_id_usuario_id_fkey: {
+    http: 422,
+    mensaje: 'El usuario no existe o no pertenece a este restaurante',
+  },
 };
 
 const MAPA_SQLSTATE: Record<string, TraduccionError> = {
