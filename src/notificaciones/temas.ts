@@ -20,4 +20,8 @@ export const ROLES_POR_TEMA: Record<TemaNotificacion, RolUsuario[]> = {
   comanda_barra: ['cocina', 'encargado', 'administrador'],
   cuenta_por_cobrar: ['caja', 'encargado', 'administrador'],
   reservacion_nueva: ['encargado', 'administrador'],
+  // Sólo el dueño: es el único que puede regenerar el código o revocar el
+  // acceso (`/accesos` es `@Roles('administrador')`). Avisar a quien no puede
+  // hacer nada al respecto sólo sería ruido.
+  acceso_sospechoso: ['administrador'],
 };

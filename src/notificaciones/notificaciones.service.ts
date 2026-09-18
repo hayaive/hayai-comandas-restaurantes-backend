@@ -195,6 +195,46 @@ export class NotificacionesService {
   // ═════════════════════════ Envío ═════════════════════════
 
   /**
+   * Aviso al dueño de que alguien está probando códigos en el enlace de un
+   * acceso temporal (`invitacion_acceso.fallos_consecutivos` llegó al umbral).
+   * Es la ÚNICA defensa contra fuerza bruta de ese enlace, por decisión del
+   * dueño: avisa, no bloquea — un bloqueo lo sufriría el mesero de verdad en
+   * plena cena (docs/DECISIONES-DATOS.md §13.6).
+   *
+   * Mismas reglas que `notificarComandaNueva`: se llama FUERA de cualquier
+   * transacción, sin `await` bloqueante y con `.catch` en quien llama; si Web
+   * Push no está configurado, no hace nada.
+   *
+   * El payload lleva el nombre del mesero (lo pidió el dueño: sin él el aviso
+   * no dice a quién revocar) y NUNCA el slug, el enlace ni nada que sirva para
+   * entrar.
+   */
+  async notificarAccesoSospechoso(restauranteId: string, nombreAcceso: string, usuarioId: string) {
+    if (!this.vapid.configurado || !this.vapid.kid) return;
+
+    const destinatarios = await this.destinatariosParaTemas(restauranteId, ['acceso_sospechoso']);
+    if (destinatarios.length === 0) return;
+
+    const restaurante = await this.prisma.restaurante.findUnique({
+      where: { id: restauranteId },
+      select: { nombre: true, logoUrl: true },
+    });
+
+    const payload = JSON.stringify({
+      tipo: 'acceso_sospechoso',
+      temas: ['acceso_sospechoso'],
+      accesoId: usuarioId,
+      titulo: 'Intentos sospechosos',
+      cuerpo: `Alguien está probando códigos en el acceso de ${nombreAcceso}`,
+      ruta: '/meseros',
+      restauranteNombre: restaurante?.nombre ?? null,
+      logoUrl: restaurante?.logoUrl ? urlAbsolutaBackend(restaurante.logoUrl) : null,
+    });
+
+    await Promise.allSettled(destinatarios.map((d) => this.enviarUno(d, payload)));
+  }
+
+  /**
    * Dispara el aviso de "entró una comanda". Se llama DESPUÉS del commit de
    * `crearComanda()`, nunca dentro de su `$transaction` (regla dura §1): un
    * abanico HTTP dentro de la transacción mantendría bloqueos abiertos
@@ -265,6 +305,11 @@ export class NotificacionesService {
    * Filtra siempre por `vapid_kid` (regla dura §11): una rotación de claves
    * VAPID se vuelve un no-evento en vez de una tormenta de 403 contra
    * suscripciones que nacieron con el par anterior.
+   *
+   * Y por la VENTANA DE VIGENCIA del usuario, no sólo por `activo`: un acceso
+   * temporal que venció no escribe nada en la base (no hay job que apague
+   * `activo`), así que sin este filtro su teléfono seguiría recibiendo los
+   * pedidos del restaurante después de que el dueño le quitara el acceso.
    */
   private async destinatariosParaTemas(
     restauranteId: string,
@@ -284,6 +329,7 @@ export class NotificacionesService {
            AND s."vapid_kid"      = ${this.vapid.kid}
            AND s."temas"          @> ARRAY[${tema}]::"tema_notificacion"[]
            AND u."activo"
+           AND (u."acceso_hasta" IS NULL OR u."acceso_hasta" > now())
            AND u."rol" = ANY(${roles}::"rol_usuario"[])
       `;
       for (const fila of filas) porEndpoint.set(fila.endpoint, fila);

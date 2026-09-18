@@ -37,7 +37,11 @@ DECLARE
     -- (logout de uno, login de otro en la misma tablet) sea un UPDATE. Sin él
     -- aparecen dos filas para el mismo endpoint, el dueño anterior sigue
     -- recibiendo y el aparato recibe cada aviso por duplicado.
-    'suscripcion_push_endpoint_unico'
+    'suscripcion_push_endpoint_unico',
+    -- Accesos temporales. Lo declara Prisma, pero es EL índice del canje: sin
+    -- él, dos invitaciones podrían compartir enlace y un mesero entraría como
+    -- otro.
+    'invitacion_acceso_enlace_unico'
   ];
 
   -- Constraints de tabla.
@@ -80,7 +84,27 @@ DECLARE
     -- sentada (moneda_base = USD) deja de estar garantizada.
     'restaurante_nombre_acotado',
     'restaurante_logo_url_valida',
-    'restaurante_moneda_base_usd'
+    'restaurante_moneda_base_usd',
+    -- Accesos temporales (migración 20260918230000). Si se pierden, nada
+    -- falla al escribir y todo queda abierto en silencio:
+    --   · sin 'usuario_credenciales_coherentes' un acceso temporal puede
+    --     acabar con PIN, y `POST /auth/pin` pasa a ser la pantalla pública
+    --     para probar sus 10.000 códigos;
+    --   · sin 'usuario_acceso_temporal_es_mesero' un acceso de 4 dígitos
+    --     puede ser administrador y renovarse a sí mismo;
+    --   · sin 'usuario_modulos_segun_rol' alguien que no es administrador
+    --     puede recibir la pantalla Meseros o Configuración;
+    --   · sin los CHECK de hash el token o el código se pueden guardar en
+    --     claro;
+    --   · sin la FK compuesta una invitación puede colgar de un usuario de
+    --     otro restaurante.
+    'usuario_credenciales_coherentes',
+    'usuario_acceso_temporal_es_mesero',
+    'usuario_modulos_segun_rol',
+    'invitacion_acceso_enlace_es_hash',
+    'invitacion_acceso_codigo_es_argon2',
+    'invitacion_acceso_fallos_validos',
+    'invitacion_acceso_restaurante_id_usuario_id_fkey'
   ];
 
   triggers text[] := ARRAY[
@@ -98,7 +122,10 @@ DECLARE
     -- FIFO) o cambiarle el monto a una factura ya emitida.
     'comanda_item_solo_pendiente',
     -- Último recurso contra la factura fantasma de dos cajeros simultáneos.
-    'cobro_no_vacio'
+    'cobro_no_vacio',
+    -- Impide colgar una invitación (puerta de 4 dígitos sin bloqueo) de un
+    -- usuario PERMANENTE. Cruza dos tablas: ningún CHECK lo puede sustituir.
+    'invitacion_acceso_solo_temporal'
   ];
 
   funciones text[] := ARRAY[
@@ -111,7 +138,9 @@ DECLARE
     'hayai_tasa_divisa_inmutable',
     'hayai_comanda_estado',
     'hayai_comanda_item_solo_pendiente',
-    'hayai_cobro_no_vacio'
+    'hayai_cobro_no_vacio',
+    'hayai_invitacion_acceso_solo_temporal',
+    'hayai_fin_acceso'
   ];
 
   vistas text[] := ARRAY[

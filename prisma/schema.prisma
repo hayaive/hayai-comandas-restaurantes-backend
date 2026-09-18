@@ -225,8 +225,38 @@ enum TemaNotificacion {
   cuenta_por_cobrar
   /// Reservado: entró una reserva por el enlace público.
   reservacion_nueva
+  /// Alguien está probando códigos en el enlace de un acceso temporal
+  /// (`invitacion_acceso.fallos_consecutivos` cruzó el umbral). Sólo para el
+  /// administrador. Es la defensa contra fuerza bruta que no le estorba al
+  /// mesero: no bloquea nada, avisa (docs/DECISIONES-DATOS.md §13.6).
+  acceso_sospechoso
 
   @@map("tema_notificacion")
+}
+
+/// Pantallas de la app que se le pueden dar a UNA persona. Un valor = una
+/// entrada del menú del frontend (`navItems.ts`). El nombre es el de la
+/// PANTALLA, no el de la ruta (`/comandas` se llama Despacho, `/cuentas` Por
+/// cobrar): la ruta puede cambiar sin tocar la base.
+///
+/// ⚠️ `configuracion` y `meseros` son de ADMINISTRACIÓN y sólo los ve el
+/// administrador: el CHECK `usuario_modulos_segun_rol` impide dárselos a nadie
+/// más. `meseros` es la pantalla que crea accesos temporales; si un acceso
+/// temporal pudiera verla, se renovaría a sí mismo y la caducidad no existiría.
+enum ModuloApp {
+  mesas
+  mesero
+  despacho
+  por_cobrar
+  reservaciones
+  checkin
+  escanear
+  productos
+  ventas
+  configuracion
+  meseros
+
+  @@map("modulo_app")
 }
 
 // ═══════════════════ 1 · RESTAURANTE Y PERSONAS ════════════════════════════
@@ -302,6 +332,7 @@ model Restaurante {
   contadores        ContadorDia[]
   resumenes         ResumenDia[]
   suscripcionesPush SuscripcionPush[]
+  invitaciones      InvitacionAcceso[]
 
   @@map("restaurante")
 }
@@ -309,38 +340,88 @@ model Restaurante {
 /// Personal. Rol plano por enum: este producto NO replica la matriz de 23
 /// acciones × 4 roles de hayai-saas — sería sobre-ingeniería para un MVP de
 /// comandas. Si más adelante se pide, `rol` pasa a FK sin tocar el resto.
+///
+/// Dos clases de persona en la MISMA tabla (docs/DECISIONES-DATOS.md §13.1):
+///   · Personal permanente — `acceso_hasta` NULL; entra con usuario/clave o PIN.
+///   · Acceso temporal     — `acceso_hasta` NOT NULL; rol `mesero`, sin clave
+///     ni PIN; entra SÓLO por su enlace + código (`InvitacionAcceso`).
+/// Misma tabla a propósito: comandas, cobros, pagos y cancelaciones apuntan a
+/// `usuario` con FK compuesta RESTRICT, y lo que haga un mesero temporal tiene
+/// que seguir a su nombre cuando su acceso ya no exista (cuadre de caja).
 model Usuario {
-  id             String     @id @db.Uuid
-  restauranteId  String     @map("restaurante_id") @db.Uuid
+  id             String      @id @db.Uuid
+  restauranteId  String      @map("restaurante_id") @db.Uuid
   nombre         String
-  /// Único por restaurante, no global.
-  usuario        String     @db.Citext
-  claveHash      String     @map("clave_hash")
+  /// Único por restaurante, no global. En un acceso temporal lo genera el
+  /// servidor (`acceso-` + 8 caracteres aleatorios) y NO sirve para entrar:
+  /// existe sólo porque la columna es NOT NULL y clave natural del login.
+  usuario        String      @db.Citext
+  /// Argon2id. NULL si y sólo si es acceso temporal (CHECK
+  /// `usuario_credenciales_coherentes`): el personal permanente siempre tiene
+  /// clave; un acceso temporal, nunca.
+  claveHash      String?     @map("clave_hash")
   /// PIN corto para el login de mostrador del mesero (Argon2id, igual que la
   /// clave). Nullable: cocina y caja entran con usuario/clave.
-  pinHash        String?    @map("pin_hash")
+  /// ⚠️ SIEMPRE NULL en un acceso temporal (mismo CHECK). El código de 4
+  /// dígitos de la invitación NO va aquí: `POST /auth/pin` es una pantalla
+  /// pública donde probar códigos SIN el enlace, que es exactamente lo que el
+  /// dueño descartó al aceptar 4 dígitos sin bloqueo.
+  pinHash        String?     @map("pin_hash")
   rol            RolUsuario
-  activo         Boolean    @default(true)
-  ultimoAccesoEn DateTime?  @map("ultimo_acceso_en") @db.Timestamptz(6)
-  creadoEn       DateTime   @default(now()) @map("creado_en") @db.Timestamptz(6)
-  actualizadoEn  DateTime   @updatedAt @map("actualizado_en") @db.Timestamptz(6)
+  /// Qué pantallas ve. Es la ÚNICA autoridad sobre eso para quien no es
+  /// administrador, sea permanente o temporal (docs §13.2):
+  ///   · `administrador` → ve TODO, siempre. Aquí no aplica y el CHECK
+  ///     `usuario_modulos_segun_rol` lo obliga a estar vacío, para que la base
+  ///     nunca diga una cosa mientras la app hace otra (y para que el dueño no
+  ///     pueda quitarse una pantalla a sí mismo).
+  ///   · cualquier otro rol → ve exactamente esto, y el mismo CHECK le prohíbe
+  ///     `configuracion` y `meseros`.
+  /// Falla cerrado: vacío = no ve nada. Se relee de la base en CADA petición
+  /// (JwtStrategy.validate), nunca del JWT: quitar un módulo surte efecto en
+  /// el siguiente clic, no cuando caduque el token.
+  modulos        ModuloApp[] @default([])
+  /// Hasta cuándo puede entrar. NULL = personal permanente. NOT NULL = acceso
+  /// temporal (los CHECK de la migración fijan el resto: rol `mesero`, sin
+  /// clave, sin PIN).
+  ///
+  /// Siempre cae en la HORA DE CORTE (lo calcula `hayai_fin_acceso`): "hoy" =
+  /// hasta el cierre del día operativo, no hasta medianoche; "2 días" = hasta
+  /// el corte de pasado mañana, no now()+48h. Así ningún acceso vence en mitad
+  /// de la cena de un viernes.
+  ///
+  /// ⚠️ Caducar NO escribe nada: no hay job que apague `activo`. Vencido =
+  /// `acceso_hasta <= now()`, y lo aplican JwtStrategy.validate (en cada
+  /// petición), el canje del enlace, la lista de meseros y el envío de push.
+  /// Revocar antes de tiempo = `acceso_hasta = now()` + borrar su invitación.
+  accesoHasta    DateTime?   @map("acceso_hasta") @db.Timestamptz(6)
+  activo         Boolean     @default(true)
+  ultimoAccesoEn DateTime?   @map("ultimo_acceso_en") @db.Timestamptz(6)
+  creadoEn       DateTime    @default(now()) @map("creado_en") @db.Timestamptz(6)
+  actualizadoEn  DateTime    @updatedAt @map("actualizado_en") @db.Timestamptz(6)
 
   restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
 
-  plantillasCreadas Plantilla[]       @relation("plantilla_creada_por")
-  reservaciones     Reservacion[]     @relation("reservacion_creada_por")
-  comandasAtendidas Comanda[]         @relation("comanda_mesero")
-  comandasAnuladas  Comanda[]         @relation("comanda_anulada_por")
-  itemsCancelados   ComandaItem[]     @relation("item_cancelado_por")
-  cobrosRealizados  Cobro[]           @relation("cobro_cobrado_por")
-  cobrosAnulados    Cobro[]           @relation("cobro_anulado_por")
-  pagosRegistrados  CobroPago[]       @relation("pago_registrado_por")
-  tasasRegistradas  TasaCambio[]      @relation("tasa_registrada_por")
-  suscripcionesPush SuscripcionPush[]
+  plantillasCreadas     Plantilla[]        @relation("plantilla_creada_por")
+  reservaciones         Reservacion[]      @relation("reservacion_creada_por")
+  comandasAtendidas     Comanda[]          @relation("comanda_mesero")
+  comandasAnuladas      Comanda[]          @relation("comanda_anulada_por")
+  itemsCancelados       ComandaItem[]      @relation("item_cancelado_por")
+  cobrosRealizados      Cobro[]            @relation("cobro_cobrado_por")
+  cobrosAnulados        Cobro[]            @relation("cobro_anulado_por")
+  pagosRegistrados      CobroPago[]        @relation("pago_registrado_por")
+  tasasRegistradas      TasaCambio[]       @relation("tasa_registrada_por")
+  suscripcionesPush     SuscripcionPush[]
+  /// La credencial con la que entra, si es un acceso temporal. 1:1.
+  invitacion            InvitacionAcceso?  @relation("invitacion_usuario")
+  invitacionesOtorgadas InvitacionAcceso[] @relation("invitacion_otorgada_por")
 
   @@unique([restauranteId, id], map: "usuario_restaurante_id_key")
   @@unique([restauranteId, usuario], map: "usuario_unico_por_restaurante")
   @@index([restauranteId, rol, activo])
+  /// La lista de meseros: rango `acceso_hasta > now()` dentro del restaurante.
+  /// Devuelve sólo los vivos sin recorrer el histórico de accesos vencidos,
+  /// que sólo crece (cada invitación deja una fila que no se borra nunca).
+  @@index([restauranteId, accesoHasta], map: "usuario_acceso_vigente_idx")
   @@map("usuario")
 }
 
@@ -1080,4 +1161,73 @@ model SuscripcionPush {
   /// btree_gin para poder llevar `restaurante_id` dentro del mismo índice.
   @@index([restauranteId, usuarioId], map: "suscripcion_push_envio_idx")
   @@map("suscripcion_push")
+}
+
+// ═══════════════════ 8 · ACCESOS TEMPORALES ════════════════════════════════
+
+/// La CREDENCIAL de un acceso temporal: el enlace único y el código de 4
+/// dígitos que el dueño manda por WhatsApp. 1:1 con un `Usuario` que tiene
+/// `acceso_hasta`.
+///
+/// No es la persona. La persona es el `Usuario`, y por eso sus comandas y
+/// cobros siguen a su nombre cuando el acceso caduca. Esta fila sólo guarda
+/// CON QUÉ se entra, y sólo como hash: el enlace y el código se muestran UNA
+/// vez (al crear o al regenerar) y después sólo existen en el WhatsApp del
+/// mesero.
+///
+/// Tabla aparte y no columnas en `usuario`, a propósito: `sanitizar()`
+/// (auth.service.ts) quita secretos por LISTA NEGRA, y cada columna secreta
+/// nueva en `usuario` sería una fuga por `/auth/yo` hasta que alguien se
+/// acordara de añadirla. Aquí no hay nada que olvidar: esta fila no se
+/// serializa nunca.
+///
+/// Reutilizable durante toda la vigencia, no de un solo uso: el mesero vuelve
+/// a abrir el mismo enlace en cada turno o en cada aparato nuevo.
+///
+/// ⚠️ Sólo puede colgar de un acceso temporal VIGENTE: lo impide el trigger
+/// `invitacion_acceso_solo_temporal`. Una invitación sobre un usuario
+/// permanente sería una puerta de 4 dígitos, sin bloqueo y sin caducidad.
+model InvitacionAcceso {
+  restauranteId String @map("restaurante_id") @db.Uuid
+  usuarioId     String @map("usuario_id") @db.Uuid
+
+  /// SHA-256, en hex minúscula, del token del enlace. El token son 160 bits
+  /// aleatorios en base32 Crockford (32 caracteres, `src/comun/codigos.ts`) y
+  /// viaja en el FRAGMENTO de la URL (`/acceso/<slug>#<token>`), que el
+  /// navegador no manda a ningún servidor: no queda en logs de Railway, ni en
+  /// el Referer, ni lo ve quien genera la vista previa del enlace.
+  /// SHA-256 y no Argon2: con 160 bits un hash lento no añade nada, y sólo un
+  /// hash determinista se puede buscar por índice.
+  /// ⚠️ El CHECK `invitacion_acceso_enlace_es_hash` rechaza el token en claro.
+  enlaceHash String @unique(map: "invitacion_acceso_enlace_unico") @map("enlace_hash")
+  /// Argon2id del código de 4 dígitos, igual que `usuario.pin_hash`.
+  /// Honestamente: con 10.000 combinaciones ningún hash lo protege de quien se
+  /// lleve la base. Lo protege que sin el ENLACE no sirve, y del enlace sólo
+  /// queda un SHA-256 de 160 bits. El CHECK `invitacion_acceso_codigo_es_argon2`
+  /// impide guardarlo en claro.
+  codigoHash String @map("codigo_hash")
+
+  /// Intentos fallidos seguidos desde el último canje correcto. El canje le
+  /// suma 1 (atómico, `fallos_consecutivos + 1`) en cada código incorrecto y lo
+  /// vuelve a 0 al acertar. NO bloquea (decisión del dueño): alimenta el aviso
+  /// push `acceso_sospechoso` y la lista de meseros (docs §13.6).
+  fallosConsecutivos Int       @default(0) @map("fallos_consecutivos")
+  ultimoFalloEn      DateTime? @map("ultimo_fallo_en") @db.Timestamptz(6)
+
+  /// Quién otorgó (o regeneró por última vez) la credencial vigente.
+  otorgadaPorId String   @map("otorgada_por_id") @db.Uuid
+  /// Cuándo se emitió el enlace/código vigente. Cambia al regenerar.
+  emitidaEn     DateTime @default(now()) @map("emitida_en") @db.Timestamptz(6)
+
+  restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  /// FK COMPUESTA: imposible colgar una invitación de un usuario de otro
+  /// restaurante. `Cascade` como en `suscripcion_push`: una credencial no es
+  /// historia (y el usuario no se borra nunca: lo retienen sus comandas).
+  usuario     Usuario     @relation("invitacion_usuario", fields: [restauranteId, usuarioId], references: [restauranteId, id], onDelete: Cascade)
+  otorgadaPor Usuario     @relation("invitacion_otorgada_por", fields: [restauranteId, otorgadaPorId], references: [restauranteId, id], onDelete: Restrict)
+
+  /// La PK es a la vez el índice de la FK compuesta hacia `usuario` y el que
+  /// resuelve regenerar/revocar por id de mesero. 1:1 por construcción.
+  @@id([restauranteId, usuarioId])
+  @@map("invitacion_acceso")
 }

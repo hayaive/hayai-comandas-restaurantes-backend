@@ -65,7 +65,16 @@ DECLARE
     -- suscribirse: eso da un endpoint nuevo y la fila huérfana muere sola en
     -- el siguiente 410. Verificar el SQLSTATE real contra un Postgres con RLS
     -- activo el día que se encienda este archivo.
-    'suscripcion_push'
+    'suscripcion_push',
+    -- `invitacion_acceso` guarda la CREDENCIAL de los accesos temporales
+    -- (hash del enlace y del código). Olvidarla aquí dejaría a un tenant
+    -- regenerar o revocar el acceso de un mesero de otro restaurante.
+    -- ⚠️ El canje (`POST /auth/acceso`) es público y busca por el hash del
+    -- enlace ANTES de saber el tenant, igual que `/auth/login`: el día que se
+    -- encienda este archivo, el canje necesita fijar `app.restaurante_id` a
+    -- partir del slug de la URL antes de consultar (migración
+    -- 20260918230000_accesos_temporales).
+    'invitacion_acceso'
   ];
 BEGIN
   FOREACH t IN ARRAY tablas LOOP

@@ -362,7 +362,25 @@ AS $$
            ELSE 'madrugada'
          END::"turno_servicio"
   FROM (SELECT extract(hour FROM (momento AT TIME ZONE zona))::int AS h) t;
-$$;
+$;
+
+-- Fin de un acceso temporal (añadido 2026-09-18, migración
+-- 20260918230000_accesos_temporales). Copia de DOCUMENTACIÓN: la fuente es la
+-- migración. Los atajos de duración son días OPERATIVOS: el acceso vence en la
+-- hora de corte, cuando el local está cerrado, nunca en mitad de una cena.
+CREATE OR REPLACE FUNCTION "hayai_fin_acceso"(
+  momento  timestamptz,
+  zona     text,
+  corte    time,
+  duracion interval
+)
+RETURNS timestamptz
+LANGUAGE sql
+STABLE
+AS $
+  SELECT (("hayai_fecha_operativa"(momento, zona, corte) + duracion)::date + corte)
+         AT TIME ZONE zona;
+$;
 
 
 -- ───────────────────────────────────────────────────────────────────────────

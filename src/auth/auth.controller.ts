@@ -3,6 +3,7 @@ import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { LoginPinDto } from './dto/login-pin.dto';
 import { Publico } from '../comun/decoradores/public.decorator';
+import { Comun } from '../comun/decoradores/modulo.decorator';
 import { UsuarioActual, UsuarioSesion } from '../comun/decoradores/usuario-actual.decorator';
 
 @Controller('auth')
@@ -23,6 +24,8 @@ export class AuthController {
     return this.auth.loginPin(dto.usuario, dto.pin);
   }
 
+  /** El shell lo pide en todas las pantallas para pintar el menú: `modulos` sale EFECTIVO. */
+  @Comun()
   @Get('yo')
   yo(@UsuarioActual() usuario: UsuarioSesion) {
     return this.auth.yo(usuario.id, usuario.restauranteId);

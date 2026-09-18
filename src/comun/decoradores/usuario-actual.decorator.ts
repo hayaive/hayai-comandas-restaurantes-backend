@@ -1,4 +1,5 @@
 import { createParamDecorator, ExecutionContext } from '@nestjs/common';
+import { ModuloApp } from '../../generated/prisma/enums';
 
 export interface UsuarioSesion {
   id: string;
@@ -6,6 +7,14 @@ export interface UsuarioSesion {
   rol: string;
   nombre: string;
   usuario: string;
+  /**
+   * La columna tal cual (vacía para el administrador). Lo que la persona VE
+   * se calcula con `modulosEfectivos()` (src/comun/modulos.ts), nunca leyendo
+   * esto a pelo.
+   */
+  modulos: ModuloApp[];
+  /** NULL = personal permanente; fecha = acceso temporal que vence ahí. */
+  accesoHasta: Date | null;
 }
 
 /**

@@ -4,6 +4,7 @@ import { ActualizarRestauranteDto } from './dto/actualizar-restaurante.dto';
 import { UsuarioActual, UsuarioSesion } from '../comun/decoradores/usuario-actual.decorator';
 import { Roles } from '../comun/decoradores/roles.decorator';
 import { RolesGuard } from '../comun/guards/roles.guard';
+import { Comun, Modulo } from '../comun/decoradores/modulo.decorator';
 
 /**
  * Configuración del restaurante (nombre, logo, en qué moneda se muestran los
@@ -16,6 +17,7 @@ export class RestauranteController {
   constructor(private readonly restaurante: RestauranteService) {}
 
   @Get()
+  @Comun()
   obtener(@UsuarioActual() u: UsuarioSesion) {
     return this.restaurante.obtener(u.restauranteId);
   }
@@ -24,6 +26,7 @@ export class RestauranteController {
   @Patch()
   @Roles('administrador')
   @UseGuards(RolesGuard)
+  @Modulo('configuracion')
   actualizar(@UsuarioActual() u: UsuarioSesion, @Body() dto: ActualizarRestauranteDto) {
     return this.restaurante.actualizar(u.restauranteId, dto);
   }

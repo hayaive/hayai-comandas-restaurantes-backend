@@ -11,6 +11,7 @@ import {
 import { extensionParaMimeImagen, TAMANO_MAXIMO_IMAGEN_BYTES, TAMANO_MAXIMO_LOGO_BYTES } from './imagen-upload.util';
 import { Roles } from '../comun/decoradores/roles.decorator';
 import { RolesGuard } from '../comun/guards/roles.guard';
+import { Modulo } from '../comun/decoradores/modulo.decorator';
 
 const MENSAJE_TIPO_INVALIDO = 'Solo se permiten imágenes JPG, PNG o WEBP';
 
@@ -45,6 +46,7 @@ export class UploadsController {
       },
     }),
   )
+  @Modulo('productos')
   subirImagenProducto(@UploadedFile() archivo?: Express.Multer.File): { url: string } {
     if (!archivo) {
       throw new BadRequestException('Debes adjuntar un archivo en el campo "archivo"');
@@ -86,6 +88,7 @@ export class UploadsController {
       },
     }),
   )
+  @Modulo('configuracion')
   subirLogoRestaurante(@UploadedFile() archivo?: Express.Multer.File): { url: string } {
     if (!archivo) {
       throw new BadRequestException('Debes adjuntar un archivo en el campo "archivo"');

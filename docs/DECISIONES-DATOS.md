@@ -771,3 +771,204 @@ hacia la pantalla de bloqueo de una persona. Se trata como `clave_hash`:
    después entran en silencio. El enum ya soporta lo que haga falta, pero hay que
    decidir si `agregarItems` emite también `comanda_cocina` con otro texto o si
    se acepta explícitamente que no avise.
+
+---
+
+## 13 · Accesos temporales y autorización por pantalla          *(añadido 2026-09-18)*
+
+El dueño da acceso temporal a alguien: nombre, duración (hoy / 2 días /
+1 semana / 1 mes) y qué pantallas ve. Le manda por WhatsApp un enlace único y un
+código de 4 dígitos; el mesero abre ESE enlace, teclea el código y entra. Al
+vencer deja de entrar y desaparece de la lista, pero sus comandas y cobros
+siguen a su nombre para cuadrar caja.
+
+Diseño de datos: J.O.R.B.I, verificado contra PostgreSQL 17.10 real (69/69
+aserciones, deriva de Prisma cero). Migración
+`20260918230000_accesos_temporales`. Implementación: D.A.N.I.
+
+El modelo en tres frases:
+
+1. La persona es un `usuario` más, con `acceso_hasta`. Todo lo que haga queda
+   atribuido por las FK de siempre, y "desaparecer de la lista" es un filtro
+   por fecha: ni borrado, ni job, ni columna de estado.
+2. La credencial (enlace + código) vive aparte, en `invitacion_acceso`, y sólo
+   como hash.
+3. `usuario.modulos` es la ÚNICA autoridad sobre qué pantallas ve quien no es
+   administrador. `rol` sólo decide si lo es.
+
+### 13.1 La persona es un `usuario`, en la misma tabla
+
+Dos clases de persona conviven en `usuario`:
+
+- **Personal permanente** — `acceso_hasta` NULL; entra con usuario/clave o PIN.
+- **Acceso temporal** — `acceso_hasta` NOT NULL; rol `mesero`, sin clave ni
+  PIN; entra SÓLO por su enlace + código.
+
+Misma tabla a propósito: comandas, cobros, pagos y cancelaciones apuntan a
+`usuario` con FK compuesta RESTRICT, y lo que haga un mesero temporal tiene que
+seguir a su nombre cuando su acceso ya no exista (cuadre de caja). Una tabla
+aparte de "invitados" obligaría a duplicar cada una de esas FK o a perder la
+atribución.
+
+`usuario.usuario` (NOT NULL, clave natural del login) se genera en el servidor
+para un acceso temporal (`acceso-` + 8 caracteres base32) y **no sirve para
+entrar**: `login()` y `loginPin()` filtran `acceso_hasta IS NULL`.
+
+### 13.2 `modulos`: la única autoridad sobre las pantallas
+
+`modulo_app` tiene un valor por entrada del menú del frontend, con el nombre de
+la PANTALLA y no de la ruta (`/comandas` es Despacho, `/cuentas` es Por cobrar):
+la ruta puede cambiar sin tocar la base.
+
+- **Administrador** → ve TODO, siempre. Su columna va VACÍA (CHECK
+  `usuario_modulos_segun_rol`): así la base nunca dice "sólo mesas" mientras la
+  app le enseña todo, y el dueño no puede quitarse una pantalla a sí mismo.
+- **Cualquier otro rol** → ve exactamente su columna. Falla cerrado: vacía =
+  no ve nada. El mismo CHECK le prohíbe `configuracion` y `meseros`: `meseros`
+  es la pantalla que crea accesos, y si un acceso temporal pudiera verla se
+  renovaría a sí mismo.
+
+Backfill de la migración: el personal existente que no es administrador recibe
+los 9 módulos asignables, para que nadie pierda una pantalla que hoy usa.
+Configuración ya les respondía 403 al guardar (desde 30366ba): sólo desaparece
+un botón que no servía.
+
+Lo que ve una persona se calcula en UN sitio, `modulosEfectivos()`
+(`src/comun/modulos.ts`), y lo usan las cuatro cosas que tienen que coincidir:
+la respuesta del login, la del canje, `GET /auth/yo` y el guard. Se relee de la
+base en CADA petición (`JwtStrategy.validate`), nunca del JWT: quitar un módulo
+surte efecto en el siguiente clic.
+
+### 13.3 La credencial vive aparte, y sólo como hash
+
+`invitacion_acceso` es 1:1 con el usuario temporal. Tabla aparte y no columnas
+en `usuario` porque `sanitizar()` quita secretos por LISTA NEGRA: cada columna
+secreta nueva en `usuario` sería una fuga por `/auth/yo` hasta que alguien se
+acordara de añadirla. Esta fila no se serializa nunca.
+
+- **Enlace**: token de 160 bits en base32 Crockford (32 caracteres), en el
+  FRAGMENTO de la URL (`/acceso/<slug>#<token>`), que el navegador no manda a
+  ningún servidor: no queda en logs de Railway, ni en el Referer, ni lo ve
+  quien genera la vista previa del enlace. Se guarda su **SHA-256** en hex
+  minúscula: con 160 bits un hash lento no añade nada, y sólo un hash
+  determinista se puede buscar por índice. El CHECK
+  `invitacion_acceso_enlace_es_hash` rechaza el token en claro — por eso el
+  token NUNCA se genera en hex (64 hex en claro pasarían el CHECK).
+- **Código**: 4 dígitos (`randomInt`), guardado con **Argon2id** (CHECK
+  `invitacion_acceso_codigo_es_argon2`). Honestamente: con 10.000 combinaciones
+  ningún hash lo protege de quien se lleve la base. Lo protege que sin el
+  ENLACE no sirve.
+- El enlace y el código en claro salen UNA vez (al crear o al regenerar). Es
+  reutilizable durante toda la vigencia: el mesero vuelve a abrir el mismo
+  enlace en cada turno o aparato.
+- **El código de 4 dígitos NO va en `pin_hash`**: `POST /auth/pin` es una
+  pantalla pública donde probar códigos SIN el enlace, justo lo que el dueño
+  descartó al aceptar 4 dígitos sin bloqueo. El CHECK
+  `usuario_credenciales_coherentes` lo hace imposible.
+
+### 13.4 Vencer es pasar la hora de corte
+
+Los atajos son días OPERATIVOS, no bloques de 24 h. `hayai_fin_acceso` reutiliza
+`hayai_fecha_operativa` (§5) y cae siempre en la hora de corte del restaurante:
+
+| Atajo | Intervalo | Vence |
+|---|---|---|
+| hoy | `1 day` | en el corte que cierra el día operativo actual |
+| 2 días | `2 days` | en el corte de pasado mañana |
+| 1 semana | `7 days` | |
+| 1 mes | `1 month` | |
+
+Con `now() + 48h`, un mesero invitado un viernes a las 20:00 quedaría fuera el
+domingo a las 20:00, en plena cena y con comandas abiertas a su nombre.
+
+"Hoy" pedido a las 04:59 dura un minuto. Es la regla, y por eso
+`GET /accesos/vencimientos` enseña la fecha exacta de cada atajo antes de
+confirmar. Ninguna ruta acepta un `acceso_hasta` libre.
+
+**Caducar no escribe nada.** No hay job ni columna `vencido`: vencer es pasar la
+hora, y la comparación con `now()` la hace quien lee — `JwtStrategy.validate`
+(cada petición), el canje, la lista de meseros y el envío de push. Un job se
+retrasa o se cae; el reloj no. Revocar antes de tiempo = `acceso_hasta = now()`
++ borrar su invitación (y sus aparatos push).
+
+El JWT de un acceso temporal dura `min(12 h, lo que le queda)`. No es la
+barrera — lo es `validate()` — sino para que el token no sobreviva a lo que
+representa.
+
+### 13.5 Las decisiones del dueño, convertidas en invariantes de la base
+
+| Objeto | Qué impide |
+|---|---|
+| `usuario_credenciales_coherentes` | Permanente sin clave; temporal con clave o PIN. Efecto buscado: si `hayai_fin_acceso` devolviera NULL por un bug, el acceso no se vuelve permanente en silencio |
+| `usuario_acceso_temporal_es_mesero` | Un acceso temporal administrador o encargado. Cierra la escalada: todo lo que está detrás de `@Roles('administrador')` queda fuera aunque alguien le marque mal los módulos |
+| `usuario_modulos_segun_rol` | Administrador con módulos; cualquier otro con `configuracion`/`meseros`; `modulos` NULL (con NULL, `cardinality` y `<> ALL` dan NULL y el CHECK dejaría pasar la fila) |
+| `invitacion_acceso_enlace_es_hash` / `_codigo_es_argon2` | Guardar el token o el código en claro |
+| FK compuesta `invitacion_acceso → usuario` | Colgar una invitación de un usuario de otro restaurante |
+| trigger `invitacion_acceso_solo_temporal` | Colgar una invitación de un usuario PERMANENTE o de un acceso vencido. Sería una puerta de 4 dígitos, sin bloqueo y sin caducidad, a la cuenta del dueño; el bug que la abre es trivial (un `regenerar` que no compruebe que `:id` es temporal) y ningún CHECK lo ve porque cruza dos tablas. `UPDATE OF` deja fuera los contadores: el canje los escribe en cada intento y no paga esta consulta |
+
+Los 7 constraints y el trigger se traducen a 422 con mensaje propio en
+`PgErrorFilter`; `invitacion_acceso_enlace_unico` a 500 (un token de 160 bits
+no colisiona: si salta, el token se generó mal). Todos están vigilados en
+`prisma/sql/99_verificar_objetos.sql`.
+
+### 13.6 Fuerza bruta: contar y avisar, nunca bloquear
+
+Decisión del dueño: **sin bloqueo por intentos**. Un bloqueo lo sufriría el
+mesero de verdad en mitad del servicio. La defensa es doble:
+
+1. El código no sirve sin el enlace, y del enlace sólo queda un SHA-256 de
+   160 bits.
+2. `fallos_consecutivos` sube de forma atómica (`+ 1` en la base, con
+   `RETURNING`) en cada código incorrecto y vuelve a 0 al acertar. Cuando llega
+   EXACTAMENTE a 10 se manda un push `acceso_sospechoso` al administrador
+   ("Alguien está probando códigos en el acceso de <nombre>"). Exactamente 10 y
+   no `>= 10`: con `>=`, un ataque de 10.000 intentos serían 10.000 avisos. La
+   lista de meseros enseña el contador para que el dueño decida si regenera o
+   revoca.
+
+**Sin `@Throttle` propio en el canje, también a propósito.** El backend no tiene
+`trust proxy`: detrás del proxy de Railway todas las peticiones comparten IP, y
+un límite estricto sólo le daría a un atacante un botón para bloquear el canje
+de TODOS los meseros. Queda el límite global. Revisarlo el día que se configure
+`trust proxy` (decisión aplazada por el dueño).
+
+El canje distingue por **código HTTP**: 404 enlace inválido (no existe, no es de
+este restaurante, está revocado o cuelga de un permanente), 410 acceso vencido,
+401 código incorrecto. La búsqueda es estricta: exige `acceso_hasta IS NOT
+NULL`, así que una invitación sobre un permanente sería inerte aunque el
+trigger fallara.
+
+### 13.7 Autorización por pantalla en todo el backend
+
+Hasta aquí cualquier sesión podía llamar cualquier endpoint (sólo existía
+`JwtAuthGuard` global y un `RolesGuard` opt-in). Con accesos de 4 dígitos
+entregados por WhatsApp eso ya no vale.
+
+- `@Modulo(...m)` — semántica "cualquiera de": hay endpoints que usan varias
+  pantallas (`GET /productos` lo usan Productos y Mesero).
+- `@Comun()` — lo que usa el shell en todas las pantallas. Lista CERRADA
+  (CONTRACT.md §5.1).
+- `ModulosGuard`, global, después de `JwtAuthGuard`, **falla cerrado**: una ruta
+  sin `@Publico`, `@Comun` ni `@Modulo` se deniega a todos, administrador
+  incluido. El administrador pasa siempre cualquier `@Modulo`.
+- `src/comun/guards/rutas-cubiertas.spec.ts` recorre TODAS las rutas que
+  registra AppModule y falla si alguna no declara nada, si las listas de
+  públicas o comunes cambian, o si una ruta de administración no lleva además
+  `@Roles('administrador')`. Es la red que impide que un endpoint nuevo nazca
+  abierto o bloqueado por olvido.
+
+Regla para elegir módulos: un endpoint se abre a TODAS las pantallas que lo
+llaman (cerrarlo a una rompe esa pantalla con 403). Se decidió leyendo qué
+store/página del frontend llama cada método de `src/api/httpClient.ts`.
+
+### 13.8 Lo que queda abierto
+
+- **RLS.** `invitacion_acceso` está en `03_rls.sql`, pero el canje es público y
+  busca por el hash ANTES de conocer el tenant, igual que `/auth/login`. El día
+  que se encienda RLS, el canje tiene que fijar `app.restaurante_id` a partir
+  del slug antes de consultar.
+- **`trust proxy`** (§13.6).
+- **Frontend**: los contadores del menú (`useComandaBootstrap`) piden la cola de
+  despacho y las cuentas por cobrar en todas las pantallas; con módulos tienen
+  que pedirse sólo si la persona tiene esas pantallas. Y el aparato del dueño
+  tiene que suscribirse al tema `acceso_sospechoso` para recibir el aviso.

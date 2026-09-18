@@ -95,6 +95,15 @@ type Moneda            = 'USD' | 'BS';
 /// NO es intercambiable con `Moneda` — ver docs/DECISIONES-DATOS.md §D13.
 type Divisa            = 'USD' | 'EUR';
 type FuenteTasa        = 'bcv' | 'manual' | 'binance';
+/// Una entrada del menú del frontend (añadido 2026-09-18, §5.1). El nombre es
+/// el de la PANTALLA, no el de la ruta: /comandas = despacho, /cuentas = por_cobrar.
+/// 'configuracion' y 'meseros' son sólo del administrador (CHECK en la base).
+type ModuloApp         = 'mesas' | 'mesero' | 'despacho' | 'por_cobrar' | 'reservaciones'
+                       | 'checkin' | 'escanear' | 'productos' | 'ventas'
+                       | 'configuracion' | 'meseros';
+/// + 'acceso_sospechoso' (2026-09-18): sólo administrador, ver §5 Accesos.
+type TemaNotificacion  = 'comanda_cocina' | 'comanda_barra' | 'cuenta_por_cobrar'
+                       | 'reservacion_nueva' | 'acceso_sospechoso';
 
 /// Derivado, NO existe como columna: lo calcula la vista v_mesa_estado.
 type EstadoMesa        = 'libre' | 'ocupada' | 'reservada' | 'bloqueada';
@@ -130,8 +139,27 @@ zona. Los importes son **string** en el wire (Prisma serializa `Decimal`), no
 ### 2.2 Usuario
 
 `id`, `restauranteId`, `nombre`, `usuario` (citext, único por restaurante),
-`claveHash`, `pinHash?` (login rápido de mesero), `rol: RolUsuario`, `activo`,
-`ultimoAccesoEn?`.
+`claveHash?`, `pinHash?` (login rápido de mesero), `rol: RolUsuario`,
+`modulos: ModuloApp[]`, `accesoHasta?`, `activo`, `ultimoAccesoEn?`.
+
+**Añadido 2026-09-18 (accesos temporales, docs/DECISIONES-DATOS.md §13):**
+
+- `accesoHasta` NULL = personal permanente (entra con usuario/clave o PIN).
+  NOT NULL = **acceso temporal**: rol `mesero`, sin clave ni PIN, entra SÓLO por
+  su enlace + código (`POST /auth/acceso`). Vencido = `accesoHasta <= ahora`: no
+  hay job ni columna de estado.
+- `modulos` en el **wire** (login, canje, `GET /auth/yo`) son los EFECTIVOS: el
+  administrador recibe los 11; cualquier otro, exactamente su columna. El
+  frontend pinta el menú con esto y coincide con lo que deja pasar el backend.
+- `claveHash`/`pinHash` no salen nunca por la API.
+
+### 2.2b InvitacionAcceso (no se expone)
+
+La credencial de un acceso temporal: `enlaceHash` (SHA-256 del token),
+`codigoHash` (Argon2id del código de 4 dígitos), `fallosConsecutivos`,
+`ultimoFalloEn`, `otorgadaPorId`, `emitidaEn`. 1:1 con el usuario temporal.
+**Ninguna respuesta la serializa.** El enlace y el código en claro salen una
+sola vez: en `POST /accesos` y en `POST /accesos/:id/regenerar`.
 
 > Los usuarios **no se borran**: `activo = false`. Todas las FK hacia usuario son
 > `ON DELETE RESTRICT` justamente para proteger la trazabilidad de quién anuló
@@ -500,6 +528,14 @@ El backend **debe** capturarlos; son reglas de negocio, no fallos técnicos.
 | `23505` | `tasa_cambio_dia_unica` | 409 | "Ya existe una tasa para esa divisa, fecha y fuente" — **no debería verse**: `POST /tasa` es upsert |
 | `23514` | `cobro_tasa_base` | **500** | Bug: se cobró con una tasa que no es la del dólar. Es un error del backend, no del usuario |
 | `23514` | `tasa_divisa_inmutable` | 422 | "No se puede cambiar la divisa de una tasa ya registrada" |
+| `23514` | `usuario_credenciales_coherentes` | 422 | "Un acceso temporal no puede tener clave ni PIN, y el personal permanente debe tener clave" |
+| `23514` | `usuario_acceso_temporal_es_mesero` | 422 | "Un acceso temporal sólo puede tener el rol mesero" |
+| `23514` | `usuario_modulos_segun_rol` | 422 | "Configuración y Meseros son sólo del administrador, y al administrador no se le asignan pantallas" |
+| `23514` | `invitacion_acceso_enlace_es_hash` / `invitacion_acceso_codigo_es_argon2` | 422 | El enlace / código debe guardarse como hash. Bug del backend si aparece |
+| `23514` | `invitacion_acceso_fallos_validos` | 422 | "El contador de intentos fallidos no puede ser negativo" |
+| `23514` | `invitacion_acceso_solo_temporal` (trigger) | 422 | "Ese acceso ya no está vigente: crea uno nuevo" |
+| `23503` | `invitacion_acceso_restaurante_id_usuario_id_fkey` | 422 | "El acceso no existe o no pertenece a este restaurante" |
+| `23505` | `invitacion_acceso_enlace_unico` | **500** | Bug: token regenerado mal (160 bits no colisionan) |
 
 ---
 
@@ -508,12 +544,179 @@ El backend **debe** capturarlos; son reglas de negocio, no fallos técnicos.
 Prefijo `/api/v1`. Todo lo que no cuelga de `/publico` exige sesión y resuelve
 `restauranteId` **desde el token**, nunca desde el body o un header.
 
+### 5.1 Autorización por pantalla (módulos)          *(añadido 2026-09-18)*
+
+Además de la sesión, **toda ruta** declara qué pantallas la usan, y el guard
+global `ModulosGuard` lo aplica en cada petición (relee `modulos` de la base:
+quitar un módulo surte efecto en el siguiente clic). Falla cerrado: una ruta sin
+declarar responde 403 a todo el mundo, y `src/comun/guards/rutas-cubiertas.spec.ts`
+impide que eso llegue a producción.
+
+- `@Publico` — sin sesión.
+- `@Comun` — cualquier sesión válida: lo que usa el shell en TODAS las pantallas.
+- `@Modulo(a, b, …)` — hace falta **al menos uno** de esos módulos. El
+  administrador pasa siempre.
+- `@Roles(...)` se suma donde hace falta (no lo sustituye).
+
+**Sin permiso de pantalla → 403**, igual que sin rol.
+
+Lista **cerrada** de `@Comun` (el frontend construye contra ella):
+`GET /auth/yo`, `GET /restaurante`, `GET /tasa/vigente`, todo `/push/*`,
+`GET /salones`, `GET /salones/:salonId/plantillas`, `GET /plantillas/:id`,
+`GET /plano`, `GET /mesas`. Más dos escrituras que el shell (`TasaBar`) usa en
+todas las pantallas y que el ROL restringe: `POST /tasa` y
+`POST /tasa/actualizar` → `@Comun + @Roles('administrador','encargado')`.
+
+| Método | Ruta | Quién |
+|---|---|---|
+| GET | /accesos | `@Modulo('meseros')` + `@Roles('administrador')` |
+| POST | /accesos | `@Modulo('meseros')` + `@Roles('administrador')` |
+| DELETE | /accesos/:id | `@Modulo('meseros')` + `@Roles('administrador')` |
+| PATCH | /accesos/:id | `@Modulo('meseros')` + `@Roles('administrador')` |
+| POST | /accesos/:id/regenerar | `@Modulo('meseros')` + `@Roles('administrador')` |
+| GET | /accesos/vencimientos | `@Modulo('meseros')` + `@Roles('administrador')` |
+| POST | /auth/acceso | `@Publico` |
+| POST | /auth/acceso/consultar | `@Publico` |
+| POST | /auth/login | `@Publico` |
+| POST | /auth/pin | `@Publico` |
+| GET | /auth/yo | `@Comun` |
+| GET | /categorias | `@Modulo('mesero','productos')` |
+| POST | /categorias | `@Modulo('productos')` |
+| DELETE | /categorias/:id | `@Modulo('productos')` |
+| PATCH | /categorias/:id | `@Modulo('productos')` |
+| GET | /cobros/:id | `@Modulo('mesas','por_cobrar','ventas')` |
+| POST | /cobros/:id/anular | `@Modulo('por_cobrar')` |
+| POST | /comandas | `@Modulo('mesero')` |
+| GET | /comandas/:id | `@Modulo('mesero','despacho','mesas','por_cobrar')` |
+| POST | /comandas/:id/anular | `@Modulo('despacho')` |
+| POST | /comandas/:id/despachar | `@Modulo('despacho')` |
+| POST | /comandas/:id/items | `@Modulo('mesero')` |
+| DELETE | /comandas/:id/items/:itemId | `@Modulo('despacho')` |
+| PATCH | /comandas/:id/items/:itemId | `@Modulo('mesero')` |
+| POST | /comandas/:id/mover | `@Modulo('mesas','mesero')` |
+| GET | /cuentas-por-cobrar | `@Modulo('por_cobrar')` |
+| GET | /despacho/cola | `@Modulo('despacho')` |
+| GET | /mesas | `@Comun` |
+| POST | /mesas | `@Modulo('mesas')` |
+| DELETE | /mesas/:id | `@Modulo('mesas')` |
+| GET | /mesas/:id | `@Modulo('mesas')` |
+| PATCH | /mesas/:id | `@Modulo('mesas')` |
+| POST | /mesas/:mesaId/cobrar | `@Modulo('mesas','por_cobrar')` |
+| GET | /mesas/:mesaId/cuenta | `@Modulo('mesas','por_cobrar')` |
+| GET | /plano | `@Comun` |
+| DELETE | /plantillas/:id | `@Modulo('mesas')` |
+| GET | /plantillas/:id | `@Comun` |
+| PATCH | /plantillas/:id | `@Modulo('mesas')` |
+| POST | /plantillas/:id/activar | `@Modulo('mesas')` |
+| POST | /plantillas/:id/clonar | `@Modulo('mesas')` |
+| POST | /plantillas/:id/mesas | `@Modulo('mesas')` |
+| PUT | /plantillas/:id/mesas | `@Modulo('mesas')` |
+| DELETE | /plantillas/:id/mesas/:mesaId | `@Modulo('mesas')` |
+| PATCH | /plantillas/:id/mesas/:mesaId | `@Modulo('mesas')` |
+| GET | /productos | `@Modulo('mesero','productos')` |
+| POST | /productos | `@Modulo('productos')` |
+| DELETE | /productos/:id | `@Modulo('productos')` |
+| GET | /productos/:id | `@Modulo('mesero','productos')` |
+| PATCH | /productos/:id | `@Modulo('productos')` |
+| PATCH | /productos/:id/disponibilidad | `@Modulo('productos')` |
+| GET/POST | /publico/* (5 rutas) | `@Publico` |
+| POST, GET, PATCH, DELETE | /push/* (6 rutas) | `@Comun` |
+| GET | /reportes/cierre-caja, /reportes/dia, /reportes/productos, /reportes/ventas | `@Modulo('ventas')` |
+| GET | /reservaciones | `@Modulo('reservaciones')` |
+| POST | /reservaciones | `@Modulo('reservaciones')` |
+| GET | /reservaciones/:id | `@Modulo('reservaciones','checkin','escanear')` |
+| PATCH | /reservaciones/:id | `@Modulo('reservaciones')` |
+| POST | /reservaciones/:id/cancelar | `@Modulo('reservaciones')` |
+| POST | /reservaciones/:id/confirmar | `@Modulo('reservaciones')` |
+| POST | /reservaciones/:id/no-show | `@Modulo('reservaciones')` |
+| GET | /reservaciones/:id/qr | `@Modulo('reservaciones')` |
+| POST | /reservaciones/:id/sentar | `@Modulo('reservaciones','checkin','escanear')` |
+| GET | /reservaciones/huerfanas | `@Modulo('reservaciones','mesas')` |
+| GET | /restaurante | `@Comun` |
+| PATCH | /restaurante | `@Modulo('configuracion')` + `@Roles('administrador')` |
+| GET | /salones | `@Comun` |
+| POST | /salones | `@Modulo('mesas')` |
+| DELETE | /salones/:id | `@Modulo('mesas')` |
+| GET | /salones/:id | `@Modulo('mesas')` |
+| PATCH | /salones/:id | `@Modulo('mesas')` |
+| GET | /salones/:salonId/plantillas | `@Comun` |
+| POST | /salones/:salonId/plantillas | `@Modulo('mesas')` |
+| POST | /tasa | `@Comun` + `@Roles('administrador','encargado')` |
+| POST | /tasa/actualizar | `@Comun` + `@Roles('administrador','encargado')` |
+| GET | /tasa/vigente | `@Comun` |
+| POST | /uploads/logo | `@Modulo('configuracion')` + `@Roles('administrador')` |
+| POST | /uploads/productos | `@Modulo('productos')` |
+
+> ⚠️ **Para el frontend:** `AppShell` monta `useComandaBootstrap`, que sondea
+> `GET /despacho/cola` y `GET /cuentas-por-cobrar` en TODAS las pantallas para
+> los contadores del menú (y `useAlertaCocina` lee la cola). Ninguna de las dos
+> es `@Comun`: hay que pedirlas sólo si la persona tiene `despacho` /
+> `por_cobrar`, o cada sondeo devuelve 403.
+
 ### Sesión
 ```
 POST   /auth/login                 { usuario, clave }            -> { token, usuario }
 POST   /auth/pin                   { usuario, pin }              -> { token, usuario }
 GET    /auth/yo                                                  -> Usuario
 ```
+
+`usuario` (aquí y en el canje) lleva `modulos` EFECTIVOS y `accesoHasta`.
+Login y PIN **nunca** aceptan un acceso temporal (responden 401 como a un
+usuario inexistente).
+
+### Accesos temporales (menú "Meseros")          *(añadido 2026-09-18)*
+
+Canje, **público**. El frontend ramifica por **código HTTP**, nunca por texto.
+El enlace es `<URL_PUBLICA>/acceso/<slug>#<TOKEN>`: el token viaja en el
+**fragmento** (no llega a ningún servidor ni a los logs); la página lo lee de
+`location.hash` y lo manda en el body.
+```
+POST   /auth/acceso/consultar   { restaurante: slug, token }
+         200 { restaurante: { nombre, logoUrl }, nombre, accesoHasta }
+         404 enlace inválido · 410 acceso vencido           (no cuenta como intento)
+POST   /auth/acceso             { restaurante: slug, token, codigo: /^\d{4}$/ }
+         200 { token, usuario }   (usuario sanitizado, con modulos y accesoHasta)
+         401 código incorrecto · 404 enlace inválido · 410 acceso vencido
+         400 si `codigo` no son 4 dígitos
+```
+- Sin bloqueo por intentos (decisión del dueño). Al 10.º fallo seguido se manda
+  un push `acceso_sospechoso` al administrador (sólo en el 10.º, no en cada
+  uno). El aparato del dueño tiene que estar suscrito a ese tema.
+- Sin `@Throttle` propio: sin `trust proxy`, detrás de Railway todas las
+  peticiones comparten IP y un límite estricto bloquearía a todos los meseros.
+- Un enlace **revocado** responde 404 (su credencial se borra); uno que venció
+  solo, 410.
+- El JWT de un acceso temporal dura `min(12 h, lo que le queda de acceso)`.
+
+Gestión: `@Modulo('meseros') + @Roles('administrador')`.
+```
+GET    /accesos/vencimientos            -> { hoy, dosDias, unaSemana, unMes }     (ISO)
+GET    /accesos                         -> AccesoVivo[]   (sólo vivos, por accesoHasta asc)
+POST   /accesos   { nombre (1-40), duracion, modulos (≥1) }
+         201 { acceso: { id, nombre, modulos, accesoHasta, creadoEn }, enlace, codigo }
+PATCH  /accesos/:id  { nombre?, modulos?, duracion? }        -> AccesoVivo | 404
+POST   /accesos/:id/regenerar  { enlace?: bool, codigo?: bool }
+         200 { enlace?, codigo? }                                           | 404
+DELETE /accesos/:id                                          -> 204 | 404
+
+duracion   = 'hoy' | '2_dias' | '1_semana' | '1_mes'
+AccesoVivo = { id, nombre, modulos, accesoHasta, ultimoAccesoEn,
+               fallosConsecutivos, ultimoFalloEn }
+```
+- **`enlace` y `codigo` salen UNA sola vez** (crear / regenerar). Ninguna otra
+  respuesta los trae, ni sus hashes.
+- Ninguna ruta acepta un `accesoHasta` libre: sólo los 4 atajos. Son días
+  OPERATIVOS: vencen en la hora de corte del restaurante (05:00 por defecto).
+  "hoy" pedido a las 04:59 dura un minuto: por eso existe `/vencimientos`.
+- `modulos` no admite `configuracion` ni `meseros` (400).
+- `PATCH` con `duracion` recalcula desde AHORA (extiende o acorta). Sobre un
+  acceso vencido o revocado: 404 — se crea uno nuevo.
+- `regenerar`: sin cuerpo (o sin ninguno de los dos campos) regenera **ambos**;
+  si viene alguno, sólo lo que venga en `true` (`{ codigo: true }` cambia el
+  código y el mesero conserva su enlace). Los dos en `false` → 400. Pone
+  `fallosConsecutivos` a 0 y `ultimoFalloEn` a null.
+- `DELETE` revoca: `accesoHasta = ahora`, borra la credencial y sus aparatos
+  push. El usuario no se borra: sus comandas y cobros siguen a su nombre.
 
 ### Salones y mesas
 ```
@@ -698,6 +901,7 @@ GET    /reportes/productos?periodo=&fecha=&desde=&hasta=&orden=cantidad|ingreso&
 GET    /reportes/dia?fecha=                                      -> { porTurno: VentaDia[], total: VentaDia }
 GET    /reportes/cierre-caja?fecha=                              -> { porMetodo: VentaMetodo[], descuadres: Descuadre[] }
 GET    /tasa/vigente                                             -> TasasVigentes
+        (POST /tasa y POST /tasa/actualizar: sólo administrador y encargado, 403 al resto — 2026-09-18)
 POST   /tasa                       CrearTasaDto                  -> TasaCambio
 ```
 

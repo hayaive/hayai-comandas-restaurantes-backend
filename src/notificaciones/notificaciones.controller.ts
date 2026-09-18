@@ -3,6 +3,7 @@ import type { Request } from 'express';
 import { NotificacionesService } from './notificaciones.service';
 import { ActualizarSuscripcionDto, EliminarSuscripcionDto, RegistrarSuscripcionDto } from './dto/push.dto';
 import { UsuarioActual, UsuarioSesion } from '../comun/decoradores/usuario-actual.decorator';
+import { Comun } from '../comun/decoradores/modulo.decorator';
 
 /**
  * Web Push: registrar aparatos y consultar la clave pública VAPID.
@@ -12,7 +13,12 @@ import { UsuarioActual, UsuarioSesion } from '../comun/decoradores/usuario-actua
  * `PATCH|DELETE /push/suscripciones(/:id)`. Ninguna respuesta de este
  * controller devuelve `endpoint`, `p256dh` ni `auth` — ver `sanitizar*` en
  * `notificaciones.service.ts`.
+ *
+ * `@Comun()` en TODA la clase: el shell registra el aparato desde cualquier
+ * pantalla, y cada ruta sólo toca los aparatos de quien llama. QUÉ avisos
+ * recibe lo decide `ROLES_POR_TEMA` en el envío, no quién puede suscribirse.
  */
+@Comun()
 @Controller('push')
 export class NotificacionesController {
   constructor(private readonly notificaciones: NotificacionesService) {}

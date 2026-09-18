@@ -4,7 +4,13 @@ import { randomBytes } from 'node:crypto';
 // o transcribirlos a mano). docs/DECISIONES-DATOS.md §3.
 const ALFABETO = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 
-function base32(bytes: Buffer): string {
+/**
+ * Base32 de Crockford en MAYÚSCULA, sin relleno. Exportada porque la usan
+ * también los accesos temporales (token del enlace y `usuario` generado): el
+ * CHECK `invitacion_acceso_enlace_es_hash` confía en que un token en claro
+ * nunca parezca hex minúscula, y eso sólo es cierto con ESTE alfabeto.
+ */
+export function base32(bytes: Buffer): string {
   let bits = 0;
   let valor = 0;
   let salida = '';

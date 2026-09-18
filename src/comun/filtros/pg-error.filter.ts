@@ -208,6 +208,53 @@ const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
     http: 500,
     mensaje: 'Error interno: se intentó cambiar la moneda base del restaurante',
   },
+
+  // Accesos temporales (migración 20260918230000). El servicio y los DTO ya
+  // impiden todos estos casos; si uno llega a la base es que algún camino se
+  // saltó la validación, y el mensaje tiene que decir QUÉ regla, no "los datos
+  // no cumplen una regla de negocio". Ninguno repite el token, el código ni un
+  // hash.
+  usuario_credenciales_coherentes: {
+    http: 422,
+    mensaje: 'Un acceso temporal no puede tener clave ni PIN, y el personal permanente debe tener clave',
+  },
+  usuario_acceso_temporal_es_mesero: {
+    http: 422,
+    mensaje: 'Un acceso temporal sólo puede tener el rol mesero',
+  },
+  usuario_modulos_segun_rol: {
+    http: 422,
+    mensaje: 'Configuración y Meseros son sólo del administrador, y al administrador no se le asignan pantallas',
+  },
+  invitacion_acceso_enlace_es_hash: {
+    http: 422,
+    mensaje: 'El enlace del acceso debe guardarse como hash, nunca en claro',
+  },
+  invitacion_acceso_codigo_es_argon2: {
+    http: 422,
+    mensaje: 'El código del acceso debe guardarse como hash, nunca en claro',
+  },
+  invitacion_acceso_fallos_validos: {
+    http: 422,
+    mensaje: 'El contador de intentos fallidos no puede ser negativo',
+  },
+  invitacion_acceso_restaurante_id_usuario_id_fkey: {
+    http: 422,
+    mensaje: 'El acceso no existe o no pertenece a este restaurante',
+  },
+  // El trigger que impide colgar una invitación de un usuario permanente o de
+  // un acceso ya vencido (RAISE ... USING CONSTRAINT). Lo más probable es una
+  // carrera: el acceso venció entre la comprobación y la escritura.
+  invitacion_acceso_solo_temporal: {
+    http: 422,
+    mensaje: 'Ese acceso ya no está vigente: crea uno nuevo',
+  },
+  // 160 bits aleatorios no colisionan: si esto salta, el token se generó mal
+  // (reutilizado, o con muy poca entropía). Es un bug nuestro, no del dueño.
+  invitacion_acceso_enlace_unico: {
+    http: 500,
+    mensaje: 'Error interno generando el enlace del acceso',
+  },
 };
 
 const MAPA_SQLSTATE: Record<string, TraduccionError> = {
