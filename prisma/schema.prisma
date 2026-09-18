@@ -183,6 +183,31 @@ enum FuenteTasa {
   @@map("fuente_tasa")
 }
 
+/// Cómo se DIBUJAN los precios: en la interfaz, en el ticket impreso y en la
+/// tarjeta que se comparte por WhatsApp. Es una preferencia de PRESENTACIÓN,
+/// no una unidad de cuenta: cambiarla no toca una sola fila de dinero.
+///
+/// ⚠️ NO es `Moneda`, y sus valores van en minúscula A PROPÓSITO.
+/// `Moneda` es el dominio del COBRO ('USD','BS') y el cálculo del sistema está
+/// escrito como `moneda === 'USD' ? monto : monto.div(tasa)`. Prisma emite los
+/// enums como uniones de literales y TypeScript es ESTRUCTURAL: si este enum
+/// reusara 'USD'/'BS', pasar `mostrarPreciosEn` donde se espera `monedaBase`
+/// compilaría sin una sola queja y dividiría un total entre la tasa por
+/// decisión de un ajuste visual. Con 'usd'|'bs'|'ambas' el compilador lo
+/// rechaza: es tipado nominal por vocabulario, y sale gratis.
+enum VistaPrecios {
+  /// Sólo dólares: "$12,00".
+  usd
+  /// Sólo bolívares, convertidos a la tasa que corresponda: "Bs 10.500,00".
+  bs
+  /// Dólar con el equivalente en Bs al lado: "$12,00 · Bs 10.500,00".
+  /// Es el comportamiento que el sistema tiene HOY, y por eso es el default:
+  /// la migración no cambia lo que ve nadie.
+  ambas
+
+  @@map("vista_precios")
+}
+
 /// Temas de notificación push. Son GRANULARES a propósito: la tablet de barra y
 /// la de cocina entran las dos con rol `cocina` (no existe un rol `barra`), así
 /// que lo único que las distingue es a qué se suscribió cada aparato.
@@ -216,9 +241,36 @@ model Restaurante {
   nombre String
   rif    String?
 
-  /// Moneda en la que se fijan los precios del menú. En Venezuela: USD.
+  /// Logo subido por el dueño. Ruta RELATIVA servida por el propio backend
+  /// (`/uploads/restaurante/<uuid>.<ext>`), exactamente igual que
+  /// `Producto.imagenUrl` — mismo endpoint de subida, mismo almacenamiento.
+  /// NULL = todavía no subió ninguno. La UI cae a las iniciales del nombre,
+  /// nunca a un `<img>` roto.
+  /// ⚠️ La FORMA la impone el CHECK `restaurante_logo_url_valida`. Sin él, este
+  /// PATCH acepta cualquier cadena y el ticket del cliente termina cargando un
+  /// pixel de rastreo de un tercero, o un `javascript:`/`data:` URI.
+  logoUrl String? @map("logo_url")
+
+  /// Moneda en la que se FIJAN los precios del menú. En Venezuela: USD.
   /// El cobro en Bs se convierte a la tasa del momento y NO se persiste derivado.
-  monedaBase   Moneda   @default(USD) @map("moneda_base")
+  ///
+  /// ⚠️ NO ES UN AJUSTE Y NO SE EXPONE EN LA PANTALLA DE CONFIGURACIÓN. Es la
+  /// unidad en la que están escritos TODOS los NUMERIC del sistema
+  /// (`producto.precio`, `cobro.total`, `cobro_pago.monto_usd`) y el
+  /// denominador de `tasa_cambio.valor`. Cambiarla no es configurar: es
+  /// reexpresar la contabilidad entera. El CHECK `restaurante_moneda_base_usd`
+  /// la clava en USD; el día que se soporte otra base, ese CHECK es la lista de
+  /// todo lo que hay que cambiar.
+  /// Para "en qué moneda se VE", la columna es `mostrarPreciosEn`.
+  monedaBase Moneda @default(USD) @map("moneda_base")
+
+  /// En qué moneda se DIBUJAN los precios (UI, ticket, tarjeta de WhatsApp).
+  /// Puro formato: no cambia ni un dato guardado. Ver el enum `VistaPrecios`.
+  /// ⚠️ Jamás alimenta un cálculo ni se copia a `cobro_pago.moneda`: la moneda
+  /// de un pago es la moneda REAL con la que pagó el cliente, aunque la
+  /// pantalla esté dibujando otra cosa.
+  mostrarPreciosEn VistaPrecios @default(ambas) @map("mostrar_precios_en")
+
   zonaHoraria  String   @default("America/Caracas") @map("zona_horaria")
   /// Hora de corte del día contable. Lo cobrado antes de esta hora pertenece a
   /// la fecha_operativa del día anterior. Default 05:00 (cierre de madrugada).

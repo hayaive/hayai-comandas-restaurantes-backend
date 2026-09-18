@@ -186,6 +186,28 @@ const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
     http: 422,
     mensaje: 'El usuario no existe o no pertenece a este restaurante',
   },
+
+  // Configuración del restaurante (nombre/logo/vista de precios).
+  restaurante_nombre_acotado: {
+    http: 422,
+    mensaje: 'El nombre del restaurante debe tener entre 1 y 60 caracteres',
+  },
+  // El DTO acepta cualquier string en `logoUrl` (validación laxa, ver
+  // ActualizarRestauranteDto); este CHECK es la garantía real de la forma
+  // exacta. Puede dispararse si alguien manda una URL que no salió de
+  // `POST /uploads/logo`.
+  restaurante_logo_url_valida: {
+    http: 422,
+    mensaje: 'La URL del logo no es válida',
+  },
+  // `monedaBase` NO está en `ActualizarRestauranteDto` (el `ValidationPipe`
+  // global con `whitelist: true` ya la descarta en silencio si alguien la
+  // manda). Si este CHECK llega a dispararse es un bug interno, no un dato
+  // malo del cliente — mismo criterio que `cobro_tasa_base` más arriba.
+  restaurante_moneda_base_usd: {
+    http: 500,
+    mensaje: 'Error interno: se intentó cambiar la moneda base del restaurante',
+  },
 };
 
 const MAPA_SQLSTATE: Record<string, TraduccionError> = {

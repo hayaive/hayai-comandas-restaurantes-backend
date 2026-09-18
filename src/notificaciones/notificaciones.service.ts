@@ -10,6 +10,7 @@ import { nuevoId } from '../comun/id';
 import { SuscripcionPush, TemaNotificacion } from '../generated/prisma/client';
 import { VapidConfigService } from './vapid.config';
 import { ROLES_POR_TEMA } from './temas';
+import { urlAbsolutaBackend } from '../uploads/uploads.service';
 import { ActualizarSuscripcionDto, EliminarSuscripcionDto, RegistrarSuscripcionDto } from './dto/push.dto';
 
 /**
@@ -219,10 +220,16 @@ export class NotificacionesService {
     const destinatarios = await this.destinatariosParaTemas(restauranteId, [...temas]);
     if (destinatarios.length === 0) return;
 
-    const mesaEtiqueta = comanda.mesaId
-      ? (await this.prisma.mesa.findUnique({ where: { id: comanda.mesaId }, select: { etiqueta: true } }))
-          ?.etiqueta
-      : null;
+    // Restaurante y mesa en paralelo: el service worker que recibe este push
+    // no tiene sesión ni puede llamar a la API (diseño §7.3), así que el
+    // nombre y el logo tienen que viajar YA resueltos en el payload.
+    const [mesa, restaurante] = await Promise.all([
+      comanda.mesaId
+        ? this.prisma.mesa.findUnique({ where: { id: comanda.mesaId }, select: { etiqueta: true } })
+        : Promise.resolve(null),
+      this.prisma.restaurante.findUnique({ where: { id: restauranteId }, select: { nombre: true, logoUrl: true } }),
+    ]);
+    const mesaEtiqueta = mesa?.etiqueta ?? null;
 
     // Payload MÍNIMO y SIN PII (reglas duras de privacidad §3/§4): se muestra
     // en la pantalla de bloqueo de un teléfono que puede estar sobre una mesa.
@@ -237,6 +244,13 @@ export class NotificacionesService {
       items: comanda.items.length,
       titulo: 'Nueva comanda',
       cuerpo: `Comanda #${comanda.numeroDia}${mesaEtiqueta ? ` · Mesa ${mesaEtiqueta}` : ''} · ${comanda.items.length} ítem${comanda.items.length === 1 ? '' : 's'}`,
+      // Nombre real del restaurante (antes venía cableado en `src/sw.ts` del
+      // frontend) y URL ABSOLUTA del logo — nunca relativa, el SW no tiene
+      // origen de API para completarla. `null` si no hay logo configurado: un
+      // ícono roto (404) se ve peor en la notificación que no mandar ninguno
+      // (diseño §7.3).
+      restauranteNombre: restaurante?.nombre ?? null,
+      logoUrl: restaurante?.logoUrl ? urlAbsolutaBackend(restaurante.logoUrl) : null,
     });
 
     await Promise.allSettled(destinatarios.map((d) => this.enviarUno(d, payload)));

@@ -14,6 +14,7 @@ import { ReservacionesModule } from './reservaciones/reservaciones.module';
 import { ReportesModule } from './reportes/reportes.module';
 import { UploadsModule } from './uploads/uploads.module';
 import { NotificacionesModule } from './notificaciones/notificaciones.module';
+import { RestauranteModule } from './restaurante/restaurante.module';
 
 @Module({
   imports: [
@@ -30,6 +31,7 @@ import { NotificacionesModule } from './notificaciones/notificaciones.module';
     ReportesModule,
     UploadsModule,
     NotificacionesModule,
+    RestauranteModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

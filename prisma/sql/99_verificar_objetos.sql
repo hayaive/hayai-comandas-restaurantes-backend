@@ -71,7 +71,16 @@ DECLARE
     -- La FK compuesta: es lo que hace imposible suscribir a un usuario de otro
     -- restaurante. Sin ella el aislamiento depende de que el servicio no se
     -- equivoque.
-    'suscripcion_push_restaurante_id_usuario_id_fkey'
+    'suscripcion_push_restaurante_id_usuario_id_fkey',
+    -- Configuración del restaurante (nombre/logo/vista de precios). Sin
+    -- 'restaurante_nombre_acotado' un nombre en blanco sale silenciosamente en
+    -- el ticket; sin 'restaurante_logo_url_valida' el PATCH acepta cualquier
+    -- cadena como logo (rastreador de terceros, `javascript:`/`data:` URI);
+    -- sin 'restaurante_moneda_base_usd' una columna que TODO el sistema da por
+    -- sentada (moneda_base = USD) deja de estar garantizada.
+    'restaurante_nombre_acotado',
+    'restaurante_logo_url_valida',
+    'restaurante_moneda_base_usd'
   ];
 
   triggers text[] := ARRAY[
