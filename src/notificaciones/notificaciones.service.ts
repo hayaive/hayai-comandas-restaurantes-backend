@@ -279,6 +279,103 @@ export class NotificacionesService {
   }
 
   /**
+   * POST /push/probar — manda un push de prueba a los aparatos del que llama.
+   *
+   * Existe porque diagnosticar esto a ciegas es infernal: si no llega una
+   * notificación, el fallo puede estar en la suscripción, en el service worker
+   * del teléfono, en las claves VAPID o en el servicio de push, y los cuatro
+   * se ven EXACTAMENTE igual desde el salón — no pasa nada. Esto dice en qué
+   * paso se rompió.
+   *
+   * A diferencia del envío real NO filtra por tema ni por rol: es una prueba
+   * de fontanería, no una notificación de negocio. Sí respeta el aislamiento
+   * por restaurante y sólo toca los aparatos del propio usuario.
+   *
+   * El endpoint nunca sale en la respuesta: sigue siendo una capacidad de
+   * escritura hacia el teléfono de alguien.
+   */
+  async probar(restauranteId: string, usuarioId: string) {
+    if (!this.vapid.configurado) {
+      return {
+        configurado: false,
+        suscripciones: 0,
+        entregadas: 0,
+        fallos: [] as { status: string; que: string }[],
+        diagnostico: 'El servidor no tiene claves VAPID configuradas: no puede enviar nada.',
+      };
+    }
+
+    const filas = await this.prisma.suscripcionPush.findMany({
+      where: { restauranteId, usuarioId },
+      select: { endpoint: true, p256dh: true, auth: true, vapidKid: true },
+    });
+
+    if (filas.length === 0) {
+      return {
+        configurado: true,
+        suscripciones: 0,
+        entregadas: 0,
+        fallos: [] as { status: string; que: string }[],
+        diagnostico:
+          'Este usuario no tiene ningún aparato suscrito: el navegador nunca llegó a registrar la suscripción.',
+      };
+    }
+
+    const desfasadas = filas.filter((f) => f.vapidKid !== this.vapid.kid).length;
+    const payload = JSON.stringify({
+      tema: 'prueba',
+      titulo: 'Prueba de notificación',
+      cuerpo: 'Si ves esto, los avisos funcionan en este dispositivo.',
+      ruta: '/comandas',
+    });
+
+    const fallos: { status: string; que: string }[] = [];
+    let entregadas = 0;
+
+    for (const fila of filas) {
+      try {
+        await webpush.sendNotification(
+          { endpoint: fila.endpoint, keys: { p256dh: fila.p256dh, auth: fila.auth } },
+          payload,
+          { TTL: 900, urgency: 'high' },
+        );
+        entregadas += 1;
+      } catch (error: unknown) {
+        const status = (error as { statusCode?: number })?.statusCode;
+        fallos.push({
+          status: String(status ?? 'desconocido'),
+          que:
+            status === 404 || status === 410
+              ? 'El servicio de push ya no conoce ese aparato (suscripción caducada). Hay que volver a suscribirse.'
+              : status === 403 || status === 401
+                ? 'El servicio de push rechazó nuestras claves VAPID. Revisa las variables del servidor.'
+                : 'El servicio de push devolvió un error inesperado.',
+        });
+        // Mismas reglas duras que el envío real: la muerta se borra por
+        // ENDPOINT (§3) y un 403 NO se borra, porque el problema es nuestro (§4).
+        if (status === 404 || status === 410) {
+          await this.prisma.suscripcionPush
+            .deleteMany({ where: { endpoint: fila.endpoint } })
+            .catch(() => undefined);
+        }
+      }
+    }
+
+    return {
+      configurado: true,
+      suscripciones: filas.length,
+      entregadas,
+      fallos,
+      diagnostico:
+        entregadas === 0
+          ? 'El servidor no logró entregar ninguna. Mira el detalle de los fallos.'
+          : desfasadas > 0
+            ? `Entregadas ${entregadas} de ${filas.length}. OJO: ${desfasadas} se crearon con otras claves VAPID y nunca van a llegar — hay que volver a suscribir ese aparato.`
+            : `Entregadas ${entregadas} de ${filas.length}. Si aun así no ves nada en el teléfono, el fallo está en el service worker del dispositivo, no en el servidor.`,
+    };
+  }
+
+  /**
    * Un envío individual. TTL corto y `urgency: high` para temas de comanda,
    * SIN cabecera `Topic` (regla dura §12): colapsar avisos de pedidos
    * distintos bajo el mismo topic perdería pedidos, no sólo los "des-duplica".

@@ -22,6 +22,19 @@ export class NotificacionesController {
     return this.notificaciones.obtenerClavePublica();
   }
 
+  /**
+   * Manda un push de prueba a los aparatos de quien llama y devuelve en qué
+   * paso se rompió la cadena. Sin esto, "no me llegan las notificaciones" no
+   * se puede diagnosticar desde el salón: una suscripción que nunca se
+   * registró, un service worker viejo, unas claves VAPID mal puestas y un
+   * servicio de push caído se ven todos igual — no pasa nada.
+   */
+  @Post('probar')
+  @HttpCode(200)
+  probar(@UsuarioActual() u: UsuarioSesion) {
+    return this.notificaciones.probar(u.restauranteId, u.id);
+  }
+
   @Post('suscripciones')
   @HttpCode(201)
   registrar(@UsuarioActual() u: UsuarioSesion, @Body() dto: RegistrarSuscripcionDto, @Req() req: Request) {
