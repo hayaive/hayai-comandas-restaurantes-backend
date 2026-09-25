@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Query } from '@nestjs/common';
 import { ComandasService } from './comandas.service';
 import {
   ActualizarItemDto,
@@ -9,6 +9,7 @@ import {
   CrearComandaDto,
   MoverComandaDto,
 } from './dto/comanda.dto';
+import { ReporteDiaQueryDto } from '../reportes/dto/reportes.dto';
 import { UsuarioActual, UsuarioSesion } from '../comun/decoradores/usuario-actual.decorator';
 import { Modulo } from '../comun/decoradores/modulo.decorator';
 
@@ -151,6 +152,13 @@ export class CuentaMesaController {
 @Controller('cobros')
 export class CobrosController {
   constructor(private readonly comandas: ComandasService) {}
+
+  /** GET /cobros?fecha= — el histórico de facturas de un día operativo (Ventas). */
+  @Get()
+  @Modulo('ventas')
+  listar(@UsuarioActual() u: UsuarioSesion, @Query() q: ReporteDiaQueryDto) {
+    return this.comandas.cobrosDelDia(u.restauranteId, q.fecha);
+  }
 
   @Get(':id')
   @Modulo('mesas', 'por_cobrar', 'ventas')

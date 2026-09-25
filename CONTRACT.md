@@ -584,6 +584,7 @@ todas las pantallas y que el ROL restringe: `POST /tasa` y
 | POST | /categorias | `@Modulo('productos')` |
 | DELETE | /categorias/:id | `@Modulo('productos')` |
 | PATCH | /categorias/:id | `@Modulo('productos')` |
+| GET | /cobros?fecha= | `@Modulo('ventas')` |
 | GET | /cobros/:id | `@Modulo('mesas','por_cobrar','ventas')` |
 | POST | /cobros/:id/anular | `@Modulo('por_cobrar')` |
 | POST | /comandas | `@Modulo('mesero')` |
@@ -866,6 +867,7 @@ GET    /cuentas-por-cobrar                                       -> CuentaMesa[]
 GET    /mesas/:mesaId/cuenta                                     -> { mesa, cuenta, comandas }
 POST   /mesas/:mesaId/cobrar       { propina?, descuento?, comandaIds?, pagos: PagoInput[] }
                                                                  -> Cobro & { pagos, comandas }
+GET    /cobros?fecha=                                            -> (Cobro & { pagos, comandas, mesa })[]  (día operativo; sin fecha = hoy)
 GET    /cobros/:id                                               -> Cobro & { pagos, comandas, mesa }
 POST   /cobros/:id/anular          { motivo }                    -> Cobro
 ```

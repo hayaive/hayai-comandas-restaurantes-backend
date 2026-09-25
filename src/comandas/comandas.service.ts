@@ -122,6 +122,46 @@ export class ComandasService {
     return cobro;
   }
 
+  /**
+   * GET /cobros?fecha= — el histórico de facturas de un día operativo, para
+   * la sección "Cuentas cobradas" de Ventas. Sin `fecha` resuelve el día
+   * operativo en curso, igual que `ReportesService.ventasDelDia`.
+   *
+   * El filtro por `fecha_operativa` va en SQL crudo (no `where: { fechaOperativa }`
+   * de Prisma) por la misma razón que el resto de este archivo: es una columna
+   * `date` y comparar contra un `Date` de JS arrastra la zona horaria del
+   * proceso Node, que no tiene por qué ser la del restaurante.
+   */
+  async cobrosDelDia(restauranteId: string, fecha?: string) {
+    let fechaResuelta = fecha;
+    if (!fechaResuelta) {
+      const restaurante = await this.prisma.restaurante.findFirstOrThrow({ where: { id: restauranteId } });
+      const { fechaOperativa } = await this.diaOperativo.resolver(restaurante.zonaHoraria, restaurante.horaCorteDia);
+      fechaResuelta = fechaOperativa.toISOString().slice(0, 10);
+    }
+
+    const filas = await this.prisma.$queryRaw<{ id: string }[]>`
+      SELECT id FROM cobro
+       WHERE restaurante_id = ${restauranteId}::uuid
+         AND fecha_operativa = ${fechaResuelta}::date
+       ORDER BY cobrado_en DESC
+    `;
+    if (filas.length === 0) return [];
+
+    const cobros = await this.prisma.cobro.findMany({
+      where: { restauranteId, id: { in: filas.map((f) => f.id) } },
+      include: {
+        pagos: { orderBy: { recibidoEn: 'asc' } },
+        comandas: { include: { items: { orderBy: { orden: 'asc' } } }, orderBy: { creadaEn: 'asc' } },
+        mesa: true,
+      },
+    });
+    // `findMany` con `id: { in }` no respeta el orden de la lista: se reordena
+    // por el `ORDER BY cobrado_en DESC` que ya resolvió la consulta cruda.
+    const porId = new Map(cobros.map((c) => [c.id, c]));
+    return filas.map((f) => porId.get(f.id)!);
+  }
+
   // ═════════════════════════ Escritura de comandas ═════════════════════════
 
   /**
