@@ -288,7 +288,10 @@ ALTER TABLE "comanda"
   -- tasa se congela en `cobro`, donde es NOT NULL por columna.
   ADD CONSTRAINT "comanda_cobro_tras_despacho" CHECK (
     "cobro_id" IS NULL OR "despachada_en" IS NOT NULL
-  );
+  ),
+  -- Nombre del cliente normalizado (migración 20260919100000, DECISIONES-DATOS §14).
+  -- Sin tope de longitud a propósito: el tope de 120 vive en los DTOs.
+  ADD CONSTRAINT "comanda_cliente_nombre_normalizado" CHECK ("cliente_nombre" IS NULL OR (length("cliente_nombre") > 0 AND "cliente_nombre" = btrim("cliente_nombre")));
 
 -- La factura consolidada.
 ALTER TABLE "cobro"
@@ -302,7 +305,8 @@ ALTER TABLE "cobro"
   ),
   ADD CONSTRAINT "cobro_anulacion_coherente" CHECK (
     "anulado_en" IS NOT NULL OR ("anulado_por_id" IS NULL AND "motivo_anulacion" IS NULL)
-  );
+  ),
+  ADD CONSTRAINT "cobro_cliente_nombre_normalizado" CHECK ("cliente_nombre" IS NULL OR (length("cliente_nombre") > 0 AND "cliente_nombre" = btrim("cliente_nombre")));
 
 -- Pago móvil y transferencia sin referencia = un pago que no se puede conciliar
 -- con el banco. Se bloquea en la base, no en el formulario.

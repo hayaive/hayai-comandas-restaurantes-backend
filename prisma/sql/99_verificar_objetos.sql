@@ -53,6 +53,8 @@ DECLARE
     'comanda_anulacion_coherente',
     -- No se factura lo que no salió de cocina.
     'comanda_cobro_tras_despacho',
+    'comanda_cliente_nombre_normalizado',
+    'cobro_cliente_nombre_normalizado',
     'comanda_item_cancelacion_coherente',
     'cobro_totales_validos',
     'cobro_tipo_coherente',

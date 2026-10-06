@@ -972,3 +972,39 @@ store/página del frontend llama cada método de `src/api/httpClient.ts`.
   despacho y las cuentas por cobrar en todas las pantallas; con módulos tienen
   que pedirse sólo si la persona tiene esas pantallas. Y el aparato del dueño
   tiene que suscribirse al tema `acceso_sospechoso` para recibir el aviso.
+
+
+---
+
+## 14 · Nombre del cliente en la factura          *(añadido 2026-09-19)*
+
+**Bug.** El mesero escribe el nombre del cliente al crear el pedido, pero ni
+`POST /comandas` lo enviaba ni la base tenía dónde guardarlo: la factura (al
+cobrar y al reimprimir desde Ventas) salía siempre "Consumidor final".
+
+**Esquema** (migración `20260919100000_cliente_nombre_en_factura`, aditiva):
+
+- `comanda.cliente_nombre TEXT NULL` — lo que dijo el mesero.
+- `cobro.cliente_nombre TEXT NULL` — el nombre CONGELADO en la factura. Se
+  congela igual que la tasa: reimprimir meses después imprime lo mismo aunque la
+  reserva o la comanda cambien.
+- CHECK `comanda_cliente_nombre_normalizado` y `cobro_cliente_nombre_normalizado`:
+  NULL, o no vacío y sin espacios de borde (`= btrim(...)`). "Sin nombre" es un
+  único valor (NULL), nunca `''` ni `'  '`.
+- Sin CHECK de longitud: el cobro copia nombres de reservas, que no tienen tope,
+  y un CHECK bloquearía el cobro. El tope de 120 vive en los DTOs
+  (`CrearComandaDto`, `CobrarMesaDto`). Sin índice: nadie filtra por este campo.
+- Las filas anteriores quedan en NULL (se siguen imprimiendo "Consumidor final").
+
+**Regla de resolución** (`ComandasService.resolverClienteNombre`, única fuente):
+
+1. `clienteNombre` del cajero si viene definido en `POST /mesas/:id/cobrar`
+   (`null` o en blanco = fuerza "Consumidor final" → NULL);
+2. el primer `cliente_nombre` no nulo de las comandas cobradas, por `creada_en`
+   (se lee de las filas ya bloqueadas con `FOR UPDATE`, no de otra consulta);
+3. `reservacion.cliente_nombre` de la reserva de la primera comanda que tenga
+   `reservacion_id`, o si no la reserva `sentada` de esa mesa;
+4. NULL.
+
+`GET /mesas/:mesaId/cuenta` devuelve el resultado como `clienteNombreSugerido`
+(sobre las comandas vivas) para que la caja lo muestre editable.

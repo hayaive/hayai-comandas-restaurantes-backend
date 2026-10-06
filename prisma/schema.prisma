@@ -755,6 +755,9 @@ model Comanda {
 
   comensales Int     @default(1)
   meseroId   String? @map("mesero_id") @db.Uuid
+  /// Lo que escribió el mesero al tomar el pedido. NULL = no lo dijo. Normalizado
+  /// (sin espacios de borde, no vacío) por `comanda_cliente_nombre_normalizado`.
+  clienteNombre String? @map("cliente_nombre")
 
   /// DERIVADO por el trigger `comanda_estado`. Ver el enum `EstadoComanda`.
   estado EstadoComanda @default(pendiente)
@@ -889,6 +892,9 @@ model Cobro {
   /// El máximo de las comandas cubiertas: la mesa tiene UN número de comensales
   /// y si creció durante la noche manda el mayor.
   comensales     Int           @default(1)
+  /// Nombre CONGELADO en la factura (lo que se imprime y se reimprime). Lo
+  /// resuelve el servidor al cobrar (§14). NULL = "Consumidor final".
+  clienteNombre  String?       @map("cliente_nombre")
 
   /// Totales en moneda base (USD). Los calcula el servidor a partir de las
   /// comandas bloqueadas con FOR UPDATE; jamás se toman del cliente.

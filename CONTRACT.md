@@ -258,6 +258,7 @@ PK compuesta `(plantillaId, mesaId)`.
 | `turno` | TurnoServicio | Ídem |
 | `comensales` | int | |
 | `meseroId` | uuid? | |
+| `clienteNombre?` | string | Lo que escribió el mesero (trim, máx. 120 en el DTO). NULL = no lo dijo |
 | `estado` | EstadoComanda | **DERIVADO** por trigger. No se escribe |
 | `despachadaEn?` | datetime | La cocina lo sacó. NULL = sigue en la cola |
 | `anuladaEn?` | datetime | Descartado |
@@ -307,6 +308,7 @@ La cuenta consolidada de una mesa. Reúne N comandas despachadas vía
 | `numeroDia` | int | Número visible de la factura del día. Contador propio, distinto del de la comanda |
 | `fechaOperativa`, `turno` | | **Los del cobro**: la venta se cuenta cuando entra el dinero |
 | `comensales` | int | El máximo de las comandas cubiertas |
+| `clienteNombre?` | string | Nombre **congelado** en la factura (lo que se imprime/reimprime). NULL = "Consumidor final". Ver DECISIONES-DATOS §14 |
 | `subtotal`, `descuento`, `impuesto`, `propina`, `total` | decimal | USD. Los calcula **el servidor** |
 | `tasaId`, `tasaValor`, `totalBs` | | **NOT NULL**: congelados al emitir, para reimprimir el mismo monto en Bs |
 | `cobradoEn`, `cobradoPorId?` | | |
@@ -425,7 +427,7 @@ El cobro es de la MESA, no de una comanda. Todo en una transacción:
 
 ```sql
 BEGIN;
-SELECT id, total, comensales, reservacion_id FROM comanda
+SELECT id, total, comensales, reservacion_id, cliente_nombre FROM comanda
  WHERE restaurante_id=$r AND mesa_id=$m
    AND cobro_id IS NULL AND anulada_en IS NULL AND despachada_en IS NOT NULL
    [AND id = ANY($comandaIds)]        -- cobro parcial
@@ -864,7 +866,7 @@ POST   /comandas/:id/anular        { motivo }                    -> Comanda
 
 GET    /despacho/cola                                            -> ColaDespacho[]  (v_cola_despacho, FIFO global, items embebidos)
 GET    /cuentas-por-cobrar                                       -> CuentaMesa[]    (v_cuenta_mesa, comandas_por_cobrar > 0)
-GET    /mesas/:mesaId/cuenta                                     -> { mesa, cuenta, comandas }
+GET    /mesas/:mesaId/cuenta                                     -> { mesa, cuenta, comandas, clienteNombreSugerido: string | null }
 POST   /mesas/:mesaId/cobrar       { propina?, descuento?, comandaIds?, pagos: PagoInput[] }
                                                                  -> Cobro & { pagos, comandas }
 GET    /cobros?fecha=                                            -> (Cobro & { pagos, comandas, mesa })[]  (día operativo; sin fecha = hoy)

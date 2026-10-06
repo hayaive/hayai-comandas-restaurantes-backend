@@ -60,6 +60,12 @@ export class CrearComandaDto {
   @MaxLength(500)
   notas?: string;
 
+  /** Nombre del cliente que dijo el mesero. Se guarda con trim; vacío = NULL. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  clienteNombre?: string;
+
   @IsArray()
   @ArrayMinSize(1)
   @ValidateNested({ each: true })
@@ -144,6 +150,16 @@ export class CobrarMesaDto {
   @ArrayMinSize(1)
   @IsUUID('all', { each: true })
   comandaIds?: string[];
+
+  /**
+   * Nombre que sale en la factura. Omitido (undefined) = lo resuelve el
+   * servidor (comandas → reserva). `null` o en blanco = el cajero fuerza
+   * "Consumidor final" (se guarda NULL). Texto = ese nombre, con trim.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  clienteNombre?: string | null;
 
   @IsArray()
   @ArrayMinSize(1)

@@ -89,7 +89,47 @@ export class ComandasService {
       orderBy: { creadaEn: 'asc' },
     });
 
-    return { mesa, cuenta: cuenta ?? null, comandas };
+    const clienteNombreSugerido = await this.resolverClienteNombre(this.prisma, restauranteId, mesaId, comandas);
+
+    return { mesa, cuenta: cuenta ?? null, comandas, clienteNombreSugerido };
+  }
+
+  /**
+   * Nombre del cliente para la factura de una mesa. ÚNICA fuente de la regla
+   * (la usan `cuentaDeMesa` para sugerirlo y `cobrarMesa` para congelarlo):
+   *
+   *   1. el del cajero (`dto`), si vino definido: null/blanco = "Consumidor final";
+   *   2. el primer `cliente_nombre` no nulo de las comandas, en orden de creación
+   *      (quien llama las pasa ya ordenadas por `creada_en`);
+   *   3. el de la reserva: la de la primera comanda que tenga `reservacion_id`,
+   *      si no la reserva `sentada` de la mesa (mismo criterio de candidatas
+   *      que `cobrarMesa` §10);
+   *   4. NULL.
+   *
+   * Devuelve siempre texto con trim y no vacío, o NULL (lo exige el CHECK
+   * `cobro_cliente_nombre_normalizado`).
+   */
+  private async resolverClienteNombre(
+    db: Pick<Prisma.TransactionClient, 'reservacion'>,
+    restauranteId: string,
+    mesaId: string,
+    comandas: { clienteNombre: string | null; reservacionId: string | null }[],
+    dto?: string | null,
+  ): Promise<string | null> {
+    if (dto !== undefined) return dto?.trim() || null;
+
+    const deComandas = comandas.find((c) => c.clienteNombre?.trim())?.clienteNombre?.trim();
+    if (deComandas) return deComandas;
+
+    const reservacionId = comandas.find((c) => c.reservacionId)?.reservacionId;
+    const reserva = await db.reservacion.findFirst({
+      where: reservacionId
+        ? { restauranteId, id: reservacionId }
+        : { restauranteId, mesaId, estado: 'sentada' },
+      orderBy: { sentadaEn: 'asc' },
+      select: { clienteNombre: true },
+    });
+    return reserva?.clienteNombre.trim() || null;
   }
 
   async obtenerConDetalle(restauranteId: string, id: string) {
@@ -315,6 +355,7 @@ export class ComandasService {
           comensales: dto.comensales ?? 1,
           meseroId,
           notas: dto.notas,
+          clienteNombre: dto.clienteNombre?.trim() || null,
         },
       });
 
@@ -541,9 +582,15 @@ export class ComandasService {
         : Prisma.empty;
 
       const comandas = await tx.$queryRaw<
-        { id: string; total: Prisma.Decimal; comensales: number; reservacion_id: string | null }[]
+        {
+          id: string;
+          total: Prisma.Decimal;
+          comensales: number;
+          reservacion_id: string | null;
+          cliente_nombre: string | null;
+        }[]
       >(Prisma.sql`
-        SELECT "id", "total", "comensales", "reservacion_id"
+        SELECT "id", "total", "comensales", "reservacion_id", "cliente_nombre"
           FROM "comanda"
          WHERE "restaurante_id" = ${restauranteId}::uuid
            AND "mesa_id"        = ${mesaId}::uuid
@@ -626,6 +673,15 @@ export class ComandasService {
       `;
 
       // ── 7 · La factura ──────────────────────────────────────────────────
+      // El nombre se resuelve ANTES de cerrar las reservas (§10), y sale de las
+      // filas ya bloqueadas en §1: nada de otra consulta sobre comandas.
+      const clienteNombre = await this.resolverClienteNombre(
+        tx,
+        restauranteId,
+        mesaId,
+        comandas.map((c) => ({ clienteNombre: c.cliente_nombre, reservacionId: c.reservacion_id })),
+        dto.clienteNombre,
+      );
       const cobroId = nuevoId();
       await tx.cobro.create({
         data: {
@@ -639,6 +695,7 @@ export class ComandasService {
           // La mesa tiene UN número de comensales: si creció durante la noche,
           // manda el mayor de las comandas que se están cobrando.
           comensales: Math.max(...comandas.map((c) => c.comensales)),
+          clienteNombre,
           subtotal,
           descuento,
           impuesto,
