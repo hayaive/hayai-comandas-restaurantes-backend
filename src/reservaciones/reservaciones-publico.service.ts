@@ -3,6 +3,7 @@ import { PrismaService } from '../comun/prisma/prisma.service';
 import { ReservacionesService } from './reservaciones.service';
 import { Reservacion } from '../generated/prisma/client';
 import { CrearReservacionPublicaDto } from './dto/reservacion-publica.dto';
+import { ClientesService } from '../clientes/clientes.service';
 
 /**
  * `ReservacionPublica` NO expone ids internos de otras reservas ni datos de
@@ -31,6 +32,7 @@ export class ReservacionesPublicoService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly reservaciones: ReservacionesService,
+    private readonly clientes: ClientesService,
   ) {}
 
   private async restaurantePorSlug(slug: string) {
@@ -183,16 +185,14 @@ export class ReservacionesPublicoService {
   }
 
   /**
-   * CONTRACT.md §3: check-in por QR — valida la reserva y la deja `sentada`.
+   * Check-in por QR (self-seat): valida la reserva, la deja `sentada` y abre el
+   * CLIENTE (la visita) sentado en su mesa, con el nombre de la reserva. La mesa
+   * queda ocupada desde este mismo instante, sin necesidad de comanda (que exige
+   * al menos una línea y no puede crearla un endpoint público sin sesión: la
+   * primera comanda la crea el mesero con `clienteId`).
    *
-   * ⚠️ Ya NO abre comanda (mismo motivo que `ReservacionesService.sentar`): una
-   * comanda es un PEDIDO y exige al menos una línea, así que el check-in no
-   * puede crearla — y menos desde un endpoint público sin sesión, donde nadie
-   * ha tomado nota todavía. La primera comanda la crea el mesero después.
-   *
-   * ⭐ Aun así la mesa queda OCUPADA desde este mismo instante: `v_mesa_estado`
-   * cuenta una reserva `sentada` como ocupación, sin necesidad de comanda. Es
-   * exactamente lo que el escaneo del QR tiene que producir en el plano.
+   * Sin sesión no hay autor: el cliente nace sin `creado_por_id` (INSERT, no se
+   * audita). El `updateMany` condicionado al estado hace atómico el doble escaneo.
    */
   async checkin(codigoPublico: string) {
     const reservacion = await this.obtenerPorCodigo(codigoPublico);
@@ -202,21 +202,31 @@ export class ReservacionesPublicoService {
     if (!reservacion.mesaId) {
       throw new BadRequestException('Elige una mesa antes de hacer check-in');
     }
+    const mesaId = reservacion.mesaId;
 
     await this.reservaciones.validarMesaDisponibleEnPlantilla(
       this.prisma,
       reservacion.restauranteId,
       reservacion.plantillaId,
-      reservacion.mesaId,
+      mesaId,
     );
 
-    await this.prisma.reservacion.update({
-      where: { id: reservacion.id },
-      data: { estado: 'sentada', sentadaEn: new Date() },
+    await this.prisma.$transaction(async (tx) => {
+      const { count } = await tx.reservacion.updateMany({
+        where: { id: reservacion.id, estado: { in: ['pendiente', 'confirmada'] } },
+        data: { estado: 'sentada', sentadaEn: new Date() },
+      });
+      if (count === 0) throw new ConflictException('Esa reservación no está lista para el check-in');
+      await this.clientes.abrir(
+        tx,
+        reservacion.restauranteId,
+        { nombre: reservacion.clienteNombre, mesaId, reservacionId: reservacion.id },
+        { validarMesa: false },
+      );
     });
 
     const actualizada = await this.obtenerPorCodigo(codigoPublico);
-    const mesa = await this.prisma.mesa.findFirst({ where: { id: actualizada.mesaId! } });
+    const mesa = await this.prisma.mesa.findFirst({ where: { id: mesaId } });
     return aReservacionPublica(actualizada, mesa?.etiqueta);
   }
 }

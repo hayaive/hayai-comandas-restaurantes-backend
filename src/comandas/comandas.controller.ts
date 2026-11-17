@@ -1,30 +1,30 @@
 import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Query } from '@nestjs/common';
 import { ComandasService } from './comandas.service';
+import { CobrosService } from './cobros.service';
+import { ClientesService } from '../clientes/clientes.service';
 import {
   ActualizarItemDto,
   AgregarItemsDto,
   AnularDto,
   CancelarItemDto,
-  CobrarMesaDto,
+  CobrarClienteDto,
+  CorregirCobroDto,
   CrearComandaDto,
-  MoverComandaDto,
 } from './dto/comanda.dto';
 import { ReporteDiaQueryDto } from '../reportes/dto/reportes.dto';
 import { UsuarioActual, UsuarioSesion } from '../comun/decoradores/usuario-actual.decorator';
 import { Modulo } from '../comun/decoradores/modulo.decorator';
 
 /**
- * Comandas: el PEDIDO. Nace en la cola de despacho y muere despachado, anulado
- * o cubierto por un cobro.
+ * Comandas: el PEDIDO. Nace en la cola de despacho y muere despachado o anulado.
+ * Es de un cliente (`clienteId`); sus líneas se cobran por cliente.
  *
- * Desaparecieron con el rediseño de comandas múltiples:
- *   · `GET  /comandas/activas`        → `GET /cuentas-por-cobrar` y `GET /despacho/cola`
- *                                        (la vista `v_comanda_activa` ya no existe)
- *   · `POST /comandas/:id/enviar`     → no hay borrador: `POST /comandas` ya encola
- *   · `PATCH /comandas/:id/items/:itemId/estado` → no hay workflow por ítem
- *   · `POST /comandas/:id/cuenta`     → no existe el estado `por_cobrar`
- *   · `POST /comandas/:id/cobrar`     → `POST /mesas/:mesaId/cobrar`, el cobro es de la mesa
- *   · `GET  /cocina/cola?destino=`    → `GET /despacho/cola`, global y por comanda
+ * Desaparecieron:
+ *   · `POST /comandas/:id/mover` → `POST /clientes/:id/sentar` (mueve al cliente
+ *     y, con él, sus comandas que siguen en cocina)
+ *   · `POST /mesas/:mesaId/cobrar` → `POST /clientes/:id/cobrar`
+ *   (y antes: `/comandas/activas`, `/comandas/:id/enviar`, `/comandas/:id/cuenta`,
+ *   `/cocina/cola`: ver CONTRACT.md §5)
  */
 @Controller('comandas')
 export class ComandasController {
@@ -37,39 +37,40 @@ export class ComandasController {
   }
 
   @Get(':id')
-  @Modulo('mesero', 'despacho', 'mesas', 'por_cobrar')
+  @Modulo('mesero', 'despacho', 'mesas', 'por_cobrar', 'ventas')
   obtener(@UsuarioActual() u: UsuarioSesion, @Param('id') id: string) {
     return this.comandas.obtenerConDetalle(u.restauranteId, id);
   }
 
+  /** Agregar líneas, también a una comanda ya despachada o cobrada (no vuelven a cocina). */
   @Post(':id/items')
-  @Modulo('mesero')
+  @Modulo('mesero', 'por_cobrar')
   agregarItems(@UsuarioActual() u: UsuarioSesion, @Param('id') id: string, @Body() dto: AgregarItemsDto) {
-    return this.comandas.agregarItems(u.restauranteId, id, dto);
+    return this.comandas.agregarItems(u.restauranteId, u.id, id, dto);
   }
 
   @Patch(':id/items/:itemId')
-  @Modulo('mesero')
+  @Modulo('mesero', 'por_cobrar')
   actualizarItem(
     @UsuarioActual() u: UsuarioSesion,
     @Param('id') id: string,
     @Param('itemId') itemId: string,
     @Body() dto: ActualizarItemDto,
   ) {
-    return this.comandas.actualizarItem(u.restauranteId, id, itemId, dto);
+    return this.comandas.actualizarItem(u.restauranteId, u.id, id, itemId, dto);
   }
 
-  /** Anular UNA línea antes de despachar. No borra: deja `canceladoEn`. */
+  /** Anular UNA línea sin factura (antes o después de despachar). No borra: deja `canceladoEn`. */
   @Delete(':id/items/:itemId')
   @HttpCode(204)
-  @Modulo('despacho')
+  @Modulo('despacho', 'mesero', 'por_cobrar')
   async cancelarItem(
     @UsuarioActual() u: UsuarioSesion,
     @Param('id') id: string,
     @Param('itemId') itemId: string,
     @Body() dto: CancelarItemDto,
   ) {
-    await this.comandas.cancelarItem(u.restauranteId, id, itemId, dto.motivo, u.id);
+    await this.comandas.cancelarItem(u.restauranteId, u.id, id, itemId, dto.motivo);
   }
 
   /** La cocina sacó el pedido: sale de la cola, no de la base. */
@@ -77,12 +78,6 @@ export class ComandasController {
   @Modulo('despacho')
   despachar(@UsuarioActual() u: UsuarioSesion, @Param('id') id: string) {
     return this.comandas.despachar(u.restauranteId, id);
-  }
-
-  @Post(':id/mover')
-  @Modulo('mesas', 'mesero')
-  mover(@UsuarioActual() u: UsuarioSesion, @Param('id') id: string, @Body() dto: MoverComandaDto) {
-    return this.comandas.moverComanda(u.restauranteId, id, dto.mesaIdDestino);
   }
 
   @Post(':id/anular')
@@ -97,10 +92,9 @@ export class ComandasController {
 export class DespachoController {
   constructor(private readonly comandas: ComandasService) {}
 
-  // ⚠️ El shell del frontend (`useComandaBootstrap` en AppShell) hoy pide la
-  // cola y las cuentas en TODAS las pantallas para los contadores del menú.
-  // Con módulos, el frontend tiene que pedirlas sólo si la persona tiene
-  // Despacho / Por cobrar; si no, recibe un 403 en cada sondeo.
+  // ⚠️ El shell del frontend pide la cola y las cuentas en TODAS las pantallas
+  // para los contadores del menú. Con módulos, sólo hay que pedirlas si la
+  // persona tiene Despacho / Por cobrar; si no, recibe un 403 en cada sondeo.
   @Get('cola')
   @Modulo('despacho')
   cola(@UsuarioActual() u: UsuarioSesion) {
@@ -108,67 +102,70 @@ export class DespachoController {
   }
 }
 
-/** El menú del cajero: qué mesas deben dinero. */
+/** El menú del cajero: qué clientes deben algo ya despachado. */
 @Controller('cuentas-por-cobrar')
 export class CuentasPorCobrarController {
-  constructor(private readonly comandas: ComandasService) {}
+  constructor(private readonly clientes: ClientesService) {}
 
   @Get()
   @Modulo('por_cobrar')
   listar(@UsuarioActual() u: UsuarioSesion) {
-    return this.comandas.cuentasPorCobrar(u.restauranteId);
+    return this.clientes.deudas(u.restauranteId, true);
   }
 }
 
-/**
- * La cuenta de una mesa y su cobro.
- *
- * Cuelga de `/mesas` y no de `/comandas` porque la unidad de cobro es la mesa:
- * una mesa tiene N comandas y se cobran juntas. Convive con `MesasController`
- * (CRUD del catálogo de mesas) sin chocar: las rutas tienen distinta forma.
- */
+/** Quiénes están sentados en una mesa y qué debe cada uno. */
 @Controller('mesas')
 export class CuentaMesaController {
-  constructor(private readonly comandas: ComandasService) {}
+  constructor(private readonly clientes: ClientesService) {}
 
   @Get(':mesaId/cuenta')
-  @Modulo('mesas', 'por_cobrar')
+  @Modulo('mesas', 'por_cobrar', 'mesero')
   cuenta(@UsuarioActual() u: UsuarioSesion, @Param('mesaId') mesaId: string) {
-    return this.comandas.cuentaDeMesa(u.restauranteId, mesaId);
-  }
-
-  @Post(':mesaId/cobrar')
-  @Modulo('mesas', 'por_cobrar')
-  cobrar(
-    @UsuarioActual() u: UsuarioSesion,
-    @Param('mesaId') mesaId: string,
-    @Body() dto: CobrarMesaDto,
-  ) {
-    return this.comandas.cobrarMesa(u.restauranteId, mesaId, dto, u.id);
+    return this.clientes.cuentaDeMesa(u.restauranteId, mesaId);
   }
 }
 
-/** Las facturas emitidas: reimprimir y anular. */
+/** El cobro es del CLIENTE: `POST /clientes/:id/cobrar` (el resto de `/clientes` vive en ClientesModule). */
+@Controller('clientes')
+export class ClienteCobroController {
+  constructor(private readonly cobros: CobrosService) {}
+
+  @Post(':id/cobrar')
+  @Modulo('mesas', 'por_cobrar')
+  cobrar(@UsuarioActual() u: UsuarioSesion, @Param('id') id: string, @Body() dto: CobrarClienteDto) {
+    return this.cobros.cobrarCliente(u.restauranteId, id, dto, u.id);
+  }
+}
+
+/** Las facturas emitidas: reimprimir, corregir y anular. */
 @Controller('cobros')
 export class CobrosController {
-  constructor(private readonly comandas: ComandasService) {}
+  constructor(private readonly cobros: CobrosService) {}
 
   /** GET /cobros?fecha= — el histórico de facturas de un día operativo (Ventas). */
   @Get()
   @Modulo('ventas')
   listar(@UsuarioActual() u: UsuarioSesion, @Query() q: ReporteDiaQueryDto) {
-    return this.comandas.cobrosDelDia(u.restauranteId, q.fecha);
+    return this.cobros.delDia(u.restauranteId, q.fecha);
   }
 
   @Get(':id')
   @Modulo('mesas', 'por_cobrar', 'ventas')
   obtener(@UsuarioActual() u: UsuarioSesion, @Param('id') id: string) {
-    return this.comandas.obtenerCobro(u.restauranteId, id);
+    return this.cobros.obtener(u.restauranteId, id);
+  }
+
+  /** Corregir una factura de cualquier día, con su cobro adicional o devolución. */
+  @Post(':id/corregir')
+  @Modulo('por_cobrar', 'ventas')
+  corregir(@UsuarioActual() u: UsuarioSesion, @Param('id') id: string, @Body() dto: CorregirCobroDto) {
+    return this.cobros.corregir(u.restauranteId, id, dto, u.id);
   }
 
   @Post(':id/anular')
   @Modulo('por_cobrar')
   anular(@UsuarioActual() u: UsuarioSesion, @Param('id') id: string, @Body() dto: AnularDto) {
-    return this.comandas.anularCobro(u.restauranteId, id, dto.motivo, u.id);
+    return this.cobros.anular(u.restauranteId, id, dto.motivo, u.id);
   }
 }

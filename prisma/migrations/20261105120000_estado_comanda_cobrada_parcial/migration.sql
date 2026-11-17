@@ -1,0 +1,11 @@
+-- Nuevo estado derivado de una comanda: despachada con ALGUNAS líneas
+-- facturadas (cobro dividido por líneas, docs/DECISIONES-DATOS.md §15).
+--
+-- Va SOLO en su propia migración a propósito: Postgres no deja USAR un valor de
+-- enum en la misma transacción que lo crea ("unsafe use of new value"), y la
+-- migración siguiente (20261105120100) instala el trigger `comanda_estado` que
+-- lo emite y recalcula el estado de todas las comandas en su backfill.
+--
+-- AFTER 'despachada': el orden del enum es el del ciclo de vida, y es el mismo
+-- en que lo declara schema.prisma.
+ALTER TYPE "estado_comanda" ADD VALUE IF NOT EXISTS 'cobrada_parcial' AFTER 'despachada';

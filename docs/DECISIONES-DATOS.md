@@ -3,6 +3,9 @@
 > Autor: **J.O.R.B.I** (data-engineer) · 2026-09-12
 > Ampliado el 2026-09-13 con §D13/§D14 y §10 (tasa del euro).
 > Ampliado el 2026-09-14 con §D15 y §11 (ventas por mes y por año).
+> Ampliado el 2026-11-05 con §15 (D19-D29): cliente como unidad de cobro,
+> factura por líneas y correcciones auditadas. **Supera** la parte de cobro de
+> §D5/§4, §6 (`v_cuenta_mesa`) y la regla de nombre de §14.
 > Acompaña a `prisma/schema.prisma`, `prisma/sql/` y `CONTRACT.md`.
 >
 > ⚠️ **§D5, §4 y parte de §6/§7 quedaron SUPERADOS el 2026-09-15** por el
@@ -1008,3 +1011,277 @@ cobrar y al reimprimir desde Ventas) salía siempre "Consumidor final".
 
 `GET /mesas/:mesaId/cuenta` devuelve el resultado como `clienteNombreSugerido`
 (sobre las comandas vivas) para que la caja lo muestre editable.
+
+> ⚠️ **§14 queda SUPERADO por §15.5** en cuanto a la regla de resolución: el
+> nombre por defecto de la factura es ahora `cliente.nombre`.
+
+---
+
+## 15 · Cliente como unidad de cobro, factura por líneas y correcciones auditadas          *(añadido 2026-11-05)*
+
+> Migraciones `20261105120000_estado_comanda_cobrada_parcial` (sólo el valor de
+> enum) y `20261105120100_cliente_y_facturacion_por_lineas`. **Rompe** el
+> contrato de cobro: `comanda.cobro_id` y `v_cuenta_mesa` ya no existen.
+>
+> **Verificación:** aplicadas sobre PostgreSQL 17.11 efímero (Docker) con un
+> escenario a mitad de servicio (mesa con comandas en cocina y despachadas,
+> reserva sentada sin pedido, para llevar viva, anulada, factura de hoy y de
+> ayer). Backfill correcto, `npm run db:verify` OK, **42/42 aserciones** de
+> `scripts/db-invariantes-clientes.js` y la carrera "cerrar cliente vs. anotarle
+> una línea" probada con dos conexiones reales en los dos órdenes.
+> `prisma migrate diff` (desde migraciones y desde la base) sólo muestra el
+> ruido preexistente de `hora_corte_dia`: **Prisma no propuso ningún DROP INDEX**
+> sobre los índices parciales (ni los nuevos ni los viejos). NO se aplicó a la
+> base de desarrollo del `.env` (localhost:5433 no estaba levantada) ni a
+> producción.
+
+### 15.0 Resumen
+
+| # | Decisión | Alternativa descartada | Por qué, en una línea |
+|---|---|---|---|
+| D19 | Tabla `cliente` = una VISITA (nombre, mesa opcional, reserva, día operativo, `cerrado_en`) | Seguir cobrando por mesa / cliente CRM | La unidad de cobro es quien paga; la mesa es sólo dónde está sentado, y puede no tener |
+| D20 | La mesa está ocupada ⟺ hay un cliente abierto sentado en ella | Comanda viva o reserva `sentada` | Un cliente sentado que aún no pidió, o que ya pagó y sigue ahí, también ocupa |
+| D21 | Sin tabla de historial de asiento | `cliente_asiento` | La bitácora guarda cada cambio de `mesa_id` y cada comanda congela su mesa |
+| D22 | La factura se pone en la LÍNEA (`comanda_item.cobro_id`) y una venta parcial PARTE la línea | Tabla puente `cobro_item(cantidad)` | "Cada unidad se factura a lo sumo una vez" sale gratis (es una columna); la puente exige SUM + bloqueos en dos tablas |
+| D23 | Deudor por línea (`comanda_item.cliente_id`) + FK de tres columnas hacia `cobro` | Mover comandas enteras entre clientes | El sobrante de un cobro parcial vive DENTRO de una comanda a medio cobrar; sólo moviendo líneas se puede reasignar |
+| D24 | `comanda.total` y `comanda.estado` derivados de las líneas por trigger; estado nuevo `cobrada_parcial` | Contadores en `comanda` / estado en código | Las líneas cambian desde muchos caminos (corregir, partir, reasignar); una sola definición en la base |
+| D25 | La factura NO se deriva: el servidor la calcula y la base la **verifica entera al COMMIT** | Trigger que recalcula el cobro | Con descuento, recalcular línea a línea pasa por totales negativos intermedios y el CHECK los rechaza |
+| D26 | Pagos de sólo agregar: una corrección se compensa con un pago o una **devolución negativa** en la misma transacción | Editar/borrar el pago / dejar saldo pendiente | El dinero registrado nunca desaparece y cada método de la caja cuadra solo |
+| D27 | Cada pago lleva su propio día operativo; el cuadre por método agrupa por él | Agrupar por el día de la factura | Una corrección de hoy sobre una factura de ayer mueve la caja de hoy, no la de ayer |
+| D28 | Una factura se corrige en CUALQUIER día operativo (decisión del dueño, 2026-11-05), con bitácora; su día y su número no cambian nunca | Sólo dentro de su día (fue la propuesta inicial) | El dueño necesita corregir facturas de días pasados; la venta corregida queda en su día original y el dinero del ajuste en la caja del día en que se corrige (D27), así cada caja sigue cuadrando con lo que realmente entró y salió |
+| D29 | Bitácora escrita por TRIGGERS con autor de `SET LOCAL app.usuario_id`; sin autor, error | Bitácora desde el servicio | Ningún camino de código corrige una factura sin dejar rastro, ni siquiera un script |
+
+### 15.1 Cliente (B)
+
+`cliente(id, restaurante_id, nombre, mesa_id?, reservacion_id?, fecha_operativa,
+creado_por_id?, cerrado_en?, cerrado_por_id?)`. Abierto ⟺ `cerrado_en IS NULL`
+(no hay enum de estado: es un hecho, como en `comanda`).
+
+- `nombre` NOT NULL, trim y no vacío (`cliente_nombre_normalizado`; 120 en DTO).
+- Dos clientes en la misma mesa son legales (cuentas separadas, barra). Un
+  cliente sin mesa también: pide con `tipo = 'mesa'` y `mesa_id` NULL
+  (`comanda_tipo_coherente` ahora sólo exige "mesa ⇒ salón y plantilla" y
+  "para llevar ⇒ sin mesa").
+- Reserva → a lo sumo UN cliente abierto (`cliente_reservacion_abierta_unica`):
+  el doble toque en "sentar" da 23505 y el servicio devuelve el existente.
+  `comanda.reservacion_id` y `comanda.cliente_nombre` quedan como LEGADO
+  (histórico); la autoridad es el cliente.
+- **No se cierra con deuda** (`cliente_cierre_sin_deuda`) y **no se le anota
+  deuda cerrado** (`cliente_cerrado`). Ambos se serializan: la línea toma
+  `FOR SHARE` sobre el cliente y el cierre su lock de fila (probado en los dos
+  órdenes). Reabrir = `cerrado_en = NULL`.
+- **Deuda viva** = líneas con `cobro_id IS NULL AND cancelado_en IS NULL` cuyo
+  deudor es el cliente, en comandas no anuladas. Lo que sigue en cocina cuenta.
+
+### 15.2 Editar comandas despachadas y facturas emitidas (A)
+
+`comanda_item_editable` sustituye a `comanda_item_solo_pendiente`. Se puede
+agregar, cambiar (cantidad, nota) y cancelar líneas de comandas `pendiente`,
+`despachada`, `cobrada_parcial` y `cobrada`. Sigue prohibido: tocar una comanda
+anulada, mover una línea de comanda, facturar lo que sigue en cocina o una línea
+cancelada, y tocar (salvo la nota) las líneas de una factura anulada.
+
+- **Una línea agregada a una comanda ya despachada NO vuelve a cocina**: se
+  considera servida y queda como deuda sin factura. Si hay que prepararla, es
+  una comanda nueva.
+- Cambiar una línea SIN factura sólo mueve la deuda del cliente.
+- Cambiar o cancelar una línea CON factura obliga a corregir la factura en la
+  misma transacción (15.3). Una línea facturada que se cancela conserva su
+  `cobro_id` (traza) y deja de sumar.
+
+### 15.3 La regla de los pagos (la más segura para el cuadre de caja)
+
+1. **Los pagos son un libro de sólo agregar.** `cobro_pago_guardia` rechaza
+   editar dinero, método, moneda, fecha o autor de un pago (sólo `referencia`
+   se corrige). Nunca se borra un pago.
+2. **Toda variación del total de una factura viva va acompañada, en la MISMA
+   transacción, del movimiento que la compensa**: si baja, una **devolución** =
+   fila con `monto` y `monto_usd` negativos, por el método por el que sale el
+   dinero (referencia obligatoria si es pago móvil/transferencia); si sube, un
+   pago positivo más. La base lo exige al COMMIT: `|total − Σ monto_usd| ≤ 0,01`
+   (`cobro_pagos_cuadran`). No existe "saldo pendiente" en una factura: lo que
+   no se cobra es deuda del cliente (líneas sin factura), nunca un hueco en
+   una factura emitida.
+3. **Devolución en Bs = tasa congelada de la factura** (`cobro.tasa_valor`), no
+   la del día: se devuelven los mismos bolívares que se cobraron.
+4. **Cada movimiento se fecha con el día en que ocurre** (`cobro_pago.fecha_operativa`,
+   lo pone el trigger desde `recibido_en`). `v_venta_dia_metodo` agrupa por él.
+5. **Una factura se corrige en cualquier día operativo** (decisión del dueño,
+   2026-11-05), siempre con bitácora. Lo que no cambia nunca es su día ni su
+   número (`cobro_guardia`, error `cobro_fecha_inmutable`). Efecto en reportes
+   al corregir HOY una factura de un día D anterior:
+   - `v_venta_dia` y `v_producto_vendido_dia` (agrupan por `cobro.fecha_operativa`):
+     la venta cambia **en el día D**. Los reportes de días pasados ya no son
+     inmutables: reflejan siempre la factura corregida.
+   - `v_venta_dia_metodo` (agrupa por `cobro_pago.fecha_operativa`): el cobro
+     adicional o la devolución aparecen **hoy**, y la caja de D no cambia. La
+     columna `ajustes_otros_dias_usd` separa esa parte: **caja de hoy = venta de
+     hoy + ajustes_otros_dias_usd**. El cierre de caja debe mostrarla aparte
+     ("ajustes de facturas de días anteriores"); si no, la caja de hoy parece
+     descuadrada contra la venta de hoy.
+   - `v_cobro_descuadre` sigue en 0: cada factura cuadra con TODOS sus pagos,
+     sean del día que sean.
+6. **Factura anulada = congelada**: sin pagos, sin líneas que entren o salgan,
+   sin reactivarse. Anular sigue siendo "dar de baja el cobro" (las líneas
+   siguen cubiertas por ella, igual que antes con las comandas) y se puede en
+   cualquier día (decisión del dueño: se deja como estaba). Ojo: anular saca la
+   factura de las ventas de su día y saca sus pagos del cuadre de los días en
+   que entraron, sin registrar devolución. Es el comportamiento de antes.
+7. **Factura viva sin líneas vivas = imposible** (`cobro_no_vacio`, al COMMIT):
+   si se le quitan todas, se anula.
+
+### 15.4 Factura por líneas (C)
+
+- `comanda_item.cobro_id` (NULL = deuda). Cada línea está en a lo sumo una
+  factura porque es una columna; no hay nada que sumar ni que bloquear.
+- **Cantidades parciales = partir la línea.** "Cobro 2 de 3 cafés": la línea
+  original queda con 1 (sin factura) y se inserta una línea nueva con 2, mismos
+  snapshots, misma comanda, `cobro_id` = la factura. `total_linea` lo vigila el
+  CHECK `comanda_item_total_coherente` (= round(cantidad·precio − descuento, 4)).
+  La suma de unidades se conserva por el servicio; la partición queda en la
+  bitácora (UPDATE de la original + INSERT de la nueva).
+- **Reasignar** = `UPDATE comanda_item SET cliente_id = <otro>` sobre líneas sin
+  factura (parcial: partir primero). La FK
+  `comanda_item_restaurante_id_cobro_id_cliente_id_fkey` hace imposible que una
+  línea facturada cambie de deudor o que una factura cubra líneas de otro
+  cliente. "Facturar a otro nombre" no reasigna: es `cobro.cliente_nombre`.
+- **Estado de la comanda** (trigger `comanda_estado`): anulada > pendiente (sin
+  despachar) > `despachada` (ninguna línea facturada) > `cobrada` (ninguna línea
+  viva sin factura) > `cobrada_parcial`. Una comanda con líneas facturadas no se
+  anula (`comanda_anulada_no_cobrada`, mismo nombre que el CHECK de antes).
+- **La factura se verifica al COMMIT** (`cobro_coherente` + sus gemelos en
+  `comanda_item` y `cobro_pago`, todos diferidos): no vacía, subtotal = Σ
+  líneas vivas, total = subtotal − descuento + impuesto + propina, total_bs =
+  round(total·tasa, 4) ± 0,01, pagos que cuadran.
+
+### 15.5 Contrato de datos para D.A.N.I
+
+**Cambios de columnas (wire camelCase):**
+
+| Entidad | Nuevo | Se fue / cambia |
+|---|---|---|
+| `Cliente` | `id, restauranteId, nombre, mesaId?, reservacionId?, fechaOperativa, creadoPorId?, cerradoEn?, cerradoPorId?, creadoEn` | — |
+| `Comanda` | `clienteId` (obligatorio) | **`cobroId` desaparece**; `total` y `estado` derivados; `estado` puede ser `cobrada_parcial`; `mesaId` opcional también con `tipo='mesa'`; `reservacionId`/`clienteNombre` legado |
+| `ComandaItem` | `clienteId` (deudor), `cobroId?` | — |
+| `Cobro` | `clienteId` (obligatorio), relación `lineas` | **`comandas` desaparece** como relación: la factura se reimprime con `lineas` (+ `include: { comanda }` si hace falta el número de comanda) |
+| `CobroPago` | `fechaOperativa` (la pone la base), `monto`/`montoUsd` < 0 = devolución | — |
+| `Bitacora` | sólo lectura: `tabla, entidadId, operacion, cambios[], antes, despues, usuarioId, motivo, creadoEn` | — |
+
+**Vistas (snake_case, `$queryRaw`):**
+
+- `v_cuenta_cliente` — una fila por cliente ABIERTO: `cliente_id, cliente_nombre,
+  mesa_id, mesa_etiqueta, salon_id, salon_nombre, sentado, reservacion_id,
+  fecha_operativa, mesero_id, ocupada_desde, minutos_ocupada, comandas,
+  comandas_por_cobrar, comandas_en_cocina, lineas_por_cobrar, cuenta_total,
+  total_por_cobrar, total_en_cocina, comensales, facturas, total_cobrado`.
+  "Por cobrar" = `total_por_cobrar > 0`. Sustituye a **`v_cuenta_mesa`, que ya
+  no existe**.
+- `v_mesa_estado` — mismas columnas y orden que antes (el frontend no cambia
+  su parser) **+ `clientes` (int) y `clientes_detalle` (jsonb `[{id, nombre}]`)**.
+  `sentada_cliente/sentada_en/sentada_reservacion_id` = el primer cliente
+  sentado; `comandas/cuenta_total` = la deuda viva de los sentados.
+- `v_cola_despacho` — **+ `cliente_id`, `cliente_nombre`** al final (la comanda
+  puede no tener mesa).
+- `v_venta_dia_metodo` — agrupa por el día del MOVIMIENTO; **+ `devoluciones`**
+  y **+ `ajustes_otros_dias_usd`** (lo que corrige facturas de otro día; el
+  cierre de caja lo muestra aparte); `pagos` cuenta sólo positivos; los montos
+  suman con signo.
+- `v_producto_vendido_dia` — de la línea a su factura directamente.
+
+**Reglas que el servicio debe cumplir (la base las verifica, pero el mensaje
+bueno es del servicio):**
+
+1. **Autor en toda transacción que escriba**: lo primero dentro del
+   `$transaction`, `SELECT set_config('app.usuario_id', $usuario, true)` (y
+   `set_config('app.motivo', $motivo, true)` si la pantalla pide motivo). Sin
+   él, cualquier corrección post-despacho, de factura o de cliente revienta con
+   `bitacora_sin_autor`. Es `SET LOCAL`: muere con la transacción.
+2. **Crear comanda**: llega `clienteId` (no `mesaId`). La mesa/salón/plantilla
+   de la comanda son la FOTO de `cliente.mesa_id` en ese momento (plantilla
+   activa, mesa no bloqueada, como hoy); `tipo='mesa'` aunque no haya mesa.
+   Cada línea con `clienteId` = el de la comanda. `recalcularTotal` sobra (el
+   trigger pisa `total`).
+3. **Cobrar** (`POST /clientes/:id/cobrar { lineas?: [{ itemId, cantidad? }],
+   clienteNombre?, descuento?, propina?, pagos[] }`, sugerido):
+   `SELECT ... FROM comanda_item ci JOIN comanda c ... WHERE ci.cliente_id = $k
+   AND ci.cobro_id IS NULL AND ci.cancelado_en IS NULL AND c.despachada_en IS NOT
+   NULL AND c.anulada_en IS NULL [AND ci.id = ANY($ids)] FOR UPDATE OF ci`
+   (⭐ el `FOR UPDATE` sigue siendo lo que serializa a dos cajeros); sin
+   `lineas` = todo lo facturable. Parcial → partir (15.4). INSERT `cobro` con
+   los totales FINALES y la foto de la mesa del cliente → `UPDATE comanda_item
+   SET cobro_id` → pagos. **No hacer UPDATE del cobro recién creado** en la
+   misma transacción: quedaría en la bitácora como una corrección.
+   Nombre: DTO del cajero (presente = manda, vacío → NULL) > `cliente.nombre`.
+4. **Corregir** una línea facturada o el descuento/propina: bloquear la
+   factura (`FOR UPDATE`), aplicar el cambio, recalcular subtotal/total/total_bs
+   desde sus líneas vivas y registrar la diferencia como pago (+) o devolución
+   (−) que viene en el DTO. Vale para facturas de CUALQUIER día: la venta se
+   corrige en el día de la factura y el pago o la devolución se registran hoy
+   (`recibido_en` = ahora; nunca fechar el ajuste en el día de la factura).
+   `GET /reportes/cierre-caja` debe presentar `ajustes_otros_dias_usd` como
+   línea propia.
+5. **Cerrar cliente** = `UPDATE cliente SET cerrado_en = now(), cerrado_por_id`;
+   si tenía reserva `sentada`, pasarla a `completada`. **Sentar/check-in** crea
+   el cliente (ya no basta con `estado='sentada'`: la ocupación la da el
+   cliente). **Mover** = `UPDATE cliente SET mesa_id`; sus comandas aún en
+   cocina conviene moverlas también (las despachadas conservan su mesa).
+
+**Errores nuevos para `pg-error.filter.ts`** (todos 23514 salvo indicación):
+
+| Constraint | HTTP | Mensaje sugerido |
+|---|---|---|
+| `cliente_cerrado` | 409 | "Ese cliente ya cerró su cuenta: reábrelo para anotarle consumo" |
+| `cliente_cierre_sin_deuda` | 409 | "El cliente todavía debe consumo: cóbralo, reasígnalo o cancélalo antes de cerrarlo" |
+| `cliente_reservacion_abierta_unica` (23505) | 409 / idempotente | "Esa reserva ya está sentada" (devolver el cliente existente) |
+| `cliente_nombre_normalizado` | 422 | "El nombre del cliente no puede estar vacío" |
+| `comanda_item_comanda_anulada` | 409 | "Esa comanda está anulada" |
+| `comanda_item_factura_linea_viva` | 409 | "Esa línea está cancelada" |
+| `comanda_item_restaurante_id_cobro_id_cliente_id_fkey` (23503) | 409 | "Esa línea ya está facturada: desfactúrala antes de reasignarla" |
+| `comanda_cobro_tras_despacho` | 409 | (igual que antes) |
+| `comanda_anulada_no_cobrada` | 409 | "Esa comanda tiene líneas facturadas: no se puede anular" |
+| `cobro_no_vacio` | 409 | (igual que antes; o "una factura sin líneas se anula") |
+| `cobro_pagos_cuadran` | 422 | "Los pagos no cuadran con el nuevo total: registra el cobro o la devolución de la diferencia" |
+| `cobro_anulado_inmutable` | 409 | "Esa factura está anulada" |
+| `cobro_pago_inmutable` | 409 | "Un pago registrado no se edita: registra una devolución" |
+| `cobro_pago_monto_valido` | 422 | "El monto no puede ser 0" |
+| `comanda_item_comanda_fija`, `comanda_item_total_coherente`, `cobro_subtotal_coherente`, `cobro_total_coherente`, `cobro_fecha_inmutable`, `bitacora_sin_autor`, `bitacora_inmutable` | **500** | Bug del servidor: nunca debería verlo un usuario |
+
+`comanda_item_solo_pendiente` deja de existir: quitarlo del filtro.
+
+### 15.6 Migración de los datos
+
+Una factura = un cliente CERRADO (al `cobrado_en`); lo vivo con mesa = un
+cliente ABIERTO por mesa, sentado; lo vivo sin mesa = uno por comanda; una
+reserva `sentada` sin cliente = un cliente abierto (la mesa no se libera por la
+migración); anuladas sin factura = al cliente abierto de su mesa si son del
+mismo día, si no uno cerrado por comanda. La factura baja a TODAS las líneas de
+sus comandas (también las canceladas antes de cobrar: es lo que la
+reimpresión mostraba). Cada pago histórico toma el día de su factura, así que
+el cuadre por método de días pasados no cambia. Nombres: el del mesero, la
+reserva, "Mesa N", "Para llevar #N", en ese orden.
+
+### 15.7 Riesgos y preguntas abiertas
+
+1. **Despliegue en bloque.** Sin `comanda.cobro_id` ni `v_cuenta_mesa`, el
+   backend actual no cobra: migración + backend nuevo salen juntos, con el
+   local cerrado, y el frontend justo después (el cobro por mesa deja de
+   existir). El frontend debe tolerar el estado `cobrada_parcial`.
+2. **Con el local abierto**, dos grupos en la misma mesa quedan como UN cliente,
+   y una visita ya cobrada en parte queda partida en dos clientes (el cerrado de
+   su factura y el abierto de lo vivo). Se arregla reasignando; o migrar cerrado.
+3. **Resuelto por el dueño (2026-11-05):** las correcciones se permiten en
+   cualquier día y la anulación se deja como estaba. Consecuencia que hay que
+   explicarle al usuario: un reporte de ventas de un día pasado puede cambiar
+   después de impreso si alguien corrige una de sus facturas (queda en la
+   bitácora con autor y motivo), y la caja del día de la corrección no cuadra
+   contra su propia venta salvo que se muestre `ajustes_otros_dias_usd`.
+4. Los tests e2e (`invariantes`, `cliente-nombre-factura`, `reportes-periodo`)
+   siembran facturas sin líneas facturadas ni pagos: hay que reescribir sus
+   fixtures (líneas con `cobro_id`, pagos que cuadren, `recibido_en` en el
+   pasado para histórico, `app.usuario_id` si corrigen algo).
+5. `comanda_item_deuda_idx` incluye las líneas de comandas anuladas (no se
+   cancelan al anular). Crece al ritmo de las anulaciones; si pesa, cancelar
+   las líneas al anular.
+6. `comensales` sigue en la comanda, no en el cliente: un cliente sentado sin
+   pedidos marca 0 en el plano. Si la pantalla lo pide al registrar, es una
+   columna en `cliente`.

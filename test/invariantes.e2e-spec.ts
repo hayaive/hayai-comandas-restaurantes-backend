@@ -1,530 +1,347 @@
-import 'dotenv/config';
-import * as argon2 from 'argon2';
-import request from 'supertest';
-import { Test } from '@nestjs/testing';
-import { INestApplication } from '@nestjs/common';
-import { AppModule } from '../src/app.module';
-import { configurarApp } from '../src/configurar-app';
-import { PrismaService } from '../src/comun/prisma/prisma.service';
-import { nuevoId } from '../src/comun/id';
+import { Fixture, montar } from './fixture';
 
 /**
- * Invariantes críticos del modelo de comandas múltiples + cobro consolidado,
- * garantizados por Postgres (prisma/sql/01_constraints_y_triggers.sql).
+ * Invariantes críticos del modelo cliente + comandas + cobro por líneas,
+ * garantizados por Postgres (prisma/sql/01_constraints_y_triggers.sql) y
+ * ejercitados contra la API real, que es donde tienen que seguir cumpliéndose.
  *
- * Es la traducción a e2e de la batería con la que J.O.R.B.I verificó la
- * migración `20260915183000_comandas_multiples_y_cobro`: allí se probaron
- * contra SQL crudo, aquí contra la API real, que es donde tienen que seguir
- * cumpliéndose.
- *
- *   B · una mesa acepta VARIAS comandas vivas (antes: 23505)
+ *   B · un cliente (o una mesa con varios) acepta VARIAS comandas vivas
  *   C · la cola de despacho es FIFO GLOBAL, con las líneas embebidas
  *   D · despachar saca de la cola, no borra
- *   E · los ítems sólo se tocan mientras la comanda esté pendiente
- *   G · el cobro consolida la mesa y deja lo pendiente en cocina
- *   H · ⭐ dos cajeros cobrando la misma mesa: uno gana, el otro 409
+ *   E · las líneas se editan también DESPUÉS de despachar; las facturadas, sólo
+ *       corrigiendo su factura
+ *   G · el cobro es del cliente, por líneas, y deja lo pendiente en cocina
+ *   H · ⭐ dos cajeros cobrando al mismo cliente: uno gana, el otro 409
  *
- * Más el EXCLUDE de reservaciones, que el rediseño no tocó.
- *
- * Cada corrida crea su propio restaurante (slug único) para no interferir con
- * otras corridas ni con el seed de desarrollo.
+ * Más la ocupación de mesa por cliente (reserva sentada, check-in por QR) y el
+ * EXCLUDE de reservaciones.
  */
 describe('Invariantes críticos (e2e)', () => {
-  let app: INestApplication;
-  let prisma: PrismaService;
-
-  let restauranteId: string;
-  let salonId: string;
+  let f: Fixture;
   let mesaId: string;
   let mesaDosId: string;
   let mesaTresId: string;
-  let productoId: string;
-  let token: string;
-  let auth: { Authorization: string };
 
-  /** Crea una comanda ya en la cola, con una línea del producto de prueba. */
-  const crearComanda = (mesa: string, cantidad = 1) =>
-    request(app.getHttpServer())
-      .post('/api/v1/comandas')
-      .set(auth)
-      .send({ tipo: 'mesa', mesaId: mesa, comensales: 2, items: [{ productoId, cantidad }] });
-
-  const despachar = (comandaId: string) =>
-    request(app.getHttpServer()).post(`/api/v1/comandas/${comandaId}/despachar`).set(auth);
-
-  /** Saca una comanda de la cuenta viva de la mesa sin pasar por la API. */
-  const anularEnBase = (id: string) =>
-    prisma.comanda.update({ where: { id }, data: { anuladaEn: new Date() } });
+  const API = '/api/v1';
+  const crearCliente = (nombre: string, mesa?: string) =>
+    f.http().post(`${API}/clientes`).set(f.auth).send({ nombre, mesaId: mesa });
+  /** Un cliente nuevo, ya creado (201). */
+  const nuevoCliente = async (nombre: string, mesa?: string) => (await crearCliente(nombre, mesa).expect(201)).body;
+  const pedir = (clienteId: string, cantidad = 1) =>
+    f.http().post(`${API}/comandas`).set(f.auth).send({
+      clienteId,
+      comensales: 2,
+      items: [{ productoId: f.productoId, cantidad }],
+    });
+  const despachar = (comandaId: string) => f.http().post(`${API}/comandas/${comandaId}/despachar`).set(f.auth);
+  const cobrar = (clienteId: string, body: Record<string, unknown>) =>
+    f.http().post(`${API}/clientes/${clienteId}/cobrar`).set(f.auth).send(body);
+  const efectivo = (monto: number) => [{ metodo: 'efectivo_usd', moneda: 'USD', monto }];
+  const cuenta = async (clienteId: string) => (await f.http().get(`${API}/clientes/${clienteId}`).set(f.auth).expect(200)).body;
+  const filaDePlano = async (mesa: string) => {
+    const { body } = await f.http().get(`${API}/plano`).set(f.auth).expect(200);
+    return body.find((m: any) => m.mesa_id === mesa);
+  };
 
   beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
-    app = moduleRef.createNestApplication();
-    configurarApp(app);
-    await app.init();
-
-    prisma = app.get(PrismaService);
-
-    const slug = `test-${Date.now()}`;
-    restauranteId = nuevoId();
-    await prisma.restaurante.create({
-      data: { id: restauranteId, slug, nombre: 'Restaurante de prueba' },
-    });
-
-    const claveHash = await argon2.hash('clave1234');
-    await prisma.usuario.create({
-      data: {
-        id: nuevoId(),
-        restauranteId,
-        nombre: 'Admin de prueba',
-        usuario: `admin-${slug}`,
-        claveHash,
-        rol: 'administrador',
-      },
-    });
-
-    salonId = nuevoId();
-    await prisma.salon.create({ data: { id: salonId, restauranteId, nombre: 'Salón de prueba' } });
-
-    mesaId = nuevoId();
-    await prisma.mesa.create({ data: { id: mesaId, restauranteId, salonId, etiqueta: 'T1' } });
-    mesaDosId = nuevoId();
-    await prisma.mesa.create({ data: { id: mesaDosId, restauranteId, salonId, etiqueta: 'T2' } });
-    mesaTresId = nuevoId();
-    await prisma.mesa.create({ data: { id: mesaTresId, restauranteId, salonId, etiqueta: 'T3' } });
-
-    const plantillaId = nuevoId();
-    await prisma.plantilla.create({
-      data: { id: plantillaId, restauranteId, salonId, nombre: 'Distribución de prueba', activa: true },
-    });
-    for (const m of [mesaId, mesaDosId, mesaTresId]) {
-      await prisma.plantillaMesa.create({
-        data: { restauranteId, plantillaId, mesaId: m, posX: 0, posY: 0, forma: 'cuadrada', capacidad: 4 },
-      });
-    }
-
-    const categoriaId = nuevoId();
-    await prisma.categoria.create({ data: { id: categoriaId, restauranteId, nombre: 'Cocina' } });
-    productoId = nuevoId();
-    await prisma.producto.create({
-      data: { id: productoId, restauranteId, categoriaId, nombre: 'Pabellón', precio: 10 },
-    });
-
-    // Sin tasa del dólar no se puede emitir ninguna factura: `cobro.tasa_id` es
-    // NOT NULL y el trigger `cobro_tasa_base` sólo admite USD.
-    await prisma.tasaCambio.create({
-      data: { id: nuevoId(), restauranteId, fecha: new Date(), divisa: 'USD', valor: 900 },
-    });
-
-    const login = await request(app.getHttpServer())
-      .post('/api/v1/auth/login')
-      .send({ usuario: `admin-${slug}`, clave: 'clave1234' })
-      .expect(200);
-    token = login.body.token;
-    auth = { Authorization: `Bearer ${token}` };
-    expect(token).toBeDefined();
+    f = await montar('test');
+    [mesaId, mesaDosId, mesaTresId] = f.mesas;
   }, 30_000);
 
-  afterAll(async () => {
-    // El restaurante en cascada se lleva usuario/salon/mesa/plantilla/etc., pero
-    // `cobro` apunta a mesa y tasa con RESTRICT: hay que vaciarlo antes.
-    await prisma.$executeRaw`DELETE FROM "comanda" WHERE "restaurante_id" = ${restauranteId}::uuid`;
-    await prisma.$executeRaw`DELETE FROM "cobro"   WHERE "restaurante_id" = ${restauranteId}::uuid`;
-    await prisma.restaurante.delete({ where: { id: restauranteId } }).catch(() => undefined);
-    await app.close();
-  });
+  afterAll(() => f.cerrar());
 
   it('GET /auth/yo devuelve el usuario autenticado', async () => {
-    const res = await request(app.getHttpServer())
-      .get('/api/v1/auth/yo')
-      .set('Authorization', `Bearer ${token}`)
-      .expect(200);
-    expect(res.body.restauranteId).toBe(restauranteId);
+    const res = await f.http().get(`${API}/auth/yo`).set(f.auth).expect(200);
+    expect(res.body.restauranteId).toBe(f.restauranteId);
   });
 
   it('GET /salones devuelve el salón recién creado', async () => {
-    const res = await request(app.getHttpServer())
-      .get('/api/v1/salones')
-      .set('Authorization', `Bearer ${token}`)
-      .expect(200);
-    expect(res.body.some((s: any) => s.id === salonId)).toBe(true);
+    const res = await f.http().get(`${API}/salones`).set(f.auth).expect(200);
+    expect(res.body.some((s: any) => s.id === f.salonId)).toBe(true);
   });
 
-  it('una comanda nace ya en la cola de despacho, con sus líneas y su total', async () => {
-    const { body } = await crearComanda(mesaId, 2).expect(201);
+  it('una comanda nace ya en la cola de despacho, con sus líneas, su total y su cliente', async () => {
+    const cliente = await nuevoCliente('Ana');
+    const { body } = await pedir(cliente.id, 2).expect(201);
 
     expect(body.estado).toBe('pendiente');
     expect(body.despachadaEn).toBeNull();
+    expect(body.clienteId).toBe(cliente.id);
     expect(body.items).toHaveLength(1);
+    expect(body.items[0].clienteId).toBe(cliente.id);
     expect(Number(body.total)).toBe(20);
 
-    // Sin líneas no hay comanda: sería un ticket en blanco en la pantalla de cocina.
-    await request(app.getHttpServer())
-      .post('/api/v1/comandas')
-      .set(auth)
-      .send({ tipo: 'mesa', mesaId, comensales: 2, items: [] })
-      .expect(400);
-
-    await anularEnBase(body.id);
+    // Sin líneas no hay comanda (sería un ticket en blanco en cocina); sin cliente tampoco.
+    await f.http().post(`${API}/comandas`).set(f.auth).send({ clienteId: cliente.id, items: [] }).expect(400);
+    await f.http().post(`${API}/comandas`).set(f.auth).send({ items: [{ productoId: f.productoId, cantidad: 1 }] }).expect(400);
   });
 
-  it('B · una mesa acepta VARIAS comandas vivas a la vez (murió comanda_mesa_activa_unica)', async () => {
-    const a = await crearComanda(mesaId).expect(201);
-    const b = await crearComanda(mesaId).expect(201);
+  it('B · un cliente acepta varias comandas vivas, y una mesa varios clientes con cuentas separadas', async () => {
+    const a = await nuevoCliente('Cliente A', mesaId);
+    const b = await nuevoCliente('Cliente B', mesaId);
+    const a1 = await pedir(a.id).expect(201);
+    const a2 = await pedir(a.id).expect(201);
+    await pedir(b.id).expect(201);
+    expect(a1.body.id).not.toBe(a2.body.id);
+    // La comanda congela la mesa donde estaba sentado.
+    expect(a1.body.mesaId).toBe(mesaId);
 
-    expect(a.body.id).not.toBe(b.body.id);
+    const cuentaA = await cuenta(a.id);
+    expect(cuentaA.cuenta.comandas).toBe(2);
+    expect(cuentaA.cuenta.comandas_en_cocina).toBe(2);
+    expect(Number(cuentaA.cuenta.cuenta_total)).toBe(20);
 
-    const { body: cuenta } = await request(app.getHttpServer())
-      .get(`/api/v1/mesas/${mesaId}/cuenta`)
-      .set(auth)
-      .expect(200);
-    expect(cuenta.cuenta.comandas).toBe(2);
-    expect(cuenta.cuenta.comandas_en_cocina).toBe(2);
-    expect(Number(cuenta.cuenta.cuenta_total)).toBe(20);
+    const { body: deMesa } = await f.http().get(`${API}/mesas/${mesaId}/cuenta`).set(f.auth).expect(200);
+    expect(deMesa.clientes.map((c: any) => c.cliente_nombre).sort()).toEqual(['Cliente A', 'Cliente B']);
 
-    // La mesa con comandas vivas se pinta ocupada en el plano.
-    const { body: plano } = await request(app.getHttpServer()).get('/api/v1/plano').set(auth).expect(200);
-    const fila = plano.find((m: any) => m.mesa_id === mesaId);
+    // El plano mantiene sus columnas y suma los dos clientes.
+    const fila = await filaDePlano(mesaId);
     expect(fila.estado).toBe('ocupada');
-    expect(fila.comandas).toBe(2);
-
-    await anularEnBase(a.body.id);
-    await anularEnBase(b.body.id);
+    expect(fila.clientes).toBe(2);
+    expect(fila.clientes_detalle.map((c: any) => c.nombre)).toEqual(['Cliente A', 'Cliente B']);
+    expect(fila.comandas).toBe(3);
+    expect(Number(fila.cuenta_total)).toBe(30);
   });
 
   it('C/D · la cola es FIFO global entre mesas, y despachar saca de la cola sin borrar', async () => {
-    const primera = await crearComanda(mesaId).expect(201);
-    const segunda = await crearComanda(mesaDosId).expect(201);
-    const tercera = await crearComanda(mesaId).expect(201);
+    const x = await nuevoCliente('Cola X', mesaDosId);
+    const y = await nuevoCliente('Cola Y', mesaTresId);
+    const primera = await pedir(x.id).expect(201);
+    const segunda = await pedir(y.id).expect(201);
+    const tercera = await pedir(x.id).expect(201);
 
-    const { body: cola } = await request(app.getHttpServer())
-      .get('/api/v1/despacho/cola')
-      .set(auth)
-      .expect(200);
-
-    // Orden de llegada, sin agrupar por mesa: mesa1 → mesa2 → mesa1.
-    expect(cola.map((c: any) => c.comanda_id)).toEqual([primera.body.id, segunda.body.id, tercera.body.id]);
-    // Las líneas viajan embebidas: el KDS no hace un N+1.
-    expect(cola[0].items).toHaveLength(1);
-    expect(cola[0].items[0].nombre).toBe('Pabellón');
+    const { body: cola } = await f.http().get(`${API}/despacho/cola`).set(f.auth).expect(200);
+    const ids = [primera.body.id, segunda.body.id, tercera.body.id];
+    // Orden de llegada, sin agrupar por cliente ni por mesa (hay comandas de otros tests antes).
+    expect(cola.map((c: any) => c.comanda_id).filter((id: string) => ids.includes(id))).toEqual(ids);
+    const fila = cola.find((c: any) => c.comanda_id === primera.body.id);
+    expect(fila.items).toHaveLength(1);
+    expect(fila.cliente_nombre).toBe('Cola X');
 
     await despachar(primera.body.id).expect(201);
+    const { body: despues } = await f.http().get(`${API}/despacho/cola`).set(f.auth).expect(200);
+    expect(despues.map((c: any) => c.comanda_id)).not.toContain(primera.body.id);
 
-    const { body: colaDespues } = await request(app.getHttpServer())
-      .get('/api/v1/despacho/cola')
-      .set(auth)
-      .expect(200);
-    expect(colaDespues.map((c: any) => c.comanda_id)).not.toContain(primera.body.id);
-
-    // Sale de la cola, NO de la base.
-    const enBase = await prisma.comanda.findUniqueOrThrow({ where: { id: primera.body.id } });
+    const enBase = await f.prisma.comanda.findUniqueOrThrow({ where: { id: primera.body.id } });
     expect(enBase.estado).toBe('despachada');
-    expect(enBase.despachadaEn).not.toBeNull();
-
-    // Despacharla otra vez (dos pantallas de cocina) no repisa la fecha.
     await despachar(primera.body.id).expect(409);
-
-    for (const id of [primera.body.id, segunda.body.id, tercera.body.id]) {
-      await anularEnBase(id);
-    }
   });
 
-  it('E · los ítems sólo se tocan mientras la comanda esté pendiente', async () => {
-    const comanda = await crearComanda(mesaId, 3).expect(201);
-    const itemId = comanda.body.items[0].id;
+  it('E · las líneas se editan después de despachar; una línea nueva NO vuelve a cocina; las facturadas se corrigen con su factura', async () => {
+    const cliente = await nuevoCliente('Edita', mesaId);
 
-    // Pendiente: se puede anular la línea, y el total se recalcula.
-    await request(app.getHttpServer())
-      .delete(`/api/v1/comandas/${comanda.body.id}/items/${itemId}`)
-      .set(auth)
+    // Pendiente: anular la línea recalcula el total.
+    const pendiente = await pedir(cliente.id, 3).expect(201);
+    await f.http()
+      .delete(`${API}/comandas/${pendiente.body.id}/items/${pendiente.body.items[0].id}`)
+      .set(f.auth)
       .send({ motivo: 'se arrepintió' })
       .expect(204);
-
-    const trasAnular = await prisma.comanda.findUniqueOrThrow({ where: { id: comanda.body.id } });
+    const trasAnular = await f.prisma.comanda.findUniqueOrThrow({ where: { id: pendiente.body.id } });
     expect(Number(trasAnular.total)).toBe(0);
-    const item = await prisma.comandaItem.findUniqueOrThrow({ where: { id: itemId } });
-    expect(item.canceladoEn).not.toBeNull();
-    expect(item.motivoCancelacion).toBe('se arrepintió');
 
-    // Despachada: ya no se le agregan líneas ni se le anulan. Protege el FIFO
-    // (entró a la cola con un contenido y saldría con otro) y el monto.
-    const otra = await crearComanda(mesaId).expect(201);
-    await despachar(otra.body.id).expect(201);
+    // Despachada: agregar, cambiar cantidad y anular, todo permitido (y auditado).
+    const comanda = await pedir(cliente.id).expect(201);
+    await despachar(comanda.body.id).expect(201);
+    const itemId = comanda.body.items[0].id;
 
-    await request(app.getHttpServer())
-      .post(`/api/v1/comandas/${otra.body.id}/items`)
-      .set(auth)
-      .send({ items: [{ productoId, cantidad: 1 }] })
-      .expect(409);
+    await f.http()
+      .post(`${API}/comandas/${comanda.body.id}/items`)
+      .set(f.auth)
+      .send({ items: [{ productoId: f.productoId, cantidad: 2, nota: 'sin picante' }] })
+      .expect(201);
+    const { body: trasAgregar } = await f.http().get(`${API}/comandas/${comanda.body.id}`).set(f.auth).expect(200);
+    expect(trasAgregar.estado).toBe('despachada');
+    expect(trasAgregar.items).toHaveLength(2);
+    expect(Number(trasAgregar.total)).toBe(30);
+    // No vuelve a cocina: la comanda sigue fuera de la cola.
+    const { body: cola } = await f.http().get(`${API}/despacho/cola`).set(f.auth).expect(200);
+    expect(cola.map((c: any) => c.comanda_id)).not.toContain(comanda.body.id);
 
-    await request(app.getHttpServer())
-      .delete(`/api/v1/comandas/${otra.body.id}/items/${otra.body.items[0].id}`)
-      .set(auth)
+    await f.http().patch(`${API}/comandas/${comanda.body.id}/items/${itemId}`).set(f.auth).send({ cantidad: 2 }).expect(200);
+    const lineaNueva = trasAgregar.items.find((i: any) => i.id !== itemId);
+    await f.http()
+      .delete(`${API}/comandas/${comanda.body.id}/items/${lineaNueva.id}`)
+      .set(f.auth)
+      .send({ motivo: 'se devolvió' })
+      .expect(204);
+    const { body: trasEditar } = await f.http().get(`${API}/comandas/${comanda.body.id}`).set(f.auth).expect(200);
+    expect(Number(trasEditar.total)).toBe(20);
+
+    // Todo cambio posterior al despacho quedó en la bitácora, con autor.
+    const bitacora = await f.prisma.bitacora.findMany({ where: { restauranteId: f.restauranteId, tabla: 'comanda_item' } });
+    expect(bitacora.length).toBeGreaterThanOrEqual(3);
+    expect(bitacora.every((b) => b.usuarioId === f.usuarioId)).toBe(true);
+
+    // Facturada: sus líneas ya no se tocan desde la comanda.
+    await cobrar(cliente.id, { pagos: efectivo(20) }).expect(201);
+    await f.http().patch(`${API}/comandas/${comanda.body.id}/items/${itemId}`).set(f.auth).send({ cantidad: 1 }).expect(409);
+    await f.http()
+      .delete(`${API}/comandas/${comanda.body.id}/items/${itemId}`)
+      .set(f.auth)
       .send({ motivo: 'tarde' })
       .expect(409);
+    const { body: cobrada } = await f.http().get(`${API}/comandas/${comanda.body.id}`).set(f.auth).expect(200);
+    expect(cobrada.estado).toBe('cobrada');
 
-    await anularEnBase(comanda.body.id);
-    await anularEnBase(otra.body.id);
+    // Agregarle una línea a una comanda cobrada la deja `cobrada_parcial` y le suma deuda al cliente.
+    await f.http()
+      .post(`${API}/comandas/${comanda.body.id}/items`)
+      .set(f.auth)
+      .send({ items: [{ productoId: f.productoId, cantidad: 1 }] })
+      .expect(201);
+    const { body: parcial } = await f.http().get(`${API}/comandas/${comanda.body.id}`).set(f.auth).expect(200);
+    expect(parcial.estado).toBe('cobrada_parcial');
+    expect(Number((await cuenta(cliente.id)).cuenta.total_por_cobrar)).toBe(10);
   });
 
-  it('G · el cobro consolida lo despachado y deja lo pendiente en cocina', async () => {
-    const despachada = await crearComanda(mesaId).expect(201);
+  it('G · el cobro es del cliente: cubre lo despachado y deja lo pendiente en cocina', async () => {
+    const cliente = await nuevoCliente('Gaby', mesaId);
+    const despachada = await pedir(cliente.id).expect(201);
     await despachar(despachada.body.id).expect(201);
-    const enCocina = await crearComanda(mesaId).expect(201);
+    const enCocina = await pedir(cliente.id).expect(201);
 
-    const { body: antes } = await request(app.getHttpServer())
-      .get(`/api/v1/mesas/${mesaId}/cuenta`)
-      .set(auth)
-      .expect(200);
+    const antes = await cuenta(cliente.id);
     expect(antes.cuenta.comandas_por_cobrar).toBe(1);
     expect(antes.cuenta.comandas_en_cocina).toBe(1);
 
-    const { body: cobro } = await request(app.getHttpServer())
-      .post(`/api/v1/mesas/${mesaId}/cobrar`)
-      .set(auth)
-      .send({ propina: 2, pagos: [{ metodo: 'efectivo_usd', moneda: 'USD', monto: 12 }] })
-      .expect(201);
-
+    const { body: cobro } = await cobrar(cliente.id, { propina: 2, pagos: efectivo(12) }).expect(201);
     expect(Number(cobro.subtotal)).toBe(10);
     expect(Number(cobro.propina)).toBe(2);
     expect(Number(cobro.total)).toBe(12);
-    // La factura sabe exactamente qué comandas cubrió: lo pendiente no entró.
-    expect(cobro.comandas.map((c: any) => c.id)).toEqual([despachada.body.id]);
+    expect(cobro.clienteId).toBe(cliente.id);
+    // La factura sabe exactamente qué líneas cubrió: lo que sigue en cocina no entró.
+    expect(cobro.lineas.map((l: any) => l.comandaId)).toEqual([despachada.body.id]);
+    expect(cobro.lineas[0].comanda.numeroDia).toBe(despachada.body.numeroDia);
 
-    // La comanda que sigue en cocina arranca la cuenta nueva de la mesa.
-    const { body: despues } = await request(app.getHttpServer())
-      .get(`/api/v1/mesas/${mesaId}/cuenta`)
-      .set(auth)
-      .expect(200);
+    const despues = await cuenta(cliente.id);
     expect(despues.cuenta.comandas_por_cobrar).toBe(0);
     expect(despues.cuenta.comandas_en_cocina).toBe(1);
+    expect(despues.lineas.map((l: any) => l.comandaId)).toEqual([enCocina.body.id]);
 
-    // Los pagos cuadran: v_cobro_descuadre tiene que seguir vacía.
-    const descuadres = await prisma.$queryRaw<any[]>`
-      SELECT * FROM v_cobro_descuadre WHERE restaurante_id = ${restauranteId}::uuid
-    `;
+    const descuadres = await f.prisma.$queryRaw<any[]>`SELECT * FROM v_cobro_descuadre WHERE restaurante_id = ${f.restauranteId}::uuid`;
     expect(descuadres).toHaveLength(0);
 
-    // Reimprimir la factura.
-    const { body: reimpresa } = await request(app.getHttpServer())
-      .get(`/api/v1/cobros/${cobro.id}`)
-      .set(auth)
-      .expect(200);
+    const { body: reimpresa } = await f.http().get(`${API}/cobros/${cobro.id}`).set(f.auth).expect(200);
     expect(reimpresa.pagos).toHaveLength(1);
-    expect(reimpresa.comandas[0].items).toHaveLength(1);
-
-    await anularEnBase(enCocina.body.id);
+    expect(reimpresa.lineas).toHaveLength(1);
   });
 
-  it('no se puede cobrar una mesa que no tiene nada despachado (409)', async () => {
-    const enCocina = await crearComanda(mesaDosId).expect(201);
-
-    await request(app.getHttpServer())
-      .post(`/api/v1/mesas/${mesaDosId}/cobrar`)
-      .set(auth)
-      .send({ pagos: [{ metodo: 'efectivo_usd', moneda: 'USD', monto: 10 }] })
-      .expect(409);
-
-    await anularEnBase(enCocina.body.id);
+  it('no se puede cobrar a un cliente que no tiene nada despachado (409)', async () => {
+    const cliente = await nuevoCliente('Sin despachar', mesaDosId);
+    await pedir(cliente.id).expect(201);
+    await cobrar(cliente.id, { pagos: efectivo(10) }).expect(409);
   });
 
   it('los pagos tienen que cuadrar con el total de la cuenta', async () => {
-    const comanda = await crearComanda(mesaDosId).expect(201);
+    const cliente = await nuevoCliente('Paga mal', mesaDosId);
+    const comanda = await pedir(cliente.id).expect(201);
     await despachar(comanda.body.id).expect(201);
 
-    await request(app.getHttpServer())
-      .post(`/api/v1/mesas/${mesaDosId}/cobrar`)
-      .set(auth)
-      .send({ pagos: [{ metodo: 'efectivo_usd', moneda: 'USD', monto: 3 }] })
-      .expect(400);
-
+    await cobrar(cliente.id, { pagos: efectivo(3) }).expect(400);
     // Pago móvil sin referencia: no se puede conciliar con el banco.
-    await request(app.getHttpServer())
-      .post(`/api/v1/mesas/${mesaDosId}/cobrar`)
-      .set(auth)
-      .send({ pagos: [{ metodo: 'pago_movil', moneda: 'USD', monto: 10 }] })
-      .expect(400);
+    await cobrar(cliente.id, { pagos: [{ metodo: 'pago_movil', moneda: 'USD', monto: 10 }] }).expect(400);
 
-    // Y tras los dos rechazos la cuenta sigue viva, sin factura a medias.
-    const cobros = await prisma.cobro.findMany({ where: { restauranteId, mesaId: mesaDosId } });
-    expect(cobros).toHaveLength(0);
-
-    await anularEnBase(comanda.body.id);
+    // Tras los dos rechazos la cuenta sigue viva, sin factura a medias.
+    expect(await f.prisma.cobro.count({ where: { restauranteId: f.restauranteId, clienteId: cliente.id } })).toBe(0);
   });
 
-  it('H · ⭐ dos cajeros cobrando la misma mesa a la vez: uno cobra, el otro recibe 409', async () => {
-    const a = await crearComanda(mesaDosId).expect(201);
-    const b = await crearComanda(mesaDosId).expect(201);
+  it('H · ⭐ dos cajeros cobrando al mismo cliente a la vez: uno cobra, el otro recibe 409', async () => {
+    const cliente = await nuevoCliente('Carrera', mesaTresId);
+    const a = await pedir(cliente.id).expect(201);
+    const b = await pedir(cliente.id).expect(201);
     await despachar(a.body.id).expect(201);
     await despachar(b.body.id).expect(201);
 
-    const cobrar = () =>
-      request(app.getHttpServer())
-        .post(`/api/v1/mesas/${mesaDosId}/cobrar`)
-        .set(auth)
-        .send({ pagos: [{ metodo: 'efectivo_usd', moneda: 'USD', monto: 20 }] });
-
-    // Las dos peticiones salen a la vez. El `SELECT ... FOR UPDATE` del
-    // servicio serializa: la segunda espera el lock y, al reevaluar el
-    // predicado tras el COMMIT de la primera, encuentra 0 comandas cobrables.
-    const [uno, dos] = await Promise.all([cobrar(), cobrar()]);
-
+    // El `SELECT ... FOR UPDATE` sobre las líneas serializa: la segunda espera
+    // el lock y, tras el COMMIT de la primera, encuentra 0 líneas cobrables.
+    const [uno, dos] = await Promise.all([
+      cobrar(cliente.id, { pagos: efectivo(20) }),
+      cobrar(cliente.id, { pagos: efectivo(20) }),
+    ]);
     expect([uno.status, dos.status].sort()).toEqual([201, 409]);
 
-    // Lo que de verdad importa: UNA sola factura, y cubre las DOS comandas. Sin
-    // el FOR UPDATE saldrían dos facturas parciales y la caja no cuadraría.
-    const cobros = await prisma.cobro.findMany({ where: { restauranteId, mesaId: mesaDosId } });
+    // UNA sola factura, y cubre las líneas de las DOS comandas.
+    const cobros = await f.prisma.cobro.findMany({ where: { restauranteId: f.restauranteId, clienteId: cliente.id } });
     expect(cobros).toHaveLength(1);
     expect(Number(cobros[0].total)).toBe(20);
-
-    const cubiertas = await prisma.comanda.findMany({ where: { restauranteId, cobroId: cobros[0].id } });
-    expect(cubiertas.map((c) => c.id).sort()).toEqual([a.body.id, b.body.id].sort());
-
-    // Y ninguna factura fantasma: el cobro perdedor no dejó rastro.
-    const descuadres = await prisma.$queryRaw<any[]>`
-      SELECT * FROM v_cobro_descuadre WHERE restaurante_id = ${restauranteId}::uuid
-    `;
-    expect(descuadres).toHaveLength(0);
+    const cubiertas = await f.prisma.comandaItem.findMany({ where: { restauranteId: f.restauranteId, cobroId: cobros[0].id } });
+    expect(cubiertas.map((l) => l.comandaId).sort()).toEqual([a.body.id, b.body.id].sort());
   });
 
-  it('⭐ sentar una reservación ocupa la mesa YA, sin ningún pedido, y la libera el cobro', async () => {
-    // El dueño lo pidió explícitamente: al escanear el QR la mesa pasa a
-    // ocupada en el acto, no cuando el mesero toma la nota. Desde que `sentar`
-    // dejó de abrir comanda, quien sostiene eso es `v_mesa_estado`: una reserva
-    // en estado 'sentada' ocupa la mesa por sí sola. Sin esa rama el plano
-    // devolvería 'libre' y pisaría el estado optimista del frontend.
-    const reserva = await request(app.getHttpServer())
-      .post('/api/v1/reservaciones')
-      .set(auth)
-      .send({
-        salonId,
-        mesaId: mesaTresId,
-        clienteNombre: 'Cliente que llega',
-        personas: 2,
-        iniciaEn: '2027-03-01T20:00:00.000Z',
-        duracionMin: 90,
-      })
-      .expect(201);
+  it('⭐ sentar una reservación abre el cliente y ocupa la mesa YA; cobrar y cerrar la libera', async () => {
+    const mesa = f.mesas[3];
+    const reserva = await f.http().post(`${API}/reservaciones`).set(f.auth).send({
+      salonId: f.salonId,
+      mesaId: mesa,
+      clienteNombre: 'Cliente que llega',
+      personas: 2,
+      iniciaEn: '2027-03-01T20:00:00.000Z',
+      duracionMin: 90,
+    }).expect(201);
 
-    const filaDeMesaTres = async () => {
-      const { body } = await request(app.getHttpServer()).get('/api/v1/plano').set(auth).expect(200);
-      return body.find((m: any) => m.mesa_id === mesaTresId);
-    };
+    // La reserva es de 2027, fuera de la ventana de 'reservada': nada pinta la mesa.
+    expect((await filaDePlano(mesa)).estado).toBe('libre');
 
-    // Antes de sentar: libre. La reserva es de 2027, fuera de la ventana de
-    // 'reservada', así que no hay nada más que pueda pintarla.
-    expect((await filaDeMesaTres()).estado).toBe('libre');
+    const { body: sentada } = await f.http().post(`${API}/reservaciones/${reserva.body.id}/sentar`).set(f.auth).send({}).expect(201);
+    expect(sentada.reservacion.estado).toBe('sentada');
+    expect(sentada.cliente.nombre).toBe('Cliente que llega');
+    expect(sentada.cliente.mesaId).toBe(mesa);
+    expect(sentada.cliente.reservacionId).toBe(reserva.body.id);
+    // El doble toque no abre otro cliente.
+    await f.http().post(`${API}/reservaciones/${reserva.body.id}/sentar`).set(f.auth).send({}).expect(409);
 
-    await request(app.getHttpServer())
-      .post(`/api/v1/reservaciones/${reserva.body.id}/sentar`)
-      .set(auth)
-      .send({})
-      .expect(201);
+    const ocupada = await filaDePlano(mesa);
+    expect(ocupada.estado).toBe('ocupada');
+    expect(ocupada.comandas).toBe(0);
+    expect(ocupada.sentada_reservacion_id).toBe(reserva.body.id);
+    expect(ocupada.sentada_cliente).toBe('Cliente que llega');
+    expect(ocupada.ocupada_desde).not.toBeNull();
 
-    // Ocupada YA, con cero comandas.
-    const sentada = await filaDeMesaTres();
-    expect(sentada.estado).toBe('ocupada');
-    expect(sentada.comandas).toBe(0);
-    expect(sentada.sentada_reservacion_id).toBe(reserva.body.id);
-    expect(sentada.sentada_cliente).toBe('Cliente que llega');
-    // "Ocupada desde" sale del momento en que se sentó, no del primer pedido.
-    expect(sentada.ocupada_desde).not.toBeNull();
-
-    // Sigue ocupada mientras come. La comanda va SIN `reservacionId`: es el caso
-    // que dejaría la mesa colgada si el cobro sólo mirara las reservas atadas a
-    // la comanda.
-    const comanda = await crearComanda(mesaTresId).expect(201);
-    expect((await filaDeMesaTres()).estado).toBe('ocupada');
+    const comanda = await pedir(sentada.cliente.id).expect(201);
     await despachar(comanda.body.id).expect(201);
-    expect((await filaDeMesaTres()).estado).toBe('ocupada');
+    expect((await filaDePlano(mesa)).estado).toBe('ocupada');
 
-    // Al cobrar se libera: la reserva pasa a 'completada' y la mesa a 'libre'.
-    await request(app.getHttpServer())
-      .post(`/api/v1/mesas/${mesaTresId}/cobrar`)
-      .set(auth)
-      .send({ pagos: [{ metodo: 'efectivo_usd', moneda: 'USD', monto: 10 }] })
-      .expect(201);
-
-    const reservaDb = await prisma.reservacion.findUniqueOrThrow({ where: { id: reserva.body.id } });
-    expect(reservaDb.estado).toBe('completada');
-    expect((await filaDeMesaTres()).estado).toBe('libre');
+    // Cobrar NO libera la mesa por sí solo: libera cerrar al cliente (aquí, con la bandera).
+    await cobrar(sentada.cliente.id, { pagos: efectivo(10), cerrarCliente: true }).expect(201);
+    expect((await f.prisma.reservacion.findUniqueOrThrow({ where: { id: reserva.body.id } })).estado).toBe('completada');
+    expect((await filaDePlano(mesa)).estado).toBe('libre');
   });
 
-  it('una reserva sentada que nunca pidió nada se libera cancelándola', async () => {
-    const reserva = await request(app.getHttpServer())
-      .post('/api/v1/reservaciones')
-      .set(auth)
-      .send({
-        salonId,
-        mesaId: mesaTresId,
-        clienteNombre: 'Se fue sin pedir',
-        personas: 2,
-        iniciaEn: '2027-04-01T20:00:00.000Z',
-        duracionMin: 90,
-      })
-      .expect(201);
+  it('el check-in público por QR también abre el cliente y ocupa la mesa', async () => {
+    const mesa = f.mesas[3];
+    const reserva = await f.http().post(`${API}/reservaciones`).set(f.auth).send({
+      salonId: f.salonId,
+      mesaId: mesa,
+      clienteNombre: 'Llega por QR',
+      personas: 2,
+      iniciaEn: '2027-05-01T20:00:00.000Z',
+      duracionMin: 90,
+    }).expect(201);
 
-    await request(app.getHttpServer())
-      .post(`/api/v1/reservaciones/${reserva.body.id}/sentar`)
-      .set(auth)
-      .send({})
-      .expect(201);
+    await f.http().post(`${API}/publico/reserva/${reserva.body.codigoPublico}/checkin`).expect(201);
+    const abiertos = await f.prisma.cliente.findMany({ where: { restauranteId: f.restauranteId, reservacionId: reserva.body.id } });
+    expect(abiertos).toHaveLength(1);
+    expect(abiertos[0].mesaId).toBe(mesa);
+    expect(abiertos[0].cerradoEn).toBeNull();
+    expect((await filaDePlano(mesa)).estado).toBe('ocupada');
 
-    const estadoDeMesaTres = async () => {
-      const { body } = await request(app.getHttpServer()).get('/api/v1/plano').set(auth).expect(200);
-      return body.find((m: any) => m.mesa_id === mesaTresId).estado;
-    };
-    expect(await estadoDeMesaTres()).toBe('ocupada');
-
-    await request(app.getHttpServer())
-      .post(`/api/v1/reservaciones/${reserva.body.id}/cancelar`)
-      .set(auth)
-      .send({ motivo: 'se fue' })
-      .expect(201);
-
-    expect(await estadoDeMesaTres()).toBe('libre');
+    // Y se libera cancelando la reserva (el cliente se cierra solo si no debe nada).
+    await f.http().post(`${API}/reservaciones/${reserva.body.id}/cancelar`).set(f.auth).send({ motivo: 'se fue' }).expect(201);
+    expect((await filaDePlano(mesa)).estado).toBe('libre');
   });
 
   it('no se puede reservar dos veces la misma mesa en horarios que se solapan (reservacion_sin_solape → 409)', async () => {
-    const base = await request(app.getHttpServer())
-      .post('/api/v1/reservaciones')
-      .set(auth)
-      .send({
-        salonId,
-        mesaId,
-        clienteNombre: 'Cliente A',
-        personas: 2,
-        iniciaEn: '2027-01-10T20:00:00.000Z',
-        duracionMin: 90,
-      })
-      .expect(201);
+    const reservar = (clienteNombre: string, iniciaEn: string, duracionMin: number) =>
+      f.http().post(`${API}/reservaciones`).set(f.auth).send({ salonId: f.salonId, mesaId, clienteNombre, personas: 2, iniciaEn, duracionMin });
+
+    const base = await reservar('Cliente A', '2027-01-10T20:00:00.000Z', 90).expect(201);
     expect(base.body.estado).toBe('pendiente');
 
-    const solapada = await request(app.getHttpServer())
-      .post('/api/v1/reservaciones')
-      .set(auth)
-      .send({
-        salonId,
-        mesaId,
-        clienteNombre: 'Cliente B',
-        personas: 2,
-        iniciaEn: '2027-01-10T20:30:00.000Z',
-        duracionMin: 90,
-      })
-      .expect(409);
+    const solapada = await reservar('Cliente B', '2027-01-10T20:30:00.000Z', 90).expect(409);
     expect(solapada.body.message).toMatch(/ya está reservada/i);
 
-    const adyacente = await request(app.getHttpServer())
-      .post('/api/v1/reservaciones')
-      .set(auth)
-      .send({
-        salonId,
-        mesaId,
-        clienteNombre: 'Cliente C',
-        personas: 2,
-        iniciaEn: '2027-01-10T21:30:00.000Z',
-        duracionMin: 60,
-      })
-      .expect(201);
+    const adyacente = await reservar('Cliente C', '2027-01-10T21:30:00.000Z', 60).expect(201);
     expect(adyacente.body.estado).toBe('pendiente');
   });
 });

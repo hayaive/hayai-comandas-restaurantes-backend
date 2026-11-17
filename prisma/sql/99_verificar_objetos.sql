@@ -26,11 +26,19 @@ DECLARE
     'producto_codigo_unico',
     'plantilla_activa_unica',
     'reservacion_agenda_idx',
-    -- Los dos que sostienen la operación tras el rediseño de comandas
-    -- múltiples. Si se pierden nada falla: el KDS y el plano simplemente pasan
-    -- a escanear la tabla histórica entera cada pocos segundos.
+    -- Los que sostienen la operación. Si se pierden nada falla: el KDS, el
+    -- plano y las cuentas pasan a escanear la tabla histórica entera cada
+    -- pocos segundos. `comanda_cuenta_abierta_idx` murió con `comanda.cobro_id`
+    -- (2026-11-05); su sucesor es `comanda_item_deuda_idx`.
     'comanda_cola_despacho_idx',
-    'comanda_cuenta_abierta_idx',
+    'comanda_item_deuda_idx',
+    'cliente_abierto_idx',
+    -- Un solo cliente abierto por reserva: sin él, el doble toque en "sentar"
+    -- abre dos cuentas para la misma mesa.
+    'cliente_reservacion_abierta_unica',
+    -- Lo declara Prisma, pero es el destino de la FK de tres columnas que ata
+    -- cada línea facturada al cliente de su factura.
+    'cobro_cliente_key',
     -- Éste SÍ lo declara Prisma (`@unique` sobre `endpoint`), pero se vigila
     -- igual porque su pérdida es silenciosa y cara: es GLOBAL, sin
     -- restaurante_id, y es lo único que hace que el traspaso de un aparato
@@ -49,11 +57,21 @@ DECLARE
     'reservacion_sin_solape',
     'comanda_tipo_coherente',
     'comanda_total_valido',
-    'comanda_anulada_no_cobrada',
     'comanda_anulacion_coherente',
-    -- No se factura lo que no salió de cocina.
-    'comanda_cobro_tras_despacho',
+    -- `comanda_anulada_no_cobrada` y `comanda_cobro_tras_despacho` dejaron de
+    -- ser CHECK el 2026-11-05: viven en los triggers `comanda_estado` y
+    -- `comanda_item_editable` (con el mismo nombre en el error).
     'comanda_cliente_nombre_normalizado',
+    -- Cliente y facturación por líneas (migración 20261105120100).
+    'cliente_nombre_normalizado',
+    'cliente_cierre_coherente',
+    'comanda_item_total_coherente',
+    -- ⭐ La línea facturada es del cliente de su factura.
+    'comanda_item_restaurante_id_cobro_id_cliente_id_fkey',
+    'comanda_restaurante_id_cliente_id_fkey',
+    'cobro_restaurante_id_cliente_id_fkey',
+    'bitacora_restaurante_id_usuario_id_fkey',
+    'cobro_pago_monto_valido',
     'cobro_cliente_nombre_normalizado',
     'comanda_item_cancelacion_coherente',
     'cobro_totales_validos',
@@ -117,14 +135,30 @@ DECLARE
     -- Si se pierde, el cobro sigue funcionando y cobra mal: nada falla.
     'cobro_tasa_base',
     'tasa_divisa_inmutable',
-    -- `comanda.estado` es derivado: sin este trigger la columna se queda en el
-    -- valor que escriba quien sea y deja de coincidir con los hechos.
+    -- `comanda.estado` y `comanda.total` son derivados: sin este trigger (y sin
+    -- `comanda_item_derivar`, que lo dispara al tocar una línea) se quedan en
+    -- el valor que escriba quien sea.
     'comanda_estado',
-    -- Sin éste se le pueden meter líneas a una comanda ya despachada (rompe el
-    -- FIFO) o cambiarle el monto a una factura ya emitida.
-    'comanda_item_solo_pendiente',
-    -- Último recurso contra la factura fantasma de dos cajeros simultáneos.
-    'cobro_no_vacio',
+    'comanda_item_derivar',
+    -- Qué se puede escribir en una línea (sustituye a comanda_item_solo_pendiente):
+    -- sin él se factura lo que sigue en cocina o se le anota deuda a un
+    -- cliente que ya se fue.
+    'comanda_item_editable',
+    'cliente_cierre_sin_deuda',
+    -- ⭐⭐ La factura verificada al COMMIT (sustituye a cobro_no_vacio): no
+    -- vacía, totales salidos de sus líneas, pagos que cuadran. Sin estos tres,
+    -- una corrección a medias deja la caja descuadrada en silencio.
+    'cobro_coherente',
+    'comanda_item_cobro_coherente',
+    'cobro_pago_cobro_coherente',
+    -- Día y número de una factura inmutables, anulada congelada / los pagos no se editan.
+    'cobro_guardia',
+    'cobro_pago_guardia',
+    -- Bitácora: sin estos, una factura se corrige sin dejar rastro.
+    'comanda_item_bitacora',
+    'cobro_bitacora',
+    'cliente_bitacora',
+    'bitacora_inmutable',
     -- Impide colgar una invitación (puerta de 4 dígitos sin bloqueo) de un
     -- usuario PERMANENTE. Cruza dos tablas: ningún CHECK lo puede sustituir.
     'invitacion_acceso_solo_temporal'
@@ -139,16 +173,23 @@ DECLARE
     'hayai_cobro_tasa_base',
     'hayai_tasa_divisa_inmutable',
     'hayai_comanda_estado',
-    'hayai_comanda_item_solo_pendiente',
-    'hayai_cobro_no_vacio',
     'hayai_invitacion_acceso_solo_temporal',
-    'hayai_fin_acceso'
+    'hayai_fin_acceso',
+    'hayai_comanda_item_editable',
+    'hayai_comanda_item_derivar',
+    'hayai_cliente_cierre',
+    'hayai_cobro_guardia',
+    'hayai_cobro_pago_guardia',
+    'hayai_cobro_verificar',
+    'hayai_cobro_coherente',
+    'hayai_bitacora',
+    'hayai_bitacora_inmutable'
   ];
 
   vistas text[] := ARRAY[
     'v_mesa_estado',
     'v_cola_despacho',
-    'v_cuenta_mesa',
+    'v_cuenta_cliente',
     'v_venta_dia',
     'v_venta_dia_metodo',
     'v_producto_vendido_dia',
@@ -168,7 +209,15 @@ DECLARE
   ];
   vistas_difuntas text[] := ARRAY[
     'v_comanda_activa',
-    'v_comanda_descuadre'
+    'v_comanda_descuadre',
+    -- Sustituida por v_cuenta_cliente (2026-11-05): la cuenta es del cliente.
+    'v_cuenta_mesa'
+  ];
+  -- Triggers del modelo "la factura es de la comanda". Si vuelven, rechazan
+  -- las correcciones legítimas o verifican contra una columna que ya no existe.
+  triggers_difuntos text[] := ARRAY[
+    'comanda_item_solo_pendiente',
+    'cobro_no_vacio'
   ];
 
   n text;
@@ -214,6 +263,25 @@ BEGIN
     IF EXISTS (SELECT 1 FROM pg_views WHERE viewname = n AND schemaname = current_schema())
     THEN faltan := faltan || ('vista REVIVIDA del modelo viejo: ' || n); END IF;
   END LOOP;
+
+  FOREACH n IN ARRAY triggers_difuntos LOOP
+    IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = n AND NOT tgisinternal)
+    THEN faltan := faltan || ('trigger REVIVIDO del modelo viejo: ' || n); END IF;
+  END LOOP;
+
+  -- Los tres de la factura TIENEN que ser diferidos: inmediatos, rechazan el
+  -- INSERT del cobro antes de que se le apunte ninguna línea.
+  IF EXISTS (SELECT 1 FROM pg_trigger
+              WHERE tgname IN ('cobro_coherente', 'comanda_item_cobro_coherente', 'cobro_pago_cobro_coherente')
+                AND NOT (tgdeferrable AND tginitdeferred)) THEN
+    faltan := faltan || 'algún trigger *_cobro_coherente dejó de ser DEFERRABLE INITIALLY DEFERRED';
+  END IF;
+
+  -- No es un objeto perdido, pero conviene verlo: la migración lo deja NOT
+  -- VALID si había líneas históricas con total_linea mal calculado.
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'comanda_item_total_coherente' AND NOT convalidated) THEN
+    RAISE NOTICE 'comanda_item_total_coherente está NOT VALID: hay líneas históricas con total_linea incoherente';
+  END IF;
 
   -- Las vistas deben ser security_invoker, o RLS no las filtra.
   IF EXISTS (

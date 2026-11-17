@@ -7,6 +7,8 @@ import { AppModule } from '../src/app.module';
 import { configurarApp } from '../src/configurar-app';
 import { PrismaService } from '../src/comun/prisma/prisma.service';
 import { nuevoId } from '../src/comun/id';
+import { fijarAutor } from '../src/comun/prisma/autor';
+import { borrarRestaurante } from './fixture';
 
 /**
  * `GET /reportes/ventas` — el apartado de ventas con filtro día / mes / año
@@ -29,10 +31,11 @@ import { nuevoId } from '../src/comun/id';
  * cobro. Si el test las replicara en TypeScript, verificaría su propia copia de
  * la regla en vez de la del sistema.
  *
- * ⚠️ Desde el rediseño de comandas múltiples la unidad de venta es el COBRO, y
- * el día operativo que cuenta es el del cobro, no el del pedido. Por eso el
- * seed siembra facturas (cada una con su comanda detrás) en vez de comandas
- * cobradas, y el resumen devuelve `cobros` donde antes decía `comandas`.
+ * ⚠️ La unidad de venta es el COBRO, y el día operativo que cuenta es el del
+ * cobro, no el del pedido. Desde el modelo cliente + factura por líneas
+ * (DECISIONES-DATOS §15) cada factura lleva sus líneas (`comanda_item.cobro_id`)
+ * y sus pagos, y la base verifica al COMMIT que cuadren: por eso el seed ya no
+ * puede insertar un cobro "suelto".
  */
 describe('Reportes de ventas por período (e2e)', () => {
   let app: INestApplication;
@@ -43,27 +46,29 @@ describe('Reportes de ventas por período (e2e)', () => {
   let auth: { Authorization: string };
   let productoEmpanadaId: string;
   let productoPabellonId: string;
+  let productoVariosId: string;
   let tasaId: string;
+  let usuarioId: string;
 
   const ZONA = 'America/Caracas';
   const CORTE = '05:00';
 
   /**
-   * Una venta completa: la comanda despachada y la factura que la cubre, con el
-   * día operativo y el turno resueltos por la base.
+   * Una venta completa y consistente: cliente, comanda despachada con sus
+   * líneas, la factura que las cubre y su pago, con el día operativo y el turno
+   * resueltos por la base.
    *
-   * Va todo en UNA transacción por obligación del esquema: `cobro_no_vacio` es
-   * un constraint trigger diferido que se evalúa en el COMMIT, así que un cobro
-   * insertado suelto —sin la comanda apuntándolo— revienta. Es el mismo
-   * invariante que protege de la factura fantasma en producción.
-   *
-   * El orden dentro de la transacción tampoco es libre:
-   *   1. comanda (nace `pendiente`)
-   *   2. sus líneas — `comanda_item_solo_pendiente` las rechaza si la comanda
-   *      ya está despachada
-   *   3. `despachada_en` — `comanda_cobro_tras_despacho` exige que lo esté
-   *      antes de cobrarla
-   *   4. el cobro, y las comandas apuntándolo
+   * Todo va en UNA transacción: `cobro_coherente` es un constraint trigger
+   * diferido que verifica al COMMIT que la factura cubra líneas vivas, que su
+   * subtotal sea la suma de ellas y que los pagos cuadren. El orden dentro de
+   * la transacción tampoco es libre:
+   *   1. cliente (abierto: no se le puede anotar deuda a uno cerrado)
+   *   2. comanda (nace `pendiente`) y sus líneas
+   *   3. `despachada_en`
+   *   4. el cobro, las líneas apuntándolo y el pago (`recibido_en` en el pasado:
+   *      el trigger fecha el movimiento con el día operativo en que ocurrió)
+   *   5. se cierra el cliente / se anula la factura (UPDATE: exige autor)
+   * Lo que no suma el detalle de `items` va en una línea "Varios".
    */
   async function sembrarVenta(opciones: {
     momento: string;
@@ -74,33 +79,44 @@ describe('Reportes de ventas por período (e2e)', () => {
     sinCobrar?: boolean;
     numero: number;
     items?: { productoId: string; nombre: string; cantidad: number; total: number }[];
-  }): Promise<void> {
+  }): Promise<{ cobroId: string; comandaId: string; clienteId: string }> {
     const { momento, total, propina = 0, anulado = false, sinCobrar = false, numero, items = [] } = opciones;
+    const clienteId = nuevoId();
     const comandaId = nuevoId();
     const cobroId = nuevoId();
     const subtotal = total - propina;
-    // `comanda.total` es sólo la suma de sus líneas: sin propina ni descuento.
-    const totalLineas = subtotal;
+
+    const lineas = [...items];
+    const resto = subtotal - items.reduce((a, it) => a + it.total, 0);
+    if (resto > 0) lineas.push({ productoId: productoVariosId, nombre: 'Varios', cantidad: 1, total: resto });
 
     await prisma.$transaction(async (tx) => {
+      await fijarAutor(tx, usuarioId);
+      await tx.$executeRaw`
+        INSERT INTO "cliente" ("id", "restaurante_id", "nombre", "fecha_operativa", "creado_en", "actualizado_en")
+        VALUES (${clienteId}::uuid, ${restauranteId}::uuid, ${'Cliente ' + numero},
+                hayai_fecha_operativa(${momento}::timestamptz, ${ZONA}, ${CORTE}::time),
+                ${momento}::timestamptz, now())
+      `;
       await tx.$executeRaw`
         INSERT INTO "comanda" (
-          "id", "restaurante_id", "tipo", "numero_dia", "fecha_operativa", "turno",
-          "comensales", "total", "creada_en", "actualizada_en"
+          "id", "restaurante_id", "tipo", "cliente_id", "numero_dia", "fecha_operativa", "turno",
+          "comensales", "creada_en", "actualizada_en"
         ) VALUES (
-          ${comandaId}::uuid, ${restauranteId}::uuid, 'para_llevar', ${numero},
+          ${comandaId}::uuid, ${restauranteId}::uuid, 'para_llevar', ${clienteId}::uuid, ${numero},
           hayai_fecha_operativa(${momento}::timestamptz, ${ZONA}, ${CORTE}::time),
           hayai_turno(${momento}::timestamptz, ${ZONA}),
-          2, ${totalLineas}, ${momento}::timestamptz, now()
+          2, ${momento}::timestamptz, now()
         )
       `;
 
-      for (const [i, it] of items.entries()) {
+      for (const [i, it] of lineas.entries()) {
         await tx.comandaItem.create({
           data: {
             id: nuevoId(),
             restauranteId,
             comandaId,
+            clienteId,
             productoId: it.productoId,
             orden: i,
             nombreSnap: it.nombre,
@@ -112,32 +128,43 @@ describe('Reportes de ventas por período (e2e)', () => {
         });
       }
 
+      await tx.comanda.update({ where: { id: comandaId }, data: { despachadaEn: new Date(momento) } });
       if (sinCobrar) return;
-
-      await tx.comanda.update({
-        where: { id: comandaId },
-        data: { despachadaEn: new Date(momento) },
-      });
 
       await tx.$executeRaw`
         INSERT INTO "cobro" (
-          "id", "restaurante_id", "numero_dia", "fecha_operativa", "turno",
+          "id", "restaurante_id", "cliente_id", "numero_dia", "fecha_operativa", "turno",
           "comensales", "subtotal", "propina", "total",
-          "tasa_id", "tasa_valor", "total_bs", "cobrado_en", "anulado_en",
-          "motivo_anulacion", "actualizado_en"
+          "tasa_id", "tasa_valor", "total_bs", "cobrado_en", "actualizado_en"
         ) VALUES (
-          ${cobroId}::uuid, ${restauranteId}::uuid, ${numero},
+          ${cobroId}::uuid, ${restauranteId}::uuid, ${clienteId}::uuid, ${numero},
           hayai_fecha_operativa(${momento}::timestamptz, ${ZONA}, ${CORTE}::time),
           hayai_turno(${momento}::timestamptz, ${ZONA}),
           2, ${subtotal}, ${propina}, ${total},
-          ${tasaId}::uuid, 900, ${total * 900}, ${momento}::timestamptz,
-          ${anulado ? momento : null}::timestamptz,
-          ${anulado ? 'prueba' : null}, now()
+          ${tasaId}::uuid, 900, ${total * 900}, ${momento}::timestamptz, now()
         )
       `;
-
-      await tx.comanda.update({ where: { id: comandaId }, data: { cobroId } });
+      await tx.comandaItem.updateMany({ where: { comandaId }, data: { cobroId } });
+      await tx.$executeRaw`
+        INSERT INTO "cobro_pago" (
+          "id", "restaurante_id", "cobro_id", "metodo", "moneda", "monto", "monto_usd", "recibido_en"
+        ) VALUES (
+          ${nuevoId()}::uuid, ${restauranteId}::uuid, ${cobroId}::uuid, 'efectivo_usd', 'USD',
+          ${total}, ${total}, ${momento}::timestamptz
+        )
+      `;
+      await tx.$executeRaw`
+        UPDATE "cliente" SET "cerrado_en" = ${momento}::timestamptz, "cerrado_por_id" = ${usuarioId}::uuid
+         WHERE "id" = ${clienteId}::uuid
+      `;
+      if (anulado) {
+        await tx.$executeRaw`
+          UPDATE "cobro" SET "anulado_en" = ${momento}::timestamptz, "motivo_anulacion" = 'prueba'
+           WHERE "id" = ${cobroId}::uuid
+        `;
+      }
     });
+    return { cobroId, comandaId, clienteId };
   }
 
   beforeAll(async () => {
@@ -155,9 +182,10 @@ describe('Reportes de ventas por período (e2e)', () => {
     });
 
     const claveHash = await argon2.hash('clave1234');
+    usuarioId = nuevoId();
     await prisma.usuario.create({
       data: {
-        id: nuevoId(),
+        id: usuarioId,
         restauranteId,
         nombre: 'Admin de reportes',
         usuario: `admin-${slug}`,
@@ -175,6 +203,12 @@ describe('Reportes de ventas por período (e2e)', () => {
     });
     await prisma.producto.create({
       data: { id: productoPabellonId, restauranteId, categoriaId, nombre: 'Pabellón', precio: 12.5 },
+    });
+
+    // Las ventas sin detalle llevan una línea "Varios" por el resto del subtotal.
+    productoVariosId = nuevoId();
+    await prisma.producto.create({
+      data: { id: productoVariosId, restauranteId, categoriaId, nombre: 'Varios', precio: 1 },
     });
 
     // `cobro.tasa_id` es NOT NULL y el trigger `cobro_tasa_base` sólo admite
@@ -225,7 +259,7 @@ describe('Reportes de ventas por período (e2e)', () => {
   }, 60_000);
 
   afterAll(async () => {
-    await prisma.restaurante.delete({ where: { id: restauranteId } }).catch(() => undefined);
+    await borrarRestaurante(prisma, restauranteId);
     await app.close();
   });
 
@@ -384,15 +418,17 @@ describe('Reportes de ventas por período (e2e)', () => {
       .get('/api/v1/reportes/productos?periodo=mes&fecha=2025-05-20')
       .set(auth)
       .expect(200);
-    expect(mayo.body).toHaveLength(1);
-    expect(mayo.body[0].producto_nombre).toBe('Empanada');
-    expect(Number(mayo.body[0].cantidad)).toBe(6);
+    // "Varios" es el relleno del seed (ventas sin detalle): no es un producto real.
+    const mayoReal = mayo.body.filter((p: any) => p.producto_nombre !== 'Varios');
+    expect(mayoReal).toHaveLength(1);
+    expect(mayoReal[0].producto_nombre).toBe('Empanada');
+    expect(Number(mayoReal[0].cantidad)).toBe(6);
 
     const anio = await request(app.getHttpServer())
       .get('/api/v1/reportes/productos?periodo=anio&fecha=2025-07-15&orden=ingreso')
       .set(auth)
       .expect(200);
-    expect(anio.body.map((p: any) => p.producto_nombre)).toEqual(['Pabellón', 'Empanada']);
+    expect(anio.body.map((p: any) => p.producto_nombre).filter((n: string) => n !== 'Varios')).toEqual(['Pabellón', 'Empanada']);
   });
 
   it('GET /reportes/dia sigue respondiendo con la misma forma de siempre', async () => {
@@ -404,5 +440,54 @@ describe('Reportes de ventas por período (e2e)', () => {
     expect(body.porTurno).toHaveLength(3); // almuerzo, cena, madrugada
     expect(body.total.cobros).toBe(3);
     expect(Number(body.total.total_usd)).toBe(350);
+  });
+
+  it('corregir HOY una factura de otro día cambia la venta de ESE día y mueve la caja de HOY (ajustes_otros_dias_usd)', async () => {
+    const venta = await sembrarVenta({
+      momento: '2025-08-05T13:00:00-04:00',
+      total: 100,
+      numero: 20,
+      items: [{ productoId: productoPabellonId, nombre: 'Pabellón', cantidad: 4, total: 50 }],
+    });
+    const dia = (fecha: string) => request(app.getHttpServer()).get(`/api/v1/reportes/dia?fecha=${fecha}`).set(auth).expect(200);
+    expect(Number((await dia('2025-08-05')).body.total.total_usd)).toBe(100);
+
+    // Baja el pabellón de 4 a 2 unidades (-25) y devuelve 25 por efectivo, hoy.
+    const lineaPabellon = await prisma.comandaItem.findFirstOrThrow({ where: { cobroId: venta.cobroId, nombreSnap: 'Pabellón' } });
+    const { body: corregida } = await request(app.getHttpServer())
+      .post(`/api/v1/cobros/${venta.cobroId}/corregir`)
+      .set(auth)
+      .send({
+        motivo: 'se devolvieron dos',
+        cambios: [{ lineaId: lineaPabellon.id, cantidad: 2 }],
+        pagos: [{ metodo: 'efectivo_usd', moneda: 'USD', monto: -25 }],
+      })
+      .expect(201);
+    expect(Number(corregida.total)).toBe(75);
+    // El día y el número de la factura no cambian.
+    expect(corregida.fechaOperativa.slice(0, 10)).toBe('2025-08-05');
+    expect(corregida.numeroDia).toBe(20);
+
+    // La venta de ayer ya no es la impresa: refleja la factura corregida.
+    expect(Number((await dia('2025-08-05')).body.total.total_usd)).toBe(75);
+
+    // La caja de ese día no cambió; la de HOY lleva la devolución, separada como ajuste.
+    const viejo = await request(app.getHttpServer()).get('/api/v1/reportes/cierre-caja?fecha=2025-08-05').set(auth).expect(200);
+    expect(viejo.body.resumen).toEqual({ cajaUsd: '100.0000', ventaDelDiaUsd: '100.0000', ajustesOtrosDiasUsd: '0.0000' });
+
+    const [{ hoy }] = await prisma.$queryRaw<{ hoy: string }[]>`
+      SELECT to_char(hayai_fecha_operativa(now(), ${ZONA}, ${CORTE}::time), 'YYYY-MM-DD') AS "hoy"
+    `;
+    const { body: caja } = await request(app.getHttpServer()).get('/api/v1/reportes/cierre-caja').set(auth).expect(200);
+    expect(caja.fecha).toBe(hoy);
+    expect(caja.resumen).toEqual({ cajaUsd: '-25.0000', ventaDelDiaUsd: '0.0000', ajustesOtrosDiasUsd: '-25.0000' });
+    const efectivo = caja.porMetodo.find((m: any) => m.metodo === 'efectivo_usd');
+    expect(Number(efectivo.monto_usd)).toBe(-25);
+    expect(Number(efectivo.ajustes_otros_dias_usd)).toBe(-25);
+    expect(Number(efectivo.devoluciones)).toBe(1);
+    expect(Number(efectivo.pagos)).toBe(0);
+    expect(caja.devoluciones).toHaveLength(1);
+    expect(caja.devoluciones[0].factura_numero_dia).toBe(20);
+    expect(caja.descuadres).toHaveLength(0);
   });
 });

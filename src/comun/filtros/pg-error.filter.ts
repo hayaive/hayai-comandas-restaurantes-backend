@@ -99,24 +99,45 @@ const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
   comanda_total_valido: { http: 422, mensaje: 'El total de la comanda no puede ser negativo' },
   comanda_anulada_no_cobrada: {
     http: 409,
-    mensaje: 'Una comanda cobrada no se puede anular, ni una anulada cobrar',
+    mensaje: 'Esa comanda tiene líneas facturadas: corrige las facturas antes de anularla',
   },
   comanda_anulacion_coherente: {
     http: 422,
     mensaje: 'El motivo de anulación sólo se guarda al anular la comanda',
   },
   // Regla de negocio confirmada por el dueño: se cobra sólo lo que ya salió de
-  // cocina; lo pendiente se queda y arranca la cuenta siguiente de la mesa.
+  // cocina; lo pendiente se queda como deuda del cliente.
   comanda_cobro_tras_despacho: {
     http: 409,
     mensaje: 'No se puede cobrar una comanda que la cocina todavía no despachó',
   },
-  // El guardián de las líneas. Es 409 y no 422 porque no son datos malos: es
-  // que el pedido ya salió y llega tarde.
-  comanda_item_solo_pendiente: {
+  // Cliente = unidad de cobro (DECISIONES-DATOS §15). Casi todos son 409: no
+  // son datos malos, es que el estado del mundo cambió (otro cajero, otro mesero).
+  cliente_cerrado: {
     http: 409,
-    mensaje: 'Esa comanda ya salió de cocina o se cobró: sus líneas no se pueden cambiar',
+    mensaje: 'Ese cliente ya cerró su cuenta: reábrelo para anotarle consumo',
   },
+  cliente_cierre_sin_deuda: {
+    http: 409,
+    mensaje: 'El cliente todavía debe consumo: cóbralo, reasígnalo o cancélalo antes de cerrarlo',
+  },
+  cliente_reservacion_abierta_unica: { http: 409, mensaje: 'Esa reserva ya está sentada' },
+  cliente_nombre_normalizado: { http: 422, mensaje: 'El nombre del cliente no puede estar vacío' },
+  comanda_item_comanda_anulada: { http: 409, mensaje: 'Esa comanda está anulada' },
+  comanda_item_factura_linea_viva: { http: 409, mensaje: 'Esa línea está cancelada' },
+  comanda_item_restaurante_id_cobro_id_cliente_id_fkey: {
+    http: 409,
+    mensaje: 'Esa línea ya está facturada: desfactúrala antes de reasignarla',
+  },
+  // Las siguientes son un bug del servidor, nunca un error del usuario: el
+  // servicio ya calcula y verifica todo antes de escribir.
+  comanda_item_comanda_fija: { http: 500, mensaje: 'Error interno: una línea no puede cambiar de comanda' },
+  comanda_item_total_coherente: { http: 500, mensaje: 'Error interno: el total de la línea no cuadra con cantidad y precio' },
+  cobro_subtotal_coherente: { http: 500, mensaje: 'Error interno: el subtotal de la factura no cuadra con sus líneas' },
+  cobro_total_coherente: { http: 500, mensaje: 'Error interno: el total de la factura no cuadra con sus componentes' },
+  cobro_fecha_inmutable: { http: 500, mensaje: 'Error interno: el día y el número de una factura no cambian' },
+  bitacora_sin_autor: { http: 500, mensaje: 'Error interno: la operación se hizo sin fijar el autor' },
+  bitacora_inmutable: { http: 500, mensaje: 'Error interno: la bitácora no se modifica' },
   comanda_item_cancelacion_coherente: {
     http: 422,
     mensaje: 'El motivo de cancelación sólo se guarda al anular la línea',
@@ -132,9 +153,15 @@ const MAPA_CONSTRAINTS: Record<string, TraduccionError> = {
   // no cobre otra vez — la mesa ya está paga.
   cobro_no_vacio: {
     http: 409,
-    mensaje: 'Esa cuenta ya la cobró otro cajero: la factura no cubriría ninguna comanda',
+    mensaje: 'Esa cuenta ya la cobró otro cajero, o la factura se quedó sin líneas (una factura sin líneas se anula)',
   },
-  cobro_pago_monto_valido: { http: 422, mensaje: 'El monto del pago debe ser mayor que 0' },
+  cobro_pagos_cuadran: {
+    http: 422,
+    mensaje: 'Los pagos no cuadran con el nuevo total: registra el cobro o la devolución de la diferencia',
+  },
+  cobro_anulado_inmutable: { http: 409, mensaje: 'Esa factura está anulada' },
+  cobro_pago_inmutable: { http: 409, mensaje: 'Un pago registrado no se edita: registra una devolución' },
+  cobro_pago_monto_valido: { http: 422, mensaje: 'El monto no puede ser 0' },
   cobro_pago_referencia_obligatoria: {
     http: 422,
     mensaje: 'Pago móvil y transferencia exigen un número de referencia',

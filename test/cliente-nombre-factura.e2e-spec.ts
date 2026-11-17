@@ -1,161 +1,92 @@
-import 'dotenv/config';
-import * as argon2 from 'argon2';
-import request from 'supertest';
-import { Test } from '@nestjs/testing';
-import { INestApplication } from '@nestjs/common';
-import { AppModule } from '../src/app.module';
-import { configurarApp } from '../src/configurar-app';
-import { PrismaService } from '../src/comun/prisma/prisma.service';
-import { nuevoId } from '../src/comun/id';
+import { Fixture, montar } from './fixture';
 
 /**
- * Nombre del cliente en la factura (docs/DECISIONES-DATOS.md §14).
- * Cada corrida crea su propio restaurante, igual que invariantes.e2e-spec.ts.
+ * Nombre del cliente en la factura (docs/DECISIONES-DATOS.md §14 y §15).
+ * Desde §15 el nombre vive en el CLIENTE; la factura lo CONGELA al emitirse y
+ * el cajero puede mandar otro (facturar a otro nombre) sin cambiar de cliente.
  */
 describe('Nombre del cliente en la factura (e2e)', () => {
-  let app: INestApplication;
-  let prisma: PrismaService;
-  let restauranteId: string;
-  let salonId: string;
-  let productoId: string;
-  let auth: { Authorization: string };
-  const mesas: string[] = [];
+  let f: Fixture;
+  const API = '/api/v1';
 
-  const http = () => request(app.getHttpServer());
-  const crearComanda = (mesaId: string, extra: Record<string, unknown> = {}) =>
-    http()
-      .post('/api/v1/comandas')
-      .set(auth)
-      .send({ tipo: 'mesa', mesaId, comensales: 2, items: [{ productoId, cantidad: 1 }], ...extra });
-  const despachar = (id: string) => http().post(`/api/v1/comandas/${id}/despachar`).set(auth);
-  const cobrar = (mesaId: string, extra: Record<string, unknown> = {}) =>
-    http()
-      .post(`/api/v1/mesas/${mesaId}/cobrar`)
-      .set(auth)
+  const nuevoCliente = async (nombre: string, mesaId?: string) =>
+    (await f.http().post(`${API}/clientes`).set(f.auth).send({ nombre, mesaId }).expect(201)).body;
+  /** Un cliente con una comanda ya despachada de 10 USD. */
+  const conConsumo = async (nombre: string, mesaId?: string) => {
+    const cliente = await nuevoCliente(nombre, mesaId);
+    const comanda = await f.http().post(`${API}/comandas`).set(f.auth)
+      .send({ clienteId: cliente.id, items: [{ productoId: f.productoId, cantidad: 1 }] }).expect(201);
+    await f.http().post(`${API}/comandas/${comanda.body.id}/despachar`).set(f.auth).expect(201);
+    return cliente;
+  };
+  const cobrar = (clienteId: string, extra: Record<string, unknown> = {}) =>
+    f.http().post(`${API}/clientes/${clienteId}/cobrar`).set(f.auth)
       .send({ pagos: [{ metodo: 'efectivo_usd', moneda: 'USD', monto: 10 }], ...extra });
 
   beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
-    app = moduleRef.createNestApplication();
-    configurarApp(app);
-    await app.init();
-    prisma = app.get(PrismaService);
-
-    const slug = `test-cn-${Date.now()}`;
-    restauranteId = nuevoId();
-    await prisma.restaurante.create({ data: { id: restauranteId, slug, nombre: 'Restaurante de prueba' } });
-    await prisma.usuario.create({
-      data: {
-        id: nuevoId(),
-        restauranteId,
-        nombre: 'Admin de prueba',
-        usuario: `admin-${slug}`,
-        claveHash: await argon2.hash('clave1234'),
-        rol: 'administrador',
-      },
-    });
-    salonId = nuevoId();
-    await prisma.salon.create({ data: { id: salonId, restauranteId, nombre: 'Salón de prueba' } });
-    const plantillaId = nuevoId();
-    await prisma.plantilla.create({
-      data: { id: plantillaId, restauranteId, salonId, nombre: 'Distribución de prueba', activa: true },
-    });
-    for (const etiqueta of ['T1', 'T2', 'T3', 'T4']) {
-      const id = nuevoId();
-      mesas.push(id);
-      await prisma.mesa.create({ data: { id, restauranteId, salonId, etiqueta } });
-      await prisma.plantillaMesa.create({
-        data: { restauranteId, plantillaId, mesaId: id, posX: 0, posY: 0, forma: 'cuadrada', capacidad: 4 },
-      });
-    }
-    const categoriaId = nuevoId();
-    await prisma.categoria.create({ data: { id: categoriaId, restauranteId, nombre: 'Cocina' } });
-    productoId = nuevoId();
-    await prisma.producto.create({ data: { id: productoId, restauranteId, categoriaId, nombre: 'Pabellón', precio: 10 } });
-    await prisma.tasaCambio.create({
-      data: { id: nuevoId(), restauranteId, fecha: new Date(), divisa: 'USD', valor: 900 },
-    });
-
-    const login = await http().post('/api/v1/auth/login').send({ usuario: `admin-${slug}`, clave: 'clave1234' }).expect(200);
-    auth = { Authorization: `Bearer ${login.body.token}` };
+    f = await montar('test-cn');
   }, 30_000);
 
-  afterAll(async () => {
-    await prisma.$executeRaw`DELETE FROM "comanda" WHERE "restaurante_id" = ${restauranteId}::uuid`;
-    await prisma.$executeRaw`DELETE FROM "cobro"   WHERE "restaurante_id" = ${restauranteId}::uuid`;
-    await prisma.restaurante.delete({ where: { id: restauranteId } }).catch(() => undefined);
-    await app.close();
+  afterAll(() => f.cerrar());
+
+  it('crear cliente: nombre con trim; vacío, en blanco o de más de 120 = 400', async () => {
+    const a = await f.http().post(`${API}/clientes`).set(f.auth).send({ nombre: '  Luis  ' }).expect(201);
+    expect(a.body.nombre).toBe('Luis');
+    expect(a.body.mesaId).toBeNull();
+    await f.http().post(`${API}/clientes`).set(f.auth).send({ nombre: '   ' }).expect(400);
+    await f.http().post(`${API}/clientes`).set(f.auth).send({}).expect(400);
+    await f.http().post(`${API}/clientes`).set(f.auth).send({ nombre: 'x'.repeat(121) }).expect(400);
   });
 
-  it('crear comanda: guarda con trim, blanco = NULL, más de 120 = 400', async () => {
-    const [m] = mesas;
-    const a = await crearComanda(m, { clienteNombre: '  Luis  ' }).expect(201);
-    expect(a.body.clienteNombre).toBe('Luis');
-    const b = await crearComanda(m, { clienteNombre: '   ' }).expect(201);
-    expect(b.body.clienteNombre).toBeNull();
-    const c = await crearComanda(m).expect(201);
-    expect(c.body.clienteNombre).toBeNull();
-    await crearComanda(m, { clienteNombre: 'x'.repeat(121) }).expect(400);
-    for (const x of [a, b, c]) await prisma.comanda.update({ where: { id: x.body.id }, data: { anuladaEn: new Date() } });
-  });
-
-  it('(a) la ronda 2 sin nombre factura con el de la ronda 1; y la reimpresión lo conserva', async () => {
-    const m = mesas[0];
-    const r1 = await crearComanda(m, { clienteNombre: 'Ana Pérez' }).expect(201);
-    const r2 = await crearComanda(m).expect(201);
-    await despachar(r1.body.id).expect(201);
-    await despachar(r2.body.id).expect(201);
-
-    const { body: cuenta } = await http().get(`/api/v1/mesas/${m}/cuenta`).set(auth).expect(200);
-    expect(cuenta.clienteNombreSugerido).toBe('Ana Pérez');
-
-    const { body: cobro } = await cobrar(m, { pagos: [{ metodo: 'efectivo_usd', moneda: 'USD', monto: 20 }] }).expect(201);
+  it('(a) sin nombre en el cobro, la factura congela el del cliente; la reimpresión lo conserva aunque el cliente se renombre', async () => {
+    const cliente = await conConsumo('Ana Pérez', f.mesas[0]);
+    const { body: cobro } = await cobrar(cliente.id).expect(201);
     expect(cobro.clienteNombre).toBe('Ana Pérez');
 
-    const { body: reimpreso } = await http().get(`/api/v1/cobros/${cobro.id}`).set(auth).expect(200);
+    await f.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT set_config('app.usuario_id', ${f.usuarioId}, true)`;
+      await tx.cliente.update({ where: { id: cliente.id }, data: { nombre: 'Otro nombre' } });
+    });
+
+    const { body: reimpreso } = await f.http().get(`${API}/cobros/${cobro.id}`).set(f.auth).expect(200);
     expect(reimpreso.clienteNombre).toBe('Ana Pérez');
-    const { body: dia } = await http().get('/api/v1/cobros').set(auth).expect(200);
+    const { body: dia } = await f.http().get(`${API}/cobros`).set(f.auth).expect(200);
     expect(dia.find((c: any) => c.id === cobro.id).clienteNombre).toBe('Ana Pérez');
   });
 
-  it('(b) mesa sentada desde una reserva, comandas sin nombre: usa el de la reserva', async () => {
-    const m = mesas[1];
-    const reserva = await http()
-      .post('/api/v1/reservaciones')
-      .set(auth)
-      .send({
-        salonId,
-        mesaId: m,
-        clienteNombre: '  Familia Rojas ',
-        personas: 2,
-        iniciaEn: '2027-03-01T20:00:00.000Z',
-        duracionMin: 90,
-      })
-      .expect(201);
-    await http().post(`/api/v1/reservaciones/${reserva.body.id}/sentar`).set(auth).send({}).expect(201);
+  it('(b) cliente sentado desde una reserva: la factura lleva el nombre de la reserva', async () => {
+    const reserva = await f.http().post(`${API}/reservaciones`).set(f.auth).send({
+      salonId: f.salonId,
+      mesaId: f.mesas[1],
+      clienteNombre: '  Familia Rojas ',
+      personas: 2,
+      iniciaEn: '2027-03-01T20:00:00.000Z',
+      duracionMin: 90,
+    }).expect(201);
+    const { body: sentada } = await f.http().post(`${API}/reservaciones/${reserva.body.id}/sentar`).set(f.auth).send({}).expect(201);
+    expect(sentada.cliente.nombre).toBe('Familia Rojas');
 
-    // Sin comandas todavía ya se sugiere.
-    const { body: vacia } = await http().get(`/api/v1/mesas/${m}/cuenta`).set(auth).expect(200);
-    expect(vacia.clienteNombreSugerido).toBe('Familia Rojas');
-
-    const c = await crearComanda(m).expect(201);
-    await despachar(c.body.id).expect(201);
-    const { body: cobro } = await cobrar(m).expect(201);
+    const comanda = await f.http().post(`${API}/comandas`).set(f.auth)
+      .send({ clienteId: sentada.cliente.id, items: [{ productoId: f.productoId, cantidad: 1 }] }).expect(201);
+    await f.http().post(`${API}/comandas/${comanda.body.id}/despachar`).set(f.auth).expect(201);
+    const { body: cobro } = await cobrar(sentada.cliente.id).expect(201);
     expect(cobro.clienteNombre).toBe('Familia Rojas');
   });
 
-  it('(c) el cajero manda "" o null: NULL aunque haya nombre; manda texto: gana con trim', async () => {
+  it('(c) el cajero manda "" o null: NULL aunque el cliente tenga nombre; manda texto: gana con trim (otro nombre, mismo cliente)', async () => {
     for (const [i, envio] of [
       [2, { clienteNombre: '' }],
       [2, { clienteNombre: null }],
       [3, { clienteNombre: '  Pedro  ' }],
     ] as const) {
-      const m = mesas[i];
-      const c = await crearComanda(m, { clienteNombre: 'Ana del mesero' }).expect(201);
-      await despachar(c.body.id).expect(201);
-      const { body: cobro } = await cobrar(m, envio).expect(201);
+      const cliente = await conConsumo(`Ana del mesero ${i}`, f.mesas[i]);
+      const { body: cobro } = await cobrar(cliente.id, envio).expect(201);
       expect(cobro.clienteNombre).toBe(envio.clienteNombre ? 'Pedro' : null);
+      // Facturar a otro nombre no cambia de cliente.
+      expect(cobro.clienteId).toBe(cliente.id);
+      expect(cobro.cliente.nombre).toBe(`Ana del mesero ${i}`);
     }
-    await cobrar(mesas[0], { clienteNombre: 'x'.repeat(121) }).expect(400);
+    const otro = await conConsumo('Para rechazar', f.mesas[0]);
+    await cobrar(otro.id, { clienteNombre: 'x'.repeat(121) }).expect(400);
   });
 });

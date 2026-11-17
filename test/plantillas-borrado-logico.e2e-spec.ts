@@ -7,6 +7,7 @@ import { AppModule } from '../src/app.module';
 import { configurarApp } from '../src/configurar-app';
 import { PrismaService } from '../src/comun/prisma/prisma.service';
 import { nuevoId } from '../src/comun/id';
+import { borrarRestaurante } from './fixture';
 
 /**
  * Borrado lógico de Plantilla (CONTRACT.md §3.6, §4, §7):
@@ -24,6 +25,7 @@ describe('Plantillas — borrado lógico (e2e)', () => {
   let mesaId: string;
   let productoId: string;
   let token: string;
+  let usuarioId: string;
 
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
@@ -40,9 +42,10 @@ describe('Plantillas — borrado lógico (e2e)', () => {
     });
 
     const claveHash = await argon2.hash('clave1234');
+    usuarioId = nuevoId();
     await prisma.usuario.create({
       data: {
-        id: nuevoId(),
+        id: usuarioId,
         restauranteId,
         nombre: 'Admin de prueba',
         usuario: `admin-${slug}`,
@@ -75,7 +78,7 @@ describe('Plantillas — borrado lógico (e2e)', () => {
   }, 30_000);
 
   afterAll(async () => {
-    await prisma.restaurante.delete({ where: { id: restauranteId } }).catch(() => undefined);
+    await borrarRestaurante(prisma, restauranteId);
     await app.close();
   });
 
@@ -99,16 +102,25 @@ describe('Plantillas — borrado lógico (e2e)', () => {
     await request(app.getHttpServer()).post(`/api/v1/plantillas/${plantilla1Id}/activar`).set(auth).expect(201);
 
     // 2. Con plantilla1 activa, genera histórico que apunta a ella.
+    const cliente = await request(app.getHttpServer())
+      .post('/api/v1/clientes')
+      .set(auth)
+      .send({ nombre: 'Cliente histórico', mesaId })
+      .expect(201);
     const comanda = await request(app.getHttpServer())
       .post('/api/v1/comandas')
       .set(auth)
-      .send({ tipo: 'mesa', mesaId, comensales: 2, items: [{ productoId, cantidad: 1 }] })
+      .send({ clienteId: cliente.body.id, comensales: 2, items: [{ productoId, cantidad: 1 }] })
       .expect(201);
     expect(comanda.body.plantillaId).toBe(plantilla1Id);
     // Saca la comanda de la cuenta de la mesa para no interferir con el resto
     // del test. `estado` es derivado: se escribe el HECHO (`anuladaEn`) y el
     // trigger `comanda_estado` deriva 'anulada'.
     await prisma.comanda.update({ where: { id: comanda.body.id }, data: { anuladaEn: new Date() } });
+    await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT set_config('app.usuario_id', ${usuarioId}, true)`;
+      await tx.cliente.update({ where: { id: cliente.body.id }, data: { cerradoEn: new Date() } });
+    });
 
     const reservacion = await request(app.getHttpServer())
       .post('/api/v1/reservaciones')

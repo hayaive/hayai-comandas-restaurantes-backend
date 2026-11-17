@@ -15,6 +15,18 @@
 > endpoints de comandas cambiaron o desaparecieron (§5). Lo que hay que releer
 > sí o sí: §0 (mapa mental), §2.9-§2.12 (entidades), §3.1-§3.3 (flujos) y la
 > tabla de endpoints retirados en §5.
+>
+> ⚠️ **2026-11-05 — cliente como unidad de cobro y factura por líneas**
+> (migraciones `20261105120000` y `20261105120100`; backend implementado por
+> **D.A.N.I**). Otro cambio **ROMPEDOR**, y este documento ya está reescrito para
+> él: se cobra al CLIENTE (no a la mesa), la factura cubre LÍNEAS
+> (`comanda_item.cobroId`; `comanda.cobroId` y `v_cuenta_mesa` ya no existen), las
+> comandas y facturas ya emitidas se pueden corregir (las facturas, de cualquier
+> día, con cobro adicional o devolución), y todo queda en la `bitacora`.
+> **Es la fuente del frontend**: relee §0, §1 (`cobrada_parcial`), §2.8b-§2.12,
+> §3.1-§3.3b, §4, §5.1 y, sobre todo, **§5 · "Clientes, comandas, despacho y
+> cobro"** (rutas, cuerpos, respuestas, errores, ejemplos y la tabla de rutas
+> retiradas). El porqué de cada decisión de datos: `docs/DECISIONES-DATOS.md §15`.
 
 ---
 
@@ -28,37 +40,45 @@ restaurante
               └── plantilla_mesa                   ← posición + tamaño + sillas
                      (plantilla × mesa)
 
-reservacion ── (al llegar) ──> [sentada]
-                                   │
-                    (el mesero toma nota)
-                                   ↓
-                              comanda ──> comanda_item        ← UN PEDIDO
-                                   │            ↑
-                                   │       producto ← categoria
-                                   │
-                        N comandas de una mesa
-                                   ↓
-                               cobro ──> cobro_pago           ← LA FACTURA
+reservacion ── (al sentarla / check-in) ──┐
+                                           ↓
+                        cliente  (una VISITA: nombre, mesa opcional)   ← LA UNIDAD DE COBRO
+                           │  └── ocupa la mesa mientras esté abierto y sentado
+                           │
+             el mesero toma nota (POST /comandas { clienteId })
+                           ↓
+                      comanda ──> comanda_item (clienteId = deudor, cobroId = factura | null)
+                       UN PEDIDO         ↑
+                                    producto ← categoria
+                           │
+        al cobrar, las líneas ELEGIDAS del cliente pasan a una factura
+                           ↓
+                       cobro ──> cobro_pago (de sólo agregar; devolución = monto < 0)
+                         ↓ (toda corrección)
+                      bitacora  (triggers; autor = la sesión)
 ```
 
-Las tres ideas que hay que entender antes de tocar código:
+Las ideas que hay que entender antes de tocar código:
 
 1. **La mesa y su sitio en el plano son dos cosas distintas.** `mesa` es la
    identidad ("Mesa 5"); `plantilla_mesa` es dónde está dibujada, cuánto mide y
    cuántas sillas tiene *en esa distribución*. Así la misma mesa puede ser de 4
    sillas en la distribución normal y de 10 en un banquete, y el histórico de
    ventas de la Mesa 5 sobrevive a cualquier rediseño del salón.
-2. **Una comanda es UN PEDIDO, no la cuenta de la mesa.** Cada envío a cocina
-   crea una comanda nueva, y una mesa acumula N comandas vivas a la vez. La mesa
-   está ocupada si y solo si tiene al menos una comanda sin cobrar y sin anular;
-   su **cuenta** es la suma de todas (`v_cuenta_mesa`). Lo que se cobra es la
-   mesa, y eso emite un `cobro` — la factura que cubre esas comandas.
-   *(Hasta la migración `20260915183000` una comanda ERA la cuenta y la base
-   impedía que hubiera dos por mesa; ese índice ya no existe.)*
-3. **`comanda.estado` es DERIVADO.** No se escribe: lo calcula el trigger
-   `comanda_estado` a partir de tres hechos independientes —`despachadaEn`,
-   `cobroId`, `anuladaEn`. Para mover una comanda se escribe el hecho, nunca el
-   estado; mandarlo en un PATCH no hace nada.
+2. **Se cobra al CLIENTE, no a la mesa.** Un `cliente` es una visita (nombre, mesa
+   opcional, deuda). La mesa está ocupada si y solo si hay un cliente ABIERTO
+   sentado en ella (puede haber varios, con cuentas separadas); un cliente sin
+   mesa también pide y paga. Su **deuda** son sus líneas sin factura. Una
+   **comanda** es UN PEDIDO (lo que se manda a cocina de una vez): cada envío
+   crea una comanda nueva. Cobrar = elegir líneas (o una parte de una) y emitir
+   una **factura** que las cubre; lo no facturado sigue siendo deuda del mismo
+   cliente y se puede reasignar a otro.
+   *(Hasta 2026-11-05 el cobro era de la mesa y la factura cubría comandas
+   enteras; hasta 2026-09-15 una comanda ERA la cuenta de la mesa.)*
+3. **`comanda.estado` y `comanda.total` son DERIVADOS.** No se escriben: los
+   calcula el trigger `comanda_estado` a partir de `despachadaEn`, `anuladaEn` y
+   del estado de facturación de sus líneas. Para mover una comanda se escribe el
+   hecho, nunca el estado; mandarlo en un PATCH no hace nada.
 4. **El día operativo no es `creado_en::date`.** Es `fecha_operativa`, calculada
    con la hora de corte del restaurante. La del **cobro** es la que cuenta como
    venta (el dinero entra al cobrar, y el cierre de caja tiene que cuadrar con
@@ -78,11 +98,13 @@ type EstadoReservacion = 'pendiente' | 'confirmada' | 'sentada' | 'completada'
 type OrigenReservacion = 'personal' | 'enlace_publico';
 type TipoComanda       = 'mesa' | 'para_llevar';
 /// DERIVADO por el trigger `comanda_estado`; la app escribe los hechos, no esto.
-///   pendiente  = en la cola de despacho          (despachadaEn = null)
-///   despachada = salió de cocina, cobrable       (despachadaEn ≠ null)
-///   cobrada    = cubierta por un Cobro           (cobroId ≠ null)
-///   anulada    = descartada                      (anuladaEn ≠ null)
-type EstadoComanda     = 'pendiente' | 'despachada' | 'cobrada' | 'anulada';
+///   pendiente       = en la cola de despacho            (despachadaEn = null)
+///   despachada      = salió de cocina, nada facturado   (despachadaEn ≠ null)
+///   cobrada_parcial = algunas líneas facturadas y otras vivas sin factura
+///                     (cobro dividido, o línea agregada después de cobrar)
+///   cobrada         = todas sus líneas vivas están facturadas
+///   anulada         = descartada                        (anuladaEn ≠ null)
+type EstadoComanda     = 'pendiente' | 'despachada' | 'cobrada_parcial' | 'cobrada' | 'anulada';
 /// `EstadoComandaItem` DESAPARECIÓ: no hay workflow por línea, la comanda se
 /// despacha entera. Una línea anulada se reconoce por `canceladoEn != null`.
 type DestinoPreparacion= 'cocina' | 'barra' | 'ninguno';
@@ -245,100 +267,152 @@ PK compuesta `(plantillaId, mesaId)`.
 > comprobarlo antes en la aplicación (aunque sí conviene para dar buen mensaje):
 > hay que **capturar el error `23P01`** y devolver 409.
 
+### 2.8b Cliente — la unidad de cobro          *(añadido 2026-11-05)*
+
+Una **visita**: quién consume, dónde está sentado y qué debe. No es un CRM de
+clientes frecuentes. Abierto ⟺ `cerradoEn == null` (no hay enum de estado).
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `id`, `restauranteId` | uuid | |
+| `nombre` | string | Trim, no vacío (CHECK `cliente_nombre_normalizado`), máx. 120 en el DTO |
+| `mesaId` | uuid? | Dónde está sentado AHORA. NULL = sin mesa (barra, de pie, para llevar) |
+| `reservacionId` | uuid? | La reserva que lo trajo. A lo sumo UN cliente abierto por reserva (`cliente_reservacion_abierta_unica`) |
+| `fechaOperativa` | date | Día operativo de apertura |
+| `creadoPorId?`, `creadoEn` | | |
+| `cerradoEn?`, `cerradoPorId?` | | Cerrado ⟺ `cerradoEn != null` |
+
+- **No se cierra con deuda** (trigger `cliente_cierre_sin_deuda`) y **no se le anota
+  deuda cerrado** (`cliente_cerrado`): el servidor da el 409 con mensaje; la base es
+  la red. Reabrir = `cerradoEn = NULL` (`POST /clientes/:id/reabrir`).
+- Dos clientes en la misma mesa son legales. La mesa no tiene "historial de
+  asiento" propio: cada cambio de `mesaId` queda en la bitácora y cada comanda
+  congela la mesa donde se sirvió.
+- **Deuda viva** = líneas con `cobroId = null`, `canceladoEn = null` y deudor = el
+  cliente, en comandas no anuladas. Lo que sigue en cocina cuenta.
+
 ### 2.9 Comanda — UN PEDIDO
 
 | Campo | Tipo | Notas |
 |---|---|---|
 | `id`, `restauranteId` | uuid | |
-| `tipo` | TipoComanda | `mesa` exige `mesaId`+`salonId`+`plantillaId`; `para_llevar` exige `mesaId` NULL |
-| `salonId`, `mesaId`, `plantillaId` | uuid? | |
-| `reservacionId` | uuid? | La reserva que originó el pedido. **1:N**: una reserva genera tantas comandas como rondas pida la mesa |
+| `clienteId` | uuid | **OBLIGATORIO.** Para quién se pidió (lo que lee cocina). Quién DEBE cada línea es `comandaItem.clienteId` (igual salvo reasignación) |
+| `tipo` | TipoComanda | `mesa` = en el local, **con o sin mesa** asignada; `para_llevar` exige `mesaId` NULL. Con mesa, exige `salonId`+`plantillaId` |
+| `salonId`, `mesaId`, `plantillaId` | uuid? | **FOTO** de dónde estaba sentado el cliente al pedir. NULL si no tenía mesa |
 | `numeroDia` | int | Número visible del pedido. Único por `(restaurante, fechaOperativa)` |
-| `fechaOperativa` | date | Día contable **del pedido**. No es el de la venta: ese es `cobro.fechaOperativa` |
-| `turno` | TurnoServicio | Ídem |
+| `fechaOperativa`, `turno` | | Día contable **del pedido**. No es el de la venta: ese es `cobro.fechaOperativa` |
 | `comensales` | int | |
 | `meseroId` | uuid? | |
-| `clienteNombre?` | string | Lo que escribió el mesero (trim, máx. 120 en el DTO). NULL = no lo dijo |
 | `estado` | EstadoComanda | **DERIVADO** por trigger. No se escribe |
 | `despachadaEn?` | datetime | La cocina lo sacó. NULL = sigue en la cola |
-| `anuladaEn?` | datetime | Descartado |
-| `cobroId?` | uuid | La factura que lo cubre. NULL = sigue en la cuenta viva de la mesa |
-| `total` | decimal | USD. **Sólo la suma de sus líneas vivas.** Lo recalcula el servidor |
-| `anuladaPorId?`, `motivoAnulacion?` | | |
-| `notas?` | | |
+| `anuladaEn?` | datetime | Descartado. Imposible si alguna línea tiene factura |
+| `total` | decimal | USD. **DERIVADO**: suma de sus líneas vivas (facturadas o no). Lo recalcula el trigger |
+| `anuladaPorId?`, `motivoAnulacion?`, `notas?` | | |
+| `reservacionId?`, `clienteNombre?` | | **LEGADO** (histórico). La autoridad es el cliente; no decidir con estas columnas |
 
-> **Lo que se fue de aquí y por qué.** `ronda` (la ronda ES la comanda);
-> `abiertaEn`/`cerradaEn` (los sustituyen los tres timestamps de hecho);
-> `subtotal`/`descuento`/`impuesto`/`propina` y `tasaId`/`tasaValor`/`totalBs`
-> (se negocian sobre la cuenta de la mesa y viven en `Cobro` — un ticket de
-> cocina no tiene propina).
+> **Lo que se fue de aquí:** `cobroId` (la factura vive en la LÍNEA);
+> `ronda`, `abiertaEn`/`cerradaEn`, `subtotal`/`descuento`/`impuesto`/`propina`
+> y `tasa*` (viven en `Cobro`).
 >
-> **Invariantes que la base hace cumplir:** no se cobra lo que no salió de
-> cocina (`comanda_cobro_tras_despacho`); una comanda cobrada no se anula ni al
-> revés (`comanda_anulada_no_cobrada`).
+> **Invariantes que la base hace cumplir:** no se factura lo que no salió de cocina
+> (`comanda_cobro_tras_despacho`); una comanda con líneas facturadas no se anula
+> (`comanda_anulada_no_cobrada`); una comanda anulada no admite cambios en sus
+> líneas (`comanda_item_comanda_anulada`).
 
 ### 2.10 ComandaItem
 
 `id`, `restauranteId`, `comandaId`, `productoId`, `orden`, `nombreSnap`,
 `precioUnitarioSnap`, `destinoSnap`, `cantidad`, `descuentoLinea`, `totalLinea`,
-`nota?`, `canceladoEn?`, `canceladoPorId?`, `motivoCancelacion?`.
+`nota?`, `canceladoEn?`, `canceladoPorId?`, `motivoCancelacion?`, y desde 2026-11-05:
 
-> Los `*Snap` son **obligatorios**: el ticket de hoy tiene que poder
-> reimprimirse idéntico dentro de un año aunque el producto haya cambiado de
-> precio o de nombre. Nunca leer el precio actual del producto para un reporte
-> histórico.
+| Campo | Tipo | Notas |
+|---|---|---|
+| `clienteId` | uuid | El **DEUDOR**. Nace igual al cliente de la comanda; reasignar deuda es cambiar esto (sólo sin factura) |
+| `cobroId?` | uuid | La **factura** que cubre la línea. NULL = deuda viva. Una línea está en a lo sumo UNA factura (es una columna). Una línea facturada que luego se anula **conserva** su `cobroId` (traza) y deja de sumar |
+
+> Los `*Snap` son **obligatorios**: el ticket de hoy tiene que poder reimprimirse
+> idéntico dentro de un año aunque el producto haya cambiado de precio o de
+> nombre. Nunca leer el precio actual del producto para un reporte histórico.
+> `totalLinea = round(cantidad × precioUnitarioSnap − descuentoLinea, 4)` (CHECK).
 >
-> **Anulada ⟺ `canceladoEn != null`.** Se fueron `estado`, `ronda`, `enviadoEn`
-> y `servidoEn`: sin workflow por ítem no había quién los moviera.
+> **Anulada ⟺ `canceladoEn != null`.** No hay workflow por ítem.
 >
-> ⚠️ **Sólo se pueden tocar mientras la comanda esté `pendiente`.** Lo impide el
-> trigger `comanda_item_solo_pendiente` (→ 409), y cubre las tres reglas: se
-> anula una línea antes de despachar; no se le añaden líneas a un pedido que ya
-> salió (rompería el FIFO); no se toca nada de una comanda ya cobrada.
+> ⭐ **Editables también después de despachar** (trigger `comanda_item_editable`,
+> que sustituye a `comanda_item_solo_pendiente`): agregar, cambiar `cantidad`/`nota`
+> y anular líneas de comandas `pendiente`, `despachada`, `cobrada_parcial` y
+> `cobrada`. Una línea **agregada a una comanda ya despachada NO vuelve a cocina**.
+> Sigue prohibido tocar una comanda anulada, facturar lo que sigue en cocina o una
+> línea cancelada, y tocar (salvo la nota) las líneas de una factura anulada.
+> Toda línea cambiada después del despacho queda en `bitacora`.
+>
+> **Partir una línea**: cobrar o reasignar 2 de 3 unidades deja la original con 1 y
+> crea una línea nueva con 2 (mismos snapshots, misma comanda). La suma de
+> unidades se conserva.
 
 ### 2.11 Cobro — LA FACTURA
 
-La cuenta consolidada de una mesa. Reúne N comandas despachadas vía
-`comanda.cobroId`.
+La factura de **algunas (o todas) las líneas de UN cliente**, cobradas juntas.
+Cubre líneas vía `comandaItem.cobroId`, no comandas.
 
 | Campo | Tipo | Notas |
 |---|---|---|
 | `id`, `restauranteId` | uuid | |
-| `mesaId?`, `salonId?` | uuid | NULL en un cobro para llevar. Con mesa, exige salón |
+| `clienteId` | uuid | **OBLIGATORIO.** A quién se le cobra; las líneas facturadas son suyas (FK compuesta) |
+| `mesaId?`, `salonId?` | uuid | Dónde estaba sentado al cobrar (foto). NULL = sin mesa. Con mesa, exige salón |
 | `numeroDia` | int | Número visible de la factura del día. Contador propio, distinto del de la comanda |
-| `fechaOperativa`, `turno` | | **Los del cobro**: la venta se cuenta cuando entra el dinero |
+| `fechaOperativa`, `turno` | | **Los del cobro**: la venta se cuenta cuando entra el dinero. **Nunca cambian** (`cobro_fecha_inmutable`) |
 | `comensales` | int | El máximo de las comandas cubiertas |
-| `clienteNombre?` | string | Nombre **congelado** en la factura (lo que se imprime/reimprime). NULL = "Consumidor final". Ver DECISIONES-DATOS §14 |
-| `subtotal`, `descuento`, `impuesto`, `propina`, `total` | decimal | USD. Los calcula **el servidor** |
+| `clienteNombre?` | string | Nombre **congelado** en la factura. NULL = "Consumidor final". Por defecto el del cliente; el cajero puede mandar otro |
+| `subtotal`, `descuento`, `impuesto`, `propina`, `total` | decimal | USD. Los calcula **el servidor**; la base los verifica al COMMIT |
 | `tasaId`, `tasaValor`, `totalBs` | | **NOT NULL**: congelados al emitir, para reimprimir el mismo monto en Bs |
 | `cobradoEn`, `cobradoPorId?` | | |
-| `anuladoEn?`, `anuladoPorId?`, `motivoAnulacion?` | | |
-| `notas?` | | |
+| `anuladoEn?`, `anuladoPorId?`, `motivoAnulacion?`, `notas?` | | |
 
-> **Es un comprobante INTERNO de cobro, no un documento fiscal**: sin RIF, sin
-> IVA discriminado, sin correlativo SENIAT. Si algún día hace falta el fiscal,
-> entra como entidad aparte que apunta a ésta.
+> **Es un comprobante INTERNO de cobro, no un documento fiscal.**
 >
-> No hay tabla puente comanda↔cobro: es una FK simple. El **cobro parcial** se
-> decide a nivel de API (`comandaIds[]`), no de esquema.
+> ⭐ **Verificada entera al COMMIT** (constraint trigger diferido `cobro_coherente`):
+> cubre al menos una línea viva (`cobro_no_vacio`: la factura fantasma de dos
+> cajeros), `subtotal` = Σ `totalLinea` de sus líneas vivas, `total` = subtotal −
+> descuento + impuesto + propina, `totalBs` = round(total × tasa, 4) ± 0,01, y
+> Σ pagos = `total` ± 0,01 (`cobro_pagos_cuadran`). El servidor ya lo calcula todo
+> bien; esto es la red.
 >
-> ⚠️ Un cobro **siempre** cubre al menos una comanda: lo garantiza el constraint
-> trigger diferido `cobro_no_vacio`, que revienta en el COMMIT. Es la red contra
-> la factura fantasma de dos cajeros cobrando la misma mesa a la vez.
+> **Se corrige en cualquier día** (decisión del dueño), con bitácora; lo que no
+> cambia nunca es su día ni su número. Una **anulada** es inmutable. Efecto en
+> reportes: ver §5 · Reportes (`cierre-caja`).
+>
+> **No hay "saldo pendiente" en una factura**: lo que no se cobra es deuda del
+> cliente (líneas sin factura), nunca un hueco en una factura emitida.
 
-### 2.12 CobroPago
+### 2.12 CobroPago — libro de SÓLO AGREGAR
 
 `id`, `restauranteId`, `cobroId`, `metodo: MetodoPago`, `moneda: Moneda`,
 `monto` (en esa moneda), `tasaAplicada?`, `montoUsd`, `referencia?`,
-`recibidoEn`, `registradoPorId?`.
+`recibidoEn`, `registradoPorId?`, y desde 2026-11-05 `fechaOperativa`.
 
-*(Se llamaba `ComandaPago` y colgaba de la comanda; ahora cuelga de la factura.)*
-
-Reglas que **la base** hace cumplir:
+- **Un pago registrado no se edita ni se borra** (`cobro_pago_inmutable`; sólo la
+  `referencia` se puede corregir). Si la factura cambia, se compensa con otra fila.
+- **Devolución = fila con `monto` y `montoUsd` NEGATIVOS**, por el método por el que
+  sale el dinero. Nunca 0 (`cobro_pago_monto_valido`). En Bs usa la tasa
+  **congelada de la factura**, no la del día.
+- `fechaOperativa` = el día operativo en que el dinero **entró o salió** (lo pone la
+  base desde `recibidoEn`), no el de la factura: una devolución de hoy sobre una
+  factura de ayer cuadra la caja de HOY.
+- No se aceptan pagos en facturas anuladas.
 - `pago_movil` y `transferencia` exigen `referencia` no vacía (conciliación bancaria).
 - `moneda = 'BS'` exige `tasaAplicada`; `moneda = 'USD'` exige que sea NULL.
-- Varias filas por cobro: el pago mixto (mitad efectivo USD, mitad pago móvil)
-  es lo normal, no la excepción.
+- Varias filas por cobro: el pago mixto es lo normal, no la excepción.
+
+### 2.12b Bitacora (sólo lectura; no hay endpoint todavía)
+
+`id`, `restauranteId`, `tabla` (`'comanda_item' | 'cobro' | 'cliente'`),
+`entidadId`, `operacion` (`INSERT | UPDATE`), `cambios: string[]`, `antes`, `despues`
+(jsonb, claves snake_case), `usuarioId`, `motivo?`, `creadoEn`. La escriben
+**triggers**: líneas agregadas/cambiadas después del despacho, toda corrección de
+una factura, y cambios de nombre/mesa/cierre de un cliente. Sin autor, la
+transacción revienta (`bitacora_sin_autor`, 500): el servicio lo fija con
+`set_config('app.usuario_id', …, true)` como PRIMERA sentencia de cada transacción
+que escriba (`src/comun/prisma/autor.ts`). Inmutable.
 
 ### 2.13 TasaCambio / ContadorDia / ResumenDia
 
@@ -384,84 +458,122 @@ Reglas que **la base** hace cumplir (verificadas, ver §10 de DECISIONES-DATOS):
 
 Todos van en **una transacción**.
 
+### 3.0 Autor de toda escritura
+
+Toda transacción que escriba abre con
+`SELECT set_config('app.usuario_id', $usuario, true)` (y `app.motivo` si la
+operación lo trae): sin eso los triggers de bitácora revientan. Es `SET LOCAL`:
+muere con la transacción.
+
 ### 3.1 Tomar un pedido (POST /comandas)
 
 No hay estado borrador: la comanda **nace ya en la cola de despacho**, con sus
 líneas, en una sola transacción. "Crear" y "enviar a cocina" son el mismo acto,
-porque cada envío es una comanda nueva. Por eso `items` es obligatorio y con al
-menos uno — una comanda vacía sería un ticket en blanco en la pantalla del KDS.
+porque cada envío es una comanda nueva.
 
 ```
-1. Resolver fechaOperativa y turno:
-     SELECT hayai_fecha_operativa(now(), r.zona_horaria, r.hora_corte_dia),
-            hayai_turno(now(), r.zona_horaria)
-   (usar las funciones SQL, NO reimplementar la regla en TypeScript)
-2. Reservar número visible, atómico:
-     INSERT INTO contador_dia (restaurante_id, fecha_operativa, ultimo_comanda, ultimo_cobro)
-     VALUES ($1, $2, 1, 0)
-     ON CONFLICT (restaurante_id, fecha_operativa)
-     DO UPDATE SET ultimo_comanda = contador_dia.ultimo_comanda + 1
-     RETURNING ultimo_comanda;
-   (nunca MAX(numero_dia)+1: duplica números con dos meseros a la vez)
-3. INSERT comanda (plantillaId = plantilla activa del salón). NO se manda
-   `estado`: lo deriva el trigger. Sin timestamps, nace 'pendiente'.
-   ⚠️ Ya NO hay 409 por mesa ocupada: la mesa acepta N comandas vivas.
-4. INSERT de las líneas + recalcular `comanda.total`.
-5. Si viene de reserva: UPDATE reservacion SET estado='sentada' (idempotente).
+1. Autor (3.0). Cliente de la sesión: existe, es del restaurante y está ABIERTO (409 si cerró).
+2. Si tipo = 'mesa' y el cliente está sentado: mesa viva, en la distribución ACTIVA y no bloqueada
+   -> foto (mesaId, salonId, plantillaId). Sin mesa, o 'para_llevar': los tres NULL.
+3. fechaOperativa y turno con las funciones SQL (NO reimplementar la regla en TypeScript).
+4. Número visible, atómico: INSERT INTO contador_dia ... ON CONFLICT DO UPDATE ultimo_comanda + 1
+   (nunca MAX(numero_dia)+1).
+5. INSERT comanda (clienteId). NO se mandan `estado` ni `total`: los deriva el trigger.
+6. INSERT de las líneas con clienteId = el de la comanda y totalLinea redondeado a 4 decimales.
 ```
 
 ### 3.2 Despachar (POST /comandas/:id/despachar)
 
 ```
 UPDATE comanda SET despachada_en = now()
- WHERE id = $1 AND despachada_en IS NULL AND anulada_en IS NULL AND cobro_id IS NULL;
+ WHERE id = $1 AND despachada_en IS NULL AND anulada_en IS NULL;
 → 0 filas: 409 (ya se despachó, o está anulada). El predicado completo es lo que
   hace segura la doble pulsación de dos pantallas de cocina.
 ```
-Sale de la cola (`v_cola_despacho`), **no se borra**: queda en la cuenta
-cobrable de la mesa.
+Sale de la cola (`v_cola_despacho`), **no se borra**: sus líneas pasan a ser cobrables.
 
-### 3.3 Cobrar la mesa (POST /mesas/:mesaId/cobrar)
-
-El cobro es de la MESA, no de una comanda. Todo en una transacción:
+### 3.3 Cobrar al cliente (POST /clientes/:id/cobrar)
 
 ```sql
 BEGIN;
-SELECT id, total, comensales, reservacion_id, cliente_nombre FROM comanda
- WHERE restaurante_id=$r AND mesa_id=$m
-   AND cobro_id IS NULL AND anulada_en IS NULL AND despachada_en IS NOT NULL
-   [AND id = ANY($comandaIds)]        -- cobro parcial
- ORDER BY creada_en
- FOR UPDATE;                          -- 0 filas -> 409 "esa mesa ya fue cobrada"
+SELECT set_config('app.usuario_id', $usuario, true);          -- 3.0 (el partir una línea queda en la bitácora)
+SELECT ci.* FROM comanda_item ci JOIN comanda c ON ...
+ WHERE ci.cliente_id = $k AND ci.cobro_id IS NULL AND ci.cancelado_en IS NULL
+   AND c.despachada_en IS NOT NULL AND c.anulada_en IS NULL
+   [AND ci.id = ANY($lineaIds)]
+ ORDER BY c.creada_en, ci.orden
+ FOR UPDATE OF ci;                  -- 0 filas -> 409 ; una línea pedida que no sale -> 409
 ```
 
 ⭐ **El `FOR UPDATE` no es opcional y no se puede sustituir por un `findMany` de
-Prisma.** Es lo único que serializa a dos cajeros cobrando la misma mesa: el
-segundo espera el lock y, al reevaluar el predicado tras el COMMIT del primero,
-encuentra 0 filas. Sin él salen dos facturas parciales y la caja del turno no
-cuadra. Red de último recurso: el trigger diferido `cobro_no_vacio`.
+Prisma.** Es lo que serializa a dos cajeros: el segundo espera el lock y, al
+reevaluar el predicado tras el COMMIT del primero, ya no ve las líneas.
 
 ```
-2. Totales en el servidor desde las comandas BLOQUEADAS (jamás del cliente).
-3. Tasa vigente DEL DÓLAR y congelarla en el cobro.
-   ⚠️ `where: { restauranteId, divisa: 'USD' }`, `orderBy: [{ fecha: 'desc' },
-   { creadaEn: 'desc' }]`. Sin el filtro de divisa la consulta puede devolver
-   la cotización del EURO y convertir cada bolívar con un ~8-15 % de error.
-   La base lo rechaza (trigger `cobro_tasa_base`), pero el cobro entero revienta
-   con un 500: el filtro no es opcional. El desempate por `creadaEn` es
-   obligatorio cuando conviven varias `fuente` el mismo día (§10.6).
-4. Día operativo y turno DEL COBRO con las funciones SQL (nunca en TypeScript).
-5. Número de factura: UPSERT atómico sobre contador_dia.ultimo_cobro.
-6. INSERT cobro + UPDATE comanda SET cobro_id = $cobro WHERE id = ANY($ids).
-7. INSERT de N cobro_pago. La suma de montoUsd debe cuadrar con total.
-8. Si alguna comanda venía de una reservación y a esa reserva no le queda
-   ninguna comanda viva: estado='completada'.
+2. Totales en el servidor: subtotal = Σ de las porciones elegidas (jamás del cliente);
+   total = subtotal − descuento + impuesto(0) + propina.
+3. Tasa vigente DEL DÓLAR (`divisa: 'USD'`, orden fecha desc + creadaEn desc) y congelarla.
+   Los pagos (en USD, o Bs ÷ tasa) deben sumar el total ± 0,01.
+4. Día operativo y turno DEL COBRO (funciones SQL). Número: UPSERT atómico sobre ultimo_cobro.
+5. INSERT cobro con los totales FINALES (clienteId, foto de la mesa del cliente, clienteNombre:
+   DTO del cajero > cliente.nombre). ⚠️ NO hacer UPDATE al cobro recién creado en la misma
+   transacción: quedaría en la bitácora como una corrección.
+6. Por cada línea: entera -> UPDATE comanda_item SET cobro_id; parcial -> PARTIR (3.3c):
+   la original conserva lo no tomado y una línea nueva con la porción lleva el cobro_id.
+7. INSERT de N cobro_pago.
+8. Si `cerrarCliente` y no queda deuda de ninguna clase: cerrar al cliente (y su reserva
+   `sentada` -> `completada`).
+COMMIT;      -- aquí corre `cobro_coherente` (diferido)
+```
+
+**Lo que sigue en cocina NO se cobra**: queda como deuda del cliente. Verificación:
+`v_cobro_descuadre` debe seguir devolviendo 0 filas.
+
+### 3.3b Corregir una factura (POST /cobros/:id/corregir)
+
+> `motivo` es OPCIONAL (máx. 300): si no viene, la bitácora lo guarda vacío.
+
+```
+BEGIN; set_config(usuario, motivo);
+SELECT ... FROM cobro WHERE id = $c FOR UPDATE;               -- anulada -> 409
+SELECT ... FROM comanda_item WHERE cobro_id = $c FOR UPDATE;
+1. cambios: UPDATE de las líneas (cantidad -> totalLinea recalculado; anular -> cancelado_en + motivo).
+2. agregar: INSERT de líneas con cobro_id = $c en una comanda despachada del mismo cliente.
+3. subtotal = Σ líneas vivas (0 líneas -> 409); total y total_bs recalculados con la tasa CONGELADA.
+4. UPDATE cobro (una sola vez).
+5. diferencia = total nuevo − Σ monto_usd ya registrado. Los `pagos` del DTO (Bs ÷ tasa congelada)
+   deben sumarla ± 0,01 (si no, 422 { diferenciaUsd }); ningún método/moneda queda en negativo (422).
+6. INSERT de los pagos (+ cobro adicional, − devolución).
 COMMIT;
 ```
 
-**Lo que sigue en cocina NO se cobra** (CHECK `comanda_cobro_tras_despacho`): se
-queda vivo y arranca la cuenta siguiente de la mesa. Es la regla que confirmó el
-dueño. Verificación: `v_cobro_descuadre` debe seguir devolviendo 0 filas.
+### 3.3c Partir una línea y reasignar deuda (POST /clientes/:id/reasignar)
+
+```
+parcial (cantidad < línea.cantidad):
+  UPDATE comanda_item SET cantidad = resto, total_linea = round(resto × precio − desc_resto, 4) WHERE id = $l;
+  INSERT comanda_item (mismos snapshots, misma comanda, cantidad = tomada, total_linea = round(...),
+                       cliente_id = destino | cobro_id = factura);
+  -- el descuento de línea, si lo hay, se reparte proporcional a la cantidad.
+entera:  UPDATE comanda_item SET cliente_id = $destino  (reasignar)  |  SET cobro_id = $c  (cobrar)
+```
+Las líneas se bloquean con el mismo `FOR UPDATE` que el cobro (aquí también las que siguen
+en cocina). Una línea facturada no cambia de deudor: lo impide la FK compuesta
+`comanda_item_restaurante_id_cobro_id_cliente_id_fkey` (→ 409).
+
+### 3.3d Sentar, mover, liberar y cerrar un cliente
+
+```
+sentar/mover: mesa viva en la distribución activa y no bloqueada; UPDATE cliente SET mesa_id;
+              UPDATE comanda SET mesa/salón/plantilla WHERE cliente_id = $k AND despachada_en IS NULL
+              (las despachadas conservan donde se sirvieron).
+liberar:      UPDATE cliente SET mesa_id = NULL (+ las comandas en cocina quedan sin mesa).
+cerrar:       sin deuda de ninguna clase (409 si debe); UPDATE cliente SET cerrado_en, cerrado_por_id;
+              si venía de una reserva 'sentada' -> 'completada'.
+reabrir:      UPDATE cliente SET cerrado_en = NULL.
+sentar reserva / check-in: updateMany condicionado al estado + INSERT cliente (atómico: el doble toque da 409).
+cancelar / no-show de una reserva 'sentada': cierra a su cliente abierto (409 si debe).
+```
 
 ### 3.4 Clonar una plantilla
 
@@ -513,10 +625,22 @@ El backend **debe** capturarlos; son reglas de negocio, no fallos técnicos.
 | `23505` | `mesa_etiqueta_unica` | 409 | "Ya existe una mesa con ese número" |
 | `23505` | `comanda_numero_dia_unico` | 500 | Bug: el número se pidió sin el contador |
 | `23505` | `cobro_numero_dia_unico` | 500 | Bug: el número de factura se pidió sin el contador |
-| `23514` | `comanda_item_solo_pendiente` | **409** | "Esa comanda ya salió de cocina o se cobró: sus líneas no se pueden cambiar" |
 | `23514` | `comanda_cobro_tras_despacho` | **409** | "No se puede cobrar una comanda que la cocina todavía no despachó" |
-| `23514` | `comanda_anulada_no_cobrada` | **409** | "Una comanda cobrada no se puede anular, ni una anulada cobrar" |
-| `23514` | `cobro_no_vacio` | **409** | "Esa cuenta ya la cobró otro cajero" — la factura fantasma, detectada en el COMMIT |
+| `23514` | `comanda_anulada_no_cobrada` | **409** | "Esa comanda tiene líneas facturadas: corrige las facturas antes de anularla" |
+| `23514` | `cliente_cerrado` | **409** | "Ese cliente ya cerró su cuenta: reábrelo para anotarle consumo" |
+| `23514` | `cliente_cierre_sin_deuda` | **409** | "El cliente todavía debe consumo: cóbralo, reasígnalo o cancélalo antes de cerrarlo" |
+| `23505` | `cliente_reservacion_abierta_unica` | **409** | "Esa reserva ya está sentada" |
+| `23514` | `cliente_nombre_normalizado` | 422 | "El nombre del cliente no puede estar vacío" |
+| `23514` | `comanda_item_comanda_anulada` | **409** | "Esa comanda está anulada" |
+| `23514` | `comanda_item_factura_linea_viva` | **409** | "Esa línea está cancelada" |
+| `23503` | `comanda_item_restaurante_id_cobro_id_cliente_id_fkey` | **409** | "Esa línea ya está facturada: desfactúrala antes de reasignarla" |
+| `23514` | `cobro_no_vacio` | **409** | "Esa cuenta ya la cobró otro cajero, o la factura se quedó sin líneas (una factura sin líneas se anula)" — detectada en el COMMIT |
+| `23514` | `cobro_pagos_cuadran` | 422 | "Los pagos no cuadran con el nuevo total: registra el cobro o la devolución de la diferencia" |
+| `23514` | `cobro_anulado_inmutable` | **409** | "Esa factura está anulada" |
+| `23514` | `cobro_pago_inmutable` | **409** | "Un pago registrado no se edita: registra una devolución" |
+| `23514` | `cobro_pago_monto_valido` | 422 | "El monto no puede ser 0" |
+| `23514` | `comanda_item_comanda_fija`, `comanda_item_total_coherente`, `cobro_subtotal_coherente`, `cobro_total_coherente`, `cobro_fecha_inmutable`, `bitacora_sin_autor`, `bitacora_inmutable` | **500** | Bug del servidor: nunca debería verlo un usuario |
+| — | ~~`comanda_item_solo_pendiente`~~, ~~`cobro_dia_abierto`~~ | — | **Ya no existen**: se editan líneas después de despachar y se corrigen facturas de cualquier día |
 | `23514` | `cobro_totales_validos` / `cobro_tipo_coherente` | 422 | Según el constraint |
 | `23514` | `cobro_pago_referencia_obligatoria` | 422 | "Pago móvil y transferencia exigen referencia" |
 | `23514` | `cobro_pago_tasa_coherente` | 422 | "Un pago en Bs exige la tasa aplicada; uno en USD no debe llevarla" |
@@ -582,6 +706,16 @@ todas las pantallas y que el ROL restringe: `POST /tasa` y
 | POST | /auth/login | `@Publico` |
 | POST | /auth/pin | `@Publico` |
 | GET | /auth/yo | `@Comun` |
+| POST | /clientes | `@Modulo('mesero','mesas')` |
+| GET | /clientes | `@Modulo('mesero','mesas','por_cobrar')` |
+| GET | /clientes/deudas | `@Modulo('por_cobrar','mesas')` |
+| GET | /clientes/:id | `@Modulo('mesero','mesas','por_cobrar')` |
+| POST | /clientes/:id/sentar | `@Modulo('mesas','mesero')` |
+| POST | /clientes/:id/liberar | `@Modulo('mesas','mesero')` |
+| POST | /clientes/:id/cerrar | `@Modulo('mesas','por_cobrar')` |
+| POST | /clientes/:id/reabrir | `@Modulo('mesas','por_cobrar')` |
+| POST | /clientes/:id/reasignar | `@Modulo('mesero','mesas','por_cobrar')` |
+| POST | /clientes/:id/cobrar | `@Modulo('mesas','por_cobrar')` |
 | GET | /categorias | `@Modulo('mesero','productos')` |
 | POST | /categorias | `@Modulo('productos')` |
 | DELETE | /categorias/:id | `@Modulo('productos')` |
@@ -589,14 +723,14 @@ todas las pantallas y que el ROL restringe: `POST /tasa` y
 | GET | /cobros?fecha= | `@Modulo('ventas')` |
 | GET | /cobros/:id | `@Modulo('mesas','por_cobrar','ventas')` |
 | POST | /cobros/:id/anular | `@Modulo('por_cobrar')` |
+| POST | /cobros/:id/corregir | `@Modulo('por_cobrar','ventas')` |
 | POST | /comandas | `@Modulo('mesero')` |
-| GET | /comandas/:id | `@Modulo('mesero','despacho','mesas','por_cobrar')` |
+| GET | /comandas/:id | `@Modulo('mesero','despacho','mesas','por_cobrar','ventas')` |
 | POST | /comandas/:id/anular | `@Modulo('despacho')` |
 | POST | /comandas/:id/despachar | `@Modulo('despacho')` |
-| POST | /comandas/:id/items | `@Modulo('mesero')` |
-| DELETE | /comandas/:id/items/:itemId | `@Modulo('despacho')` |
-| PATCH | /comandas/:id/items/:itemId | `@Modulo('mesero')` |
-| POST | /comandas/:id/mover | `@Modulo('mesas','mesero')` |
+| POST | /comandas/:id/items | `@Modulo('mesero','por_cobrar')` |
+| DELETE | /comandas/:id/items/:itemId | `@Modulo('despacho','mesero','por_cobrar')` |
+| PATCH | /comandas/:id/items/:itemId | `@Modulo('mesero','por_cobrar')` |
 | GET | /cuentas-por-cobrar | `@Modulo('por_cobrar')` |
 | GET | /despacho/cola | `@Modulo('despacho')` |
 | GET | /mesas | `@Comun` |
@@ -604,8 +738,7 @@ todas las pantallas y que el ROL restringe: `POST /tasa` y
 | DELETE | /mesas/:id | `@Modulo('mesas')` |
 | GET | /mesas/:id | `@Modulo('mesas')` |
 | PATCH | /mesas/:id | `@Modulo('mesas')` |
-| POST | /mesas/:mesaId/cobrar | `@Modulo('mesas','por_cobrar')` |
-| GET | /mesas/:mesaId/cuenta | `@Modulo('mesas','por_cobrar')` |
+| GET | /mesas/:mesaId/cuenta | `@Modulo('mesas','por_cobrar','mesero')` |
 | GET | /plano | `@Comun` |
 | DELETE | /plantillas/:id | `@Modulo('mesas')` |
 | GET | /plantillas/:id | `@Comun` |
@@ -767,9 +900,9 @@ POST   /reservaciones              { salonId, mesaId?, clienteNombre, clienteTel
 GET    /reservaciones/:id                                        -> Reservacion
 PATCH  /reservaciones/:id          { ...campos editables }       -> Reservacion
 POST   /reservaciones/:id/confirmar                              -> Reservacion
-POST   /reservaciones/:id/cancelar { motivo }                    -> Reservacion
-POST   /reservaciones/:id/no-show                                -> Reservacion
-POST   /reservaciones/:id/sentar   { mesaId?, comensales? }      -> { reservacion, comanda }
+POST   /reservaciones/:id/cancelar { motivo }                    -> Reservacion   // si estaba 'sentada', cierra a su cliente (409 si debe)
+POST   /reservaciones/:id/no-show                                -> Reservacion   // ídem
+POST   /reservaciones/:id/sentar   { mesaId?, comensales? }      -> { reservacion, cliente }   // abre el CLIENTE sentado (nombre = el de la reserva); doble toque -> 409
 GET    /reservaciones/:id/qr                                     -> image/png
 GET    /reservaciones/huerfanas                                  -> Reservacion[]  (vista v_reservacion_huerfana)
 ```
@@ -781,7 +914,7 @@ POST   /publico/r/:slug/reservaciones { clienteNombre, clienteTelefono, personas
                                                                  -> { codigoPublico, codigoCorto, qrUrl }
 GET    /publico/reserva/:codigoPublico                           -> ReservacionPublica
 POST   /publico/reserva/:codigoPublico/mesa    { mesaId }        -> ReservacionPublica
-POST   /publico/reserva/:codigoPublico/checkin                   -> ReservacionPublica
+POST   /publico/reserva/:codigoPublico/checkin                   -> ReservacionPublica   // abre el cliente sentado; no lo expone
 ```
 > `ReservacionPublica` NO expone ids internos de otras reservas ni datos de otros
 > clientes: sólo la propia reserva y las mesas **disponibles** de la plantilla activa.
@@ -851,51 +984,273 @@ producto.
 > documentada D.A.N.I para que el dueño del producto la tome antes de
 > considerar esto listo para producción.
 
-### Comandas, despacho y cobro
+### Clientes, comandas, despacho y cobro          *(reescrito 2026-11-05)*
+
+Se cobra al **CLIENTE** (una visita), por **líneas**. Léelo así:
+
 ```
-POST   /comandas                   { tipo, mesaId?, comensales?, reservacionId?, notas?,
-                                     items: [{ productoId, cantidad, nota? }] }  -> Comanda & { items }
-                                   (items OBLIGATORIO, min 1: nace ya en la cola)
-GET    /comandas/:id                                             -> Comanda & { items, mesa, cobro }
-POST   /comandas/:id/items         { items: [{ productoId, cantidad, nota? }] } -> ComandaItem[]
+cliente ─┬─ 1..N comandas (lo que pidió; la cocina las despacha)
+         └─ N líneas = lo que DEBE   (comanda_item.clienteId, cobroId = null)
+                                      └─ al cobrar, las elegidas pasan a una factura (cobroId)
+```
+
+- La **mesa** es sólo dónde está sentado el cliente (opcional). La mesa está
+  ocupada ⟺ hay un cliente ABIERTO sentado en ella; se libera al cerrarlo, moverlo
+  o liberarlo. Dos clientes en la misma mesa son legales (cuentas separadas).
+- **Deuda** = líneas vivas sin factura, de comandas no anuladas. Lo que sigue en
+  cocina cuenta como deuda pero **no se puede cobrar** hasta que se despache.
+- Todo lo que se escribe aquí queda con **autor** en la bitácora (el servidor lo
+  fija desde la sesión; el frontend no manda nada para eso).
+
+#### Formas
+
+```ts
+interface Cliente {
+  id: string; restauranteId: string;
+  nombre: string;                 // trim, 1-120
+  mesaId: string | null;          // dónde está sentado AHORA (null = sin mesa)
+  reservacionId: string | null;   // la reserva que lo trajo
+  fechaOperativa: string;         // día operativo de apertura
+  creadoPorId: string | null; creadoEn: string;
+  cerradoEn: string | null; cerradoPorId: string | null;   // cerrado ⟺ cerradoEn != null
+}
+
+/** Fila de `v_cuenta_cliente` (snake_case, igual que el plano): UN cliente ABIERTO. */
+interface CuentaCliente {
+  restaurante_id: string; cliente_id: string; cliente_nombre: string;
+  mesa_id: string | null; mesa_etiqueta: string | null; salon_id: string | null; salon_nombre: string | null;
+  sentado: boolean; reservacion_id: string | null; fecha_operativa: string;
+  mesero_id: string | null; ocupada_desde: string; minutos_ocupada: number;
+  comandas: number; comandas_por_cobrar: number; comandas_en_cocina: number;
+  lineas_por_cobrar: number;
+  cuenta_total: string;       // toda su deuda viva (cocina + despachado)
+  total_por_cobrar: string;   // lo facturable YA (despachado)
+  total_en_cocina: string;
+  comensales: number;
+  facturas: number; total_cobrado: string;   // facturas vivas de esta visita
+}
+
+interface Comanda {            // ComandaItem en `items`
+  id: string; tipo: 'mesa' | 'para_llevar';
+  clienteId: string;           // OBLIGATORIO
+  mesaId: string | null; salonId: string | null; plantillaId: string | null;  // FOTO al pedir; null si no estaba sentado
+  numeroDia: number; fechaOperativa: string; turno: TurnoServicio; comensales: number; meseroId: string | null;
+  estado: 'pendiente' | 'despachada' | 'cobrada_parcial' | 'cobrada' | 'anulada';   // DERIVADO
+  despachadaEn: string | null; anuladaEn: string | null;
+  total: string;               // suma de sus líneas vivas (facturadas o no)
+  notas: string | null;
+  /* LEGADO (sólo lectura, no decidir con ellos): reservacionId, clienteNombre */
+}
+interface ComandaItem {
+  id: string; comandaId: string; productoId: string; orden: number;
+  clienteId: string;           // el DEUDOR (= el de la comanda salvo reasignación)
+  cobroId: string | null;      // la factura que la cubre; null = deuda viva
+  nombreSnap: string; precioUnitarioSnap: string; destinoSnap: DestinoPreparacion;
+  cantidad: string; descuentoLinea: string; totalLinea: string; nota: string | null;
+  canceladoEn: string | null; canceladoPorId: string | null; motivoCancelacion: string | null;
+}
+
+/** `cobroId` NUNCA existe en Comanda: la factura vive en la línea. */
+interface Cobro {
+  id: string; clienteId: string;          // OBLIGATORIO
+  mesaId: string | null; salonId: string | null;   // dónde estaba sentado al cobrar (foto)
+  numeroDia: number; fechaOperativa: string; turno: TurnoServicio; comensales: number;
+  clienteNombre: string | null;           // CONGELADO en la factura; null = "Consumidor final"
+  subtotal: string; descuento: string; impuesto: string; propina: string; total: string;   // USD
+  tasaId: string; tasaValor: string; totalBs: string;
+  cobradoEn: string; cobradoPorId: string | null;
+  anuladoEn: string | null; anuladoPorId: string | null; motivoAnulacion: string | null;
+}
+/** Lo que devuelven GET /cobros, GET /cobros/:id, el cobro y la corrección. */
+type CobroDetalle = Cobro & {
+  pagos: CobroPago[];                       // en orden; las devoluciones son pagos con monto < 0
+  lineas: (ComandaItem & { comanda: { id: string; numeroDia: number } })[];   // incluye las anuladas después (canceladoEn != null: ya no suman)
+  cliente: { id: string; nombre: string; mesaId: string | null; cerradoEn: string | null };
+  mesa: Mesa | null;
+};
+
+interface PagoInput { metodo: MetodoPago; moneda: Moneda; monto: number; referencia?: string }   // monto > 0
+```
+
+#### Clientes
+
+```
+POST   /clientes                   { nombre, mesaId? }                    -> Cliente            201
+       // mesaId = sentarlo (mesa viva, en la distribución ACTIVA, no bloqueada); omitido = sin mesa.
+GET    /clientes?mesaId=&sinMesa=true                                     -> CuentaCliente[]    // abiertos, por orden de llegada
+GET    /clientes/deudas                                                   -> CuentaCliente[]    // abiertos con cuenta_total > 0 (incluye lo que está en cocina)
+GET    /clientes/:id                                                      -> { cliente, cuenta: CuentaCliente | null, lineas: (ComandaItem & { comanda }) [], facturas: FacturaResumen[] }
+       // `lineas` = lo que DEBE (sin factura, sin cancelar). `cuenta` es null si ya cerró.
+POST   /clientes/:id/sentar        { mesaId }                             -> Cliente            201
+       // Sienta (si no tenía mesa) o MUEVE (si tenía). Sus comandas que siguen en cocina se mudan con él;
+       // las ya despachadas conservan la mesa donde se sirvieron.
+POST   /clientes/:id/liberar                                              -> Cliente            201   // se levanta; sigue abierto (y debiendo)
+POST   /clientes/:id/cerrar                                               -> Cliente            201   // 409 si debe algo (incluso en cocina)
+POST   /clientes/:id/reabrir                                              -> Cliente            201   // para anotarle consumo a quien ya cerró
+POST   /clientes/:id/reasignar     { lineas: [{ lineaId, cantidad? }],
+                                     clienteDestinoId?  |  nuevoCliente?: { nombre, mesaId? } }
+                                                                          -> { origenId, destino: Cliente, lineas: ComandaItem[] }   201
+GET    /mesas/:mesaId/cuenta                                              -> { mesa, clientes: CuentaCliente[] }   // quiénes están sentados y qué debe cada uno
+GET    /cuentas-por-cobrar                                                -> CuentaCliente[]    // total_por_cobrar > 0: el menú del cajero
+```
+
+- **`cerrar`**: cierra la visita (y pasa la reserva de origen de `sentada` a `completada`).
+  No se cierra con deuda: **409** `"<nombre> todavía debe N línea(s) por X USD: cóbralas, reasígnalas o cancélalas antes de cerrarlo"`.
+  Cobrar **no** cierra solo (ver `cerrarCliente` en el cobro): un cliente que ya pagó pero sigue sentado mantiene la mesa ocupada.
+- **`reasignar`**: exactamente UNO de `clienteDestinoId` / `nuevoCliente` (si no, **400**). Se reasignan líneas SIN factura
+  (también las que siguen en cocina). `cantidad` menor que la de la línea la PARTE: la porción pasa al destino, el resto
+  se queda. `nuevoCliente` sin `mesaId` se sienta donde estaba el origen. Línea ya facturada / cancelada / de otro cliente →
+  **409**; destino cerrado → **409** `"Ese cliente ya cerró su cuenta: reábrelo para anotarle consumo"`.
+  "Facturar a otro nombre" **no** es reasignar: es `clienteNombre` al cobrar.
+- Sentar una reserva (`POST /reservaciones/:id/sentar`) y el check-in público **crean** el cliente (nombre = el de la reserva).
+
+#### Cobrar (reemplaza a `POST /mesas/:mesaId/cobrar`)
+
+```
+POST   /clientes/:id/cobrar        { lineas?: [{ lineaId, cantidad? }],      // omitido = TODO lo facturable (despachado y sin factura)
+                                     clienteNombre?: string | null,           // se congela en la factura
+                                     descuento?: number, propina?: number,    // USD, >= 0
+                                     cerrarCliente?: boolean,                 // cierra al cliente (y libera la mesa) si no queda deuda
+                                     pagos: PagoInput[] }                     // mixtos: la suma en USD debe cuadrar con el total
+                                                                              -> CobroDetalle   201
+```
+
+- **Parcial por línea.** `cantidad` omitida = la línea entera. `cantidad` menor = **parte la línea**: se cobra esa porción
+  (línea nueva, ya con `cobroId`) y el resto queda como deuda del mismo cliente. La suma de unidades se conserva y cada
+  unidad se factura una sola vez. En la respuesta, `lineas[]` son las líneas FACTURADAS (la porción cobrada es una línea
+  nueva: su `id` ≠ el `lineaId` enviado).
+- **Nombre en la factura** (`clienteNombre`): ausente = el del cliente; `""`/`null` = "Consumidor final" (se guarda `null`);
+  texto = ese nombre con trim (máx. 120, si no **400**). No cambia de cliente ni su nombre.
+- **Pagos**: Σ(`monto` en USD; los `BS` se convierten con la tasa del dólar vigente, que se congela) = `total` ± 0,01, si
+  no **400** `"Los pagos no cuadran con el total de la cuenta"`. `pago_movil` y `transferencia` exigen `referencia` (**400**).
+- **Lo que sigue en cocina nunca entra** (aunque se pida su `lineaId`: **409**). Sin nada facturable: **409**.
+- **Dos cajeros a la vez**: el servidor bloquea las líneas (`FOR UPDATE`); uno cobra (201) y el otro recibe **409**
+  `"... ya se facturó ..."` / `"Ese cliente no tiene nada despachado por cobrar"`.
+- `cerrarCliente: true` sólo cierra si NO queda deuda de ninguna clase; si queda, se ignora (la factura sí se emite).
+  Mira `cliente.cerradoEn` en la respuesta.
+- Totales, tasa, número de factura y día operativo los calcula el servidor (el cliente no manda ninguno).
+
+Ejemplo — "cobro 2 de 3 cafés, mitad efectivo mitad pago móvil":
+
+```jsonc
+POST /api/v1/clientes/0190…/cobrar
+{ "lineas": [{ "lineaId": "0190…a1", "cantidad": 2 }],
+  "propina": 1,
+  "pagos": [ { "metodo": "efectivo_usd", "moneda": "USD", "monto": 11 },
+             { "metodo": "pago_movil", "moneda": "BS", "monto": 8100, "referencia": "004512" } ] }   // 8100 / 900 = 9 USD
+// 201
+{ "id": "0190…c1", "clienteId": "0190…", "numeroDia": 7, "clienteNombre": "Ana", "subtotal": "20.0000", "propina": "1.0000",
+  "total": "21.0000", "tasaValor": "900.00000000", "totalBs": "18900.0000",
+  "lineas": [ { "id": "0190…b2", "cantidad": "2.000", "totalLinea": "20.0000", "cobroId": "0190…c1", "comanda": { "id": "0190…", "numeroDia": 14 } } ],
+  "pagos": [ { "metodo": "efectivo_usd", "monto": "11.0000", "montoUsd": "11.0000" }, { "metodo": "pago_movil", "monto": "8100.0000", "montoUsd": "9.0000" } ],
+  "cliente": { "id": "0190…", "nombre": "Ana", "mesaId": "0190…", "cerradoEn": null } }
+// El 1 café restante sigue en GET /clientes/:id → lineas (cobroId null) y la comanda queda 'cobrada_parcial'.
+```
+
+#### Comandas y despacho
+
+```
+POST   /comandas                   { clienteId, tipo?: 'mesa'|'para_llevar', comensales?, notas?,
+                                     items: [{ productoId, cantidad, nota? }] }   -> Comanda & { items, cliente }   201
+       // items OBLIGATORIO (min 1): nace ya en la cola. `mesaId`, `reservacionId` y `clienteNombre` YA NO se aceptan
+       // (se descartan en silencio): la mesa sale del cliente sentado. `tipo` por defecto 'mesa', también sin mesa.
+       // 'para_llevar' nunca lleva mesa. Cliente cerrado -> 409.
+GET    /comandas/:id                                             -> Comanda & { items, mesa, cliente }
+POST   /comandas/:id/items         { items: [{ productoId, cantidad, nota? }] }   -> ComandaItem[]   201
 PATCH  /comandas/:id/items/:itemId { cantidad?, nota? }          -> ComandaItem
-DELETE /comandas/:id/items/:itemId { motivo }                    -> 204   (canceladoEn, no borra)
-POST   /comandas/:id/despachar                                   -> Comanda & { items }
-POST   /comandas/:id/mover         { mesaIdDestino }             -> Comanda
-POST   /comandas/:id/anular        { motivo }                    -> Comanda
-
-GET    /despacho/cola                                            -> ColaDespacho[]  (v_cola_despacho, FIFO global, items embebidos)
-GET    /cuentas-por-cobrar                                       -> CuentaMesa[]    (v_cuenta_mesa, comandas_por_cobrar > 0)
-GET    /mesas/:mesaId/cuenta                                     -> { mesa, cuenta, comandas, clienteNombreSugerido: string | null }
-POST   /mesas/:mesaId/cobrar       { propina?, descuento?, comandaIds?, pagos: PagoInput[] }
-                                                                 -> Cobro & { pagos, comandas }
-GET    /cobros?fecha=                                            -> (Cobro & { pagos, comandas, mesa })[]  (día operativo; sin fecha = hoy)
-GET    /cobros/:id                                               -> Cobro & { pagos, comandas, mesa }
-POST   /cobros/:id/anular          { motivo }                    -> Cobro
+DELETE /comandas/:id/items/:itemId { motivo }                    -> 204   (canceladoEn; no borra)
+POST   /comandas/:id/despachar                                   -> Comanda & { items }   201
+POST   /comandas/:id/anular        { motivo }                    -> Comanda   201
+GET    /despacho/cola                                            -> ColaDespacho[]   (v_cola_despacho; + cliente_id, cliente_nombre; mesa_id puede ser null)
 ```
 
-**Los cuatro que desaparecieron y por qué** (el frontend viejo los llama):
+- **Editar después de despachar** (nuevo): `items` (agregar), `PATCH` y `DELETE` funcionan en comandas `pendiente`,
+  `despachada`, `cobrada_parcial` y `cobrada` (no en una `anulada`: **409**). Una línea **agregada a una comanda ya
+  despachada NO vuelve a cocina**: se considera servida y queda como deuda del cliente de la comanda (si éste ya cerró:
+  **409**, `reabrir` primero). Agregarle una línea a una comanda `cobrada` la deja `cobrada_parcial`.
+- **Líneas ya facturadas** no se tocan aquí: `PATCH`/`DELETE` responden **409** con la ruta
+  `POST /cobros/:cobroId/corregir`.
+- `anular` una comanda con alguna línea facturada → **409** (corrige la factura primero).
+- `comanda.estado`/`total` se derivan solos; `cobrada_parcial` = despachada con algunas líneas facturadas y otras vivas
+  sin factura. **El frontend debe tolerar ese estado.**
+- Cambios posteriores al despacho quedan en la bitácora (autor = la sesión; `DELETE` guarda su `motivo`).
+
+#### Facturas (cobros)
+
+```
+GET    /cobros?fecha=                                            -> CobroDetalle[]   (día operativo de la FACTURA; sin fecha = hoy)
+GET    /cobros/:id                                               -> CobroDetalle
+POST   /cobros/:id/corregir        CorregirCobroDto              -> CobroDetalle   201
+POST   /cobros/:id/anular          { motivo }                    -> CobroDetalle   201
+```
+
+```ts
+interface CorregirCobroDto {
+  motivo: string;                                         // OBLIGATORIO: va a la bitácora
+  cambios?: { lineaId: string; cantidad?: number; nota?: string; anular?: boolean }[];   // sobre líneas de ESTA factura
+  agregar?: { comandaId: string; productoId: string; cantidad: number; nota?: string }[]; // líneas nuevas, directo en la factura
+  descuento?: number; propina?: number;                  // USD; ausente = sin cambio
+  clienteNombre?: string | null;                         // ausente = sin cambio; ""/null = Consumidor final
+  pagos?: { metodo: MetodoPago; moneda: Moneda; monto: number; referencia?: string }[];   // monto NEGATIVO = devolución
+}
+```
+
+- **Se corrige una factura de cualquier día** (decisión del dueño), siempre con bitácora. Lo que nunca cambia es su
+  `fechaOperativa` y su `numeroDia`. Una factura **anulada** no se corrige (**409**).
+- El servidor recalcula `subtotal` (Σ líneas vivas), `total` y `totalBs` (con la tasa **congelada** de la factura). La
+  **diferencia** `total nuevo − Σ pagos ya registrados` tiene que venir compensada en `pagos` en la MISMA petición:
+  cobro adicional (`monto > 0`) si subió, **devolución** (`monto < 0`) si bajó. Si no cuadra → **422**
+  `{ message, diferenciaUsd }` (`"-10.0000"` = hay que devolver 10 USD; positivo = cobrar de más). Con total igual, `pagos`
+  es opcional (o netea cero: p. ej. "fue punto, no efectivo" = devolución + pago).
+- Los **pagos nunca se editan ni se borran**: el libro es de sólo agregar. Cada movimiento se fecha con el día en que
+  OCURRE. Devolución en Bs = tasa de la factura. No se devuelve por un método/moneda más de lo cobrado por él (**422**).
+  `pago_movil` / `transferencia` exigen `referencia` también en devoluciones (**400**).
+- Una factura no se queda sin líneas vivas: si se le quitan todas → **409** (anúlala).
+- `agregar`: la comanda debe estar despachada, no anulada y ser **del cliente de la factura** (si no, **409**).
+- Anular (`/anular`): se puede cualquier día, sigue como antes (las líneas siguen cubiertas por la factura anulada; **no**
+  registra devolución: saca la factura de las ventas de su día y sus pagos del cuadre de los días en que entraron).
+
+Ejemplo — devolución por bajar 3 → 2 unidades:
+
+```jsonc
+POST /api/v1/cobros/0190…c1/corregir
+{ "motivo": "se devolvió una", "cambios": [{ "lineaId": "0190…b2", "cantidad": 2 }],
+  "pagos": [{ "metodo": "efectivo_usd", "moneda": "USD", "monto": -10 }] }
+// 201 → total 20, pagos: [ +30, -10 ] ; sin `pagos` → 422 { "diferenciaUsd": "-10.0000", "message": "El total bajó 10.0000 USD: registra la devolución (monto negativo)" }
+```
+
+**Errores específicos (además de los de §4)**: `404` cliente/comanda/línea/cobro inexistente (o de otro restaurante);
+`409` conflictos de estado (cliente cerrado, comanda anulada, línea facturada, ya cobrado por otro cajero, cliente con
+deuda al cerrar); `400` DTO inválido o pagos que no cuadran al cobrar; `422` pagos que no cuadran al corregir, devolver más
+de lo cobrado, o un CHECK de datos.
+
+**Rutas retiradas** (el frontend viejo las llama):
 
 | Se fue | Qué usar | Por qué |
 |---|---|---|
-| `GET /comandas/activas` | `GET /cuentas-por-cobrar` + `GET /despacho/cola` | La vista `v_comanda_activa` ya no existe: "comanda activa" mezclaba pedido y cuenta, que ahora son dos cosas |
-| `POST /comandas/:id/enviar` | nada: `POST /comandas` ya encola | No hay borrador; cada envío es una comanda |
-| `PATCH /comandas/:id/items/:itemId/estado` | nada | No hay workflow por ítem: cocina y barra despachan la comanda entera |
-| `POST /comandas/:id/cuenta` | nada | No existe el estado `por_cobrar`; una comanda despachada ya es cobrable |
-| `POST /comandas/:id/cobrar` | `POST /mesas/:mesaId/cobrar` | Se cobra la mesa, no un pedido suelto |
-| `GET /cocina/cola?destino=` | `GET /despacho/cola` | Una sola cola global, por comanda y no por ítem |
+| `POST /mesas/:mesaId/cobrar` | `POST /clientes/:id/cobrar` | **2026-11-05.** Se cobra al cliente, por líneas; la mesa ya no es la unidad de cobro. Antes `{ comandaIds }`, ahora `{ lineas: [{ lineaId, cantidad? }] }` |
+| `POST /comandas/:id/mover` | `POST /clientes/:id/sentar { mesaId }` | **2026-11-05.** La mesa es del cliente; mover al cliente muda sus comandas que siguen en cocina |
+| `GET /mesas/:mesaId/cuenta` → `{ mesa, cuenta, comandas, clienteNombreSugerido }` | misma ruta, **nueva forma** `{ mesa, clientes: CuentaCliente[] }`; el detalle por cliente es `GET /clientes/:id` | **2026-11-05.** `clienteNombreSugerido` desaparece: el nombre es `cliente.nombre` |
+| `GET /cuentas-por-cobrar` (filas `v_cuenta_mesa`) | misma ruta, **filas `v_cuenta_cliente`** (`CuentaCliente`: una por cliente, no por mesa) | **2026-11-05.** `v_cuenta_mesa` ya no existe |
+| campo `cobroId` de `Comanda`, `comandas` de `Cobro` | `ComandaItem.cobroId`, `Cobro.lineas` | **2026-11-05.** La factura vive en la línea |
+| `POST /comandas { tipo, mesaId, reservacionId, clienteNombre }` | `POST /comandas { clienteId }` | **2026-11-05.** `mesaId`/`reservacionId`/`clienteNombre` ya no se leen |
+| `GET /comandas/activas` | `GET /cuentas-por-cobrar` + `GET /despacho/cola` | La vista `v_comanda_activa` ya no existe |
+| `POST /comandas/:id/enviar` | nada: `POST /comandas` ya encola | No hay borrador |
+| `PATCH /comandas/:id/items/:itemId/estado` | nada | No hay workflow por ítem |
+| `POST /comandas/:id/cuenta` | nada | No existe el estado `por_cobrar` |
+| `POST /comandas/:id/cobrar` | `POST /clientes/:id/cobrar` | Se cobra al cliente |
+| `GET /cocina/cola?destino=` | `GET /despacho/cola` | Una sola cola global, por comanda |
 
-> `POST /reservaciones/:id/sentar` y el check-in público ya **no abren comanda**:
-> devuelven sólo `{ reservacion }` con `estado='sentada'` (antes devolvían
-> `{ reservacion, comanda }`). Una comanda es un pedido y exige al menos una
-> línea; la primera la crea el mesero al tomar la nota, idealmente pasando
-> `reservacionId`.
+> `POST /reservaciones/:id/sentar` devuelve ahora **`{ reservacion, cliente }`** (antes `{ reservacion }`; antes aún
+> `{ reservacion, comanda }`): sentar **abre el cliente** (`nombre` = el de la reserva, `mesaId` = la mesa,
+> `reservacionId`). El check-in público (`POST /publico/reserva/:codigo/checkin`) también lo abre, pero responde
+> `ReservacionPublica` sin exponerlo. Ninguno abre comanda: el mesero pide con `POST /comandas { clienteId }`.
+> El doble toque en "sentar" → **409** (la segunda vez la reserva ya está `sentada`).
 >
-> ⭐ **La mesa queda ocupada igual, desde el escaneo.** `v_mesa_estado` cuenta
-> una reserva `sentada` como ocupación por sí sola, sin comanda: el plano
-> devuelve `estado='ocupada'` en cuanto se hace check-in, así que el refresco no
-> pisa el estado optimista que pinta el frontend. Se libera al cobrar la mesa, o
-> cancelando la reserva / marcándola no-show.
+> ⭐ **La mesa queda ocupada desde el escaneo/sentado**, porque ocupada ⟺ cliente abierto sentado (`v_mesa_estado`, que
+> conserva todas sus columnas y suma `clientes` (int) y `clientes_detalle` (`[{ id, nombre }]`)). Se libera **cerrando al
+> cliente** (`POST /clientes/:id/cerrar`, o `cerrarCliente: true` al cobrar), moviéndolo/liberándolo, o cancelando la
+> reserva / marcándola no-show (`cancelar` y `no-show` cierran al cliente de esa reserva; si debe algo → **409**).
 
 ### Reportes y tasa
 ```
@@ -903,7 +1258,7 @@ GET    /reportes/ventas?periodo=dia|mes|anio&fecha=              -> ReporteVenta
 GET    /reportes/productos?periodo=&fecha=&desde=&hasta=&orden=cantidad|ingreso&limite=
                                                                  -> ProductoVendido[]
 GET    /reportes/dia?fecha=                                      -> { porTurno: VentaDia[], total: VentaDia }
-GET    /reportes/cierre-caja?fecha=                              -> { porMetodo: VentaMetodo[], descuadres: Descuadre[] }
+GET    /reportes/cierre-caja?fecha=                              -> CierreCaja
 GET    /tasa/vigente                                             -> TasasVigentes
         (POST /tasa y POST /tasa/actualizar: sólo administrador y encargado, 403 al resto — 2026-09-18)
 POST   /tasa                       CrearTasaDto                  -> TasaCambio
@@ -1037,6 +1392,46 @@ Orden de resolución del rango:
 
 La forma de las filas **no cambia** (snake_case, ver el aviso de arriba).
 
+#### `GET /reportes/cierre-caja` — la caja de UN día, con devoluciones          *(reescrito 2026-11-05)*
+
+```ts
+interface CierreCaja {
+  fecha: string;                         // día operativo resuelto, 'YYYY-MM-DD'
+  porMetodo: VentaMetodo[];              // filas crudas de v_venta_dia_metodo (snake_case), una por método × moneda
+  devoluciones: Devolucion[];            // cada SALIDA de dinero del día (pagos con monto < 0)
+  descuadres: Descuadre[];               // v_cobro_descuadre: debe ser []
+  resumen: {
+    cajaUsd: string;                     // Σ monto_usd del día, con signo
+    ventaDelDiaUsd: string;              // cajaUsd − ajustesOtrosDiasUsd
+    ajustesOtrosDiasUsd: string;         // la parte de la caja que corrige facturas de OTRO día
+  };
+}
+interface VentaMetodo {                  // snake_case
+  metodo: MetodoPago; moneda: Moneda; fecha_operativa: string;
+  pagos: number;                         // movimientos positivos
+  devoluciones: number;                  // movimientos negativos
+  monto_moneda: string; monto_usd: string;           // SUMAN CON SIGNO: ya descuentan las devoluciones
+  ajustes_otros_dias_usd: string;        // parte de monto_usd que corrige facturas de otro día
+}
+interface Devolucion {                   // snake_case
+  pago_id: string; cobro_id: string; factura_numero_dia: number; factura_fecha_operativa: string;
+  metodo: MetodoPago; moneda: Moneda; monto: string; monto_usd: string;   // negativos
+  referencia: string | null; recibido_en: string; registrado_por_id: string | null;
+}
+```
+
+- La caja se agrupa por el día en que el dinero **entró o salió** (`cobro_pago.fechaOperativa`), no por el de la
+  factura; los pagos son de sólo agregar y una devolución es un pago negativo. Así cada método cuadra solo.
+- ⭐ **Corregir HOY una factura de un día D anterior** mueve la caja de **hoy** (el cobro adicional o la devolución entran
+  hoy) y la venta del día **D** (`/reportes/ventas`, `/reportes/dia`, `/reportes/productos` agrupan por la fecha de la
+  factura y reflejan siempre su versión corregida; ese día ya no es inmutable). La caja de D no cambia.
+  Por eso `ajustes_otros_dias_usd` es una **línea propia del cierre**: **caja de hoy = venta de hoy + ajustes de otros
+  días**. El frontend debe mostrarla aparte ("ajustes de facturas de días anteriores"); si no, la caja parece descuadrada
+  contra la venta del día.
+- Anular una factura la saca de las ventas de su día y sus pagos de la caja de los días en que entraron, **sin** registrar
+  devolución (comportamiento de siempre).
+- `descuadres` sigue en `[]`: cada factura cuadra con TODOS sus pagos, sean del día que sean.
+
 #### `GET /reportes/dia` — sigue igual, y queda superado
 
 Misma ruta, misma respuesta, mismos nombres de campo. Lo único que cambia es que
@@ -1136,12 +1531,12 @@ verdad y la base no tiene forma de saber cuál es la magnitud correcta.
 | Necesidad de negocio | Cómo se resuelve |
 |---|---|
 | Pintar el plano con el estado de cada mesa | `SELECT * FROM v_mesa_estado WHERE plantilla_id = $1` |
-| ¿Por qué está ocupada esta mesa? | `v_mesa_estado`: `comandas > 0` (ya pidió) y/o `sentada_reservacion_id` (hizo check-in y aún no pide) |
+| ¿Por qué está ocupada esta mesa? | `v_mesa_estado`: `clientes > 0` (hay un cliente abierto sentado; `clientes_detalle` = `[{ id, nombre }]`). `comandas`/`cuenta_total` = su deuda viva; `sentada_*` = el primer cliente sentado |
 | Cola de cocina / barra (KDS) | `SELECT * FROM v_cola_despacho WHERE restaurante_id = $1 ORDER BY creada_en` — FIFO global, líneas embebidas en jsonb |
-| Cuentas por cobrar / ficha de mesa ocupada | `SELECT * FROM v_cuenta_mesa WHERE restaurante_id = $1 [AND comandas_por_cobrar > 0]` |
+| Cuentas por cobrar / ficha de un cliente o de una mesa | `SELECT * FROM v_cuenta_cliente WHERE restaurante_id = $1 [AND total_por_cobrar > 0 \| AND cliente_id = $2 \| AND mesa_id = $3]` (sustituye a `v_cuenta_mesa`) |
 | Ventas del día y por turno | `SELECT * FROM v_venta_dia WHERE restaurante_id=$1 AND fecha_operativa=$2` |
 | **Ventas del mes / del año** | La MISMA vista con `fecha_operativa BETWEEN $2 AND $3`. El mes es la suma de sus días operativos: no hay vista nueva ni `date_trunc` sobre `creado_en` |
-| Cierre de caja por método de pago | `v_venta_dia_metodo` |
+| Cierre de caja por método de pago | `v_venta_dia_metodo` (agrupa por el día del MOVIMIENTO; suma con signo; `ajustes_otros_dias_usd`) |
 | **Producto más vendido** | `SELECT * FROM v_producto_vendido_dia WHERE ... ORDER BY cantidad DESC LIMIT 10` (o `ingreso_usd DESC`) |
 | Reservas que quedaron fuera del plano | `v_reservacion_huerfana` |
 | Cuadre de cobros | `v_cobro_descuadre` — debe dar 0 filas siempre |
@@ -1156,14 +1551,14 @@ verdad y la base no tiene forma de saber cuál es la magnitud correcta.
 
 | Funcionalidad | Cómo se añade |
 |---|---|
-| Dividir la cuenta entre comensales | Tabla `comanda_cuenta` + `comanda_item.cuenta_id`. No toca lo existente |
+| ~~Dividir la cuenta entre comensales~~ | **Hecho (2026-11-05)**: cobro por cliente y por líneas, con partición de cantidades y reasignación de deuda |
 | Modificadores con precio ("extra queso +1$") | `comanda_item_modificador`; el snapshot ya está en la línea |
 | Rollup `resumen_dia` | La tabla ya está modelada. Se llena al emitir/anular un **cobro** y el dashboard histórico cambia de vista a tabla. **Todavía no hace falta**: medido abajo. ⚠️ Su columna `comandas` pasaría a contar cobros, como `v_venta_dia` |
 | Vista materializada de reportes | Sólo si `v_producto_vendido_dia` pasa de ~300 ms. Ver `docs/DECISIONES-DATOS.md §Reportes` |
 | Vistas `v_venta_mes` / `v_venta_anio` | **Descartadas.** Serían una segunda definición de "qué cuenta como venta", capaz de quedarse atrás respecto a `v_venta_dia`, a cambio de un `GROUP BY` que ya es barato |
 | Multi-sucursal / SaaS | `restauranteId` ya está en todo: se activa `prisma/sql/03_rls.sql` |
 | Inventario y recetas | Tablas nuevas; `comanda_item` ya tiene el consumo por producto |
-| Auditoría completa | `evento_auditoria` como en hayai-saas. Hoy sólo hay trazas de anulación y cancelación |
+| Auditoría completa | Hoy hay `bitacora` (líneas posteriores al despacho, correcciones de facturas, cambios de cliente), pero **sin endpoint de lectura todavía** |
 
 **La medida que sostiene "todavía no hace falta rollup"** (2026-09-14): con
 **73.000 comandas y 219.000 líneas** sembradas sobre un año —un restaurante de

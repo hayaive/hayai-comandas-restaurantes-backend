@@ -11,6 +11,7 @@ import { MesasModule } from './mesas/mesas.module';
 import { PlantillasModule } from './plantillas/plantillas.module';
 import { MenuModule } from './menu/menu.module';
 import { ComandasModule } from './comandas/comandas.module';
+import { ClientesModule } from './clientes/clientes.module';
 import { ReservacionesModule } from './reservaciones/reservaciones.module';
 import { ReportesModule } from './reportes/reportes.module';
 import { UploadsModule } from './uploads/uploads.module';
@@ -28,6 +29,7 @@ import { AccesosModule } from './accesos/accesos.module';
     MesasModule,
     PlantillasModule,
     MenuModule,
+    ClientesModule,
     ComandasModule,
     ReservacionesModule,
     ReportesModule,

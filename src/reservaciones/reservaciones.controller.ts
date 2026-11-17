@@ -60,13 +60,13 @@ export class ReservacionesController {
   @Post(':id/cancelar')
   @Modulo('reservaciones')
   cancelar(@UsuarioActual() u: UsuarioSesion, @Param('id') id: string, @Body() dto: CancelarReservacionDto) {
-    return this.reservaciones.cancelar(u.restauranteId, id, dto.motivo);
+    return this.reservaciones.cancelar(u.restauranteId, id, dto.motivo, u.id);
   }
 
   @Post(':id/no-show')
   @Modulo('reservaciones')
   noShow(@UsuarioActual() u: UsuarioSesion, @Param('id') id: string) {
-    return this.reservaciones.noShow(u.restauranteId, id);
+    return this.reservaciones.noShow(u.restauranteId, id, u.id);
   }
 
   @Post(':id/sentar')

@@ -18,10 +18,15 @@
 -- de `v_mesa_estado` en la migración 20260915183000.
 -- Se leen con `$queryRaw`.
 --
+-- Copia de DOCUMENTACIÓN del estado vigente: la fuente es la última migración
+-- que tocó cada vista (20261105120100 para todas salvo v_venta_dia,
+-- v_cobro_descuadre y v_reservacion_huerfana).
+--
 -- Mapa de las vistas y quién las consume:
 --   v_mesa_estado         → GET /plano                (PlanoService)
 --   v_cola_despacho       → GET /despacho/cola        (DespachoService, KDS)
---   v_cuenta_mesa         → GET /cuentas-por-cobrar   y GET /mesas/:id/cuenta
+--   v_cuenta_cliente      → cuentas por cobrar y la ficha del cliente (sustituye
+--                           a v_cuenta_mesa, que ya no existe: 2026-11-05)
 --   v_venta_dia           → GET /reportes/ventas, /reportes/dia
 --   v_venta_dia_metodo    → GET /reportes/cierre-caja
 --   v_producto_vendido_dia→ GET /reportes/productos
@@ -38,12 +43,15 @@
 --   · editor de plano   → WHERE plantilla_id = $1
 --   · vista operativa   → WHERE plantilla_id = $1 AND plantilla_activa
 --
--- ⚠️ Desde el rediseño de comandas múltiples AGREGA sobre N comandas por mesa
--- en vez de traer "la" comanda viva con un LATERAL LIMIT 1 — ese modelo asumía
--- el índice único `comanda_mesa_activa_unica`, que ya no existe. La mesa está
--- ocupada ⟺ tiene al menos una comanda viva, y su cuenta es la suma de todas.
--- El LATERAL con agregados devuelve siempre exactamente una fila (0 comandas
--- cuando la mesa está libre), así que el CASE mira el contador, no un NULL.
+-- Desde 2026-11-05 (DECISIONES-DATOS §15) la ocupación la da el CLIENTE:
+--   · ocupada ⟺ al menos un cliente ABIERTO sentado en la mesa (antes: una
+--     comanda viva o una reserva `sentada`). Un cliente que ya pagó todo pero
+--     sigue sentado mantiene la mesa ocupada; se libera al cerrarlo o moverlo.
+--   · comandas / cuenta_total = la deuda viva de los clientes sentados.
+--   · sentada_cliente / sentada_en / sentada_reservacion_id = el PRIMER
+--     cliente sentado ("Mesa ocupada · Juan").
+--   · clientes / clientes_detalle = todos los sentados [{id, nombre}].
+-- Mismas columnas y en el mismo orden que antes, más las dos últimas.
 -- ───────────────────────────────────────────────────────────────────────────
 CREATE OR REPLACE VIEW "v_mesa_estado" WITH (security_invoker = true) AS
 SELECT
@@ -56,61 +64,69 @@ SELECT
     pm."pos_x", pm."pos_y", pm."ancho", pm."alto", pm."rotacion",
     pm."forma", pm."capacidad", pm."bloqueada",
 
-    cta."comandas",
-    cta."comandas_en_cocina",
-    cta."comandas_por_cobrar",
-    cta."cuenta_total",
-    -- Desde cuándo está tomada la mesa: el primer pedido, o —si todavía no
-    -- pidieron nada— el momento en que se sentó la reserva.
-    coalesce(cta."primera_comanda_en", sent."sentada_en") AS "ocupada_desde",
-    cta."comensales",
-    cta."mesero_id",
+    coalesce(cta."comandas", 0)            AS "comandas",
+    coalesce(cta."comandas_en_cocina", 0)  AS "comandas_en_cocina",
+    coalesce(cta."comandas_por_cobrar", 0) AS "comandas_por_cobrar",
+    coalesce(cta."cuenta_total", 0)        AS "cuenta_total",
+    cli."primero_en"                       AS "ocupada_desde",
+    coalesce(cta."comensales", 0)          AS "comensales",
+    cli."mesero_id",
 
     rsv."id"             AS "reservacion_id",
     rsv."inicia_en"      AS "reservacion_inicia_en",
     rsv."cliente_nombre" AS "reservacion_cliente",
     rsv."personas"       AS "reservacion_personas",
 
-    -- La reserva que YA está sentada en esta mesa (distinta de `reservacion_id`,
-    -- que es la próxima que llega). Sirve para rotular "Mesa ocupada · Juan".
-    sent."id"             AS "sentada_reservacion_id",
-    sent."cliente_nombre" AS "sentada_cliente",
-    sent."sentada_en",
+    cli."reservacion_id" AS "sentada_reservacion_id",
+    cli."nombre"         AS "sentada_cliente",
+    cli."primero_en"     AS "sentada_en",
 
     CASE
       WHEN pm."bloqueada"        THEN 'bloqueada'
-      WHEN cta."comandas" > 0    THEN 'ocupada'
-      -- ⭐ La reserva sentada TAMBIÉN ocupa, aunque todavía no haya pedido.
-      -- El cliente escaneó su QR y se sentó: la mesa está tomada desde ese
-      -- instante, no desde que el mesero toma la nota. Sin esta rama, el
-      -- check-in pinta la mesa ocupada de forma optimista y el siguiente
-      -- refresco del plano la devolvía a 'libre'.
-      WHEN sent."id" IS NOT NULL THEN 'ocupada'
+      WHEN cli."clientes" > 0    THEN 'ocupada'
       WHEN rsv."id" IS NOT NULL  THEN 'reservada'
       ELSE 'libre'
-    END AS "estado"
+    END AS "estado",
+
+    cli."clientes",
+    cli."detalle"        AS "clientes_detalle"
 FROM "plantilla_mesa" pm
 JOIN "plantilla" pl
   ON pl."restaurante_id" = pm."restaurante_id" AND pl."id" = pm."plantilla_id"
 JOIN "mesa" m
   ON m."restaurante_id" = pm."restaurante_id" AND m."id" = pm."mesa_id"
--- La cuenta viva de la mesa: TODA comanda no cobrada y no anulada, esté en
--- cocina o esperando pago. Usa `comanda_cuenta_abierta_idx`.
+-- Quién está sentado. Usa `cliente_abierto_idx`. Siempre una fila (agregados).
 LEFT JOIN LATERAL (
-    SELECT count(*)::int                                                  AS "comandas",
-           count(*) FILTER (WHERE c."despachada_en" IS NULL)::int         AS "comandas_en_cocina",
-           count(*) FILTER (WHERE c."despachada_en" IS NOT NULL)::int     AS "comandas_por_cobrar",
-           coalesce(sum(c."total"), 0)                                    AS "cuenta_total",
-           min(c."creada_en")                                             AS "primera_comanda_en",
-           -- La mesa tiene UN número de comensales; si creció durante la
-           -- noche, manda el mayor. Regla escrita una sola vez, aquí.
-           coalesce(max(c."comensales"), 0)                               AS "comensales",
-           (array_agg(c."mesero_id" ORDER BY c."creada_en"))[1]           AS "mesero_id"
-      FROM "comanda" c
-     WHERE c."restaurante_id" = pm."restaurante_id"
-       AND c."mesa_id"        = pm."mesa_id"
-       AND c."cobro_id"   IS NULL
-       AND c."anulada_en" IS NULL
+    SELECT count(*)::int                                                         AS "clientes",
+           min(k."creado_en")                                                    AS "primero_en",
+           (array_agg(k."nombre" ORDER BY k."creado_en"))[1]                     AS "nombre",
+           (array_agg(k."creado_por_id" ORDER BY k."creado_en"))[1]              AS "mesero_id",
+           (array_agg(k."reservacion_id" ORDER BY k."creado_en")
+              FILTER (WHERE k."reservacion_id" IS NOT NULL))[1]                  AS "reservacion_id",
+           coalesce(jsonb_agg(jsonb_build_object('id', k."id", 'nombre', k."nombre")
+                              ORDER BY k."creado_en"), '[]'::jsonb)              AS "detalle",
+           coalesce(array_agg(k."id"), '{}'::uuid[])                             AS "ids"
+      FROM "cliente" k
+     WHERE k."restaurante_id" = pm."restaurante_id"
+       AND k."mesa_id"        = pm."mesa_id"
+       AND k."cerrado_en" IS NULL
+) cli ON TRUE
+-- Su deuda viva (usa `comanda_item_deuda_idx`) y sus comensales.
+LEFT JOIN LATERAL (
+    SELECT count(DISTINCT ci."comanda_id")::int                                              AS "comandas",
+           count(DISTINCT ci."comanda_id") FILTER (WHERE c."despachada_en" IS NULL)::int     AS "comandas_en_cocina",
+           count(DISTINCT ci."comanda_id") FILTER (WHERE c."despachada_en" IS NOT NULL)::int AS "comandas_por_cobrar",
+           sum(ci."total_linea")                                                             AS "cuenta_total",
+           (SELECT max(c2."comensales") FROM "comanda" c2
+             WHERE c2."restaurante_id" = pm."restaurante_id"
+               AND c2."cliente_id" = ANY (cli."ids") AND c2."anulada_en" IS NULL)            AS "comensales"
+      FROM "comanda_item" ci
+      JOIN "comanda" c ON c."restaurante_id" = ci."restaurante_id" AND c."id" = ci."comanda_id"
+     WHERE ci."restaurante_id" = pm."restaurante_id"
+       AND ci."cliente_id" = ANY (cli."ids")
+       AND ci."cobro_id"     IS NULL
+       AND ci."cancelado_en" IS NULL
+       AND c."anulada_en"    IS NULL
 ) cta ON TRUE
 -- Próxima reserva que ya "pesa" sobre la mesa: desde 30 min antes de la hora
 -- hasta 2 h después (una reserva de las 8pm bloquea la mesa desde las 7:30).
@@ -125,29 +141,15 @@ LEFT JOIN LATERAL (
      ORDER BY r."inicia_en"
      LIMIT 1
 ) rsv ON TRUE
--- ⭐ La reserva SENTADA. Va aparte de `rsv` a propósito: aquella son las que
--- todavía no llegaron (y por eso lleva ventana de tiempo), ésta es gente que ya
--- está en la mesa. Sin ventana: una comida se alarga más de dos horas y la mesa
--- no puede "liberarse sola" mientras siguen ahí. Se cierra al cobrar, o
--- explícitamente con cancelar / no-show.
-LEFT JOIN LATERAL (
-    SELECT r."id", r."cliente_nombre", r."sentada_en"
-      FROM "reservacion" r
-     WHERE r."restaurante_id" = pm."restaurante_id"
-       AND r."mesa_id"        = pm."mesa_id"
-       AND r."estado"         = 'sentada'
-     ORDER BY r."sentada_en" DESC NULLS LAST
-     LIMIT 1
-) sent ON TRUE
 WHERE pl."eliminada_en" IS NULL;
 
 
 -- ───────────────────────────────────────────────────────────────────────────
 -- v_cola_despacho · LA cola de cocina (KDS)
 --
--- Global, todas las mesas juntas, estrictamente por orden de llegada. Sustituye
--- a la cola por ítem del modelo viejo: cocina y barra despachan la comanda como
--- una sola unidad, así que la fila es la comanda y las líneas van embebidas.
+-- Global, todas las mesas juntas, estrictamente por orden de llegada. Cocina y
+-- barra despachan la comanda como una sola unidad, así que la fila es la
+-- comanda y las líneas van embebidas.
 --
 -- El jsonb no es decorativo: es la consulta que el KDS repite cada pocos
 -- segundos, y pedir los ítems aparte sería un N+1 contra la tabla más grande
@@ -156,6 +158,7 @@ WHERE pl."eliminada_en" IS NULL;
 -- ⚠️ Los ítems cancelados VIENEN en el jsonb, marcados con `cancelado: true`,
 -- en vez de filtrarse: la cocina tiene que ver que algo se anuló si ya lo había
 -- empezado. Quien sume dinero usa `comanda.total`, que sólo cuenta los vivos.
+-- `cliente_id`/`cliente_nombre` (2026-11-05): la comanda puede no tener mesa.
 -- ───────────────────────────────────────────────────────────────────────────
 CREATE OR REPLACE VIEW "v_cola_despacho" WITH (security_invoker = true) AS
 SELECT
@@ -172,8 +175,11 @@ SELECT
     c."comensales",
     c."total",
     c."notas",
-    it."items"
+    it."items",
+    c."cliente_id",
+    k."nombre"        AS "cliente_nombre"
 FROM "comanda" c
+JOIN "cliente" k      ON k."restaurante_id" = c."restaurante_id" AND k."id" = c."cliente_id"
 LEFT JOIN "mesa" m    ON m."restaurante_id" = c."restaurante_id" AND m."id" = c."mesa_id"
 LEFT JOIN "usuario" u ON u."restaurante_id" = c."restaurante_id" AND u."id" = c."mesero_id"
 LEFT JOIN LATERAL (
@@ -193,42 +199,72 @@ WHERE c."despachada_en" IS NULL
 
 
 -- ───────────────────────────────────────────────────────────────────────────
--- v_cuenta_mesa · "cuentas por cobrar" y la ficha de la mesa ocupada
+-- v_cuenta_cliente · LA cuenta: una fila por cliente ABIERTO   (2026-11-05)
 --
--- Una fila por mesa con cuenta viva. El menú de cuentas por cobrar filtra
--- `comandas_por_cobrar > 0`; la ficha de una mesa filtra por `mesa_id`.
---
--- Se llama v_cuenta_mesa y no v_cuenta_por_cobrar porque también contiene lo
--- que todavía está en cocina — y esa cifra es justo la que el cajero necesita
--- ver antes de cerrar la cuenta: cobrar deja lo pendiente en cocina y le abre
--- a la mesa una cuenta nueva.
+-- Sustituye a v_cuenta_mesa. "Cuentas por cobrar" = `total_por_cobrar > 0`;
+-- la ficha de un cliente filtra por `cliente_id`; la de una mesa, por
+-- `mesa_id` (puede haber varios clientes en la misma mesa).
+--   cuenta_total      = toda su deuda viva (en cocina + despachada)
+--   total_por_cobrar  = lo facturable YA (despachado)
+--   total_cobrado     = lo que ya pagó en facturas vivas de esta visita
 -- ───────────────────────────────────────────────────────────────────────────
-CREATE OR REPLACE VIEW "v_cuenta_mesa" WITH (security_invoker = true) AS
+CREATE OR REPLACE VIEW "v_cuenta_cliente" WITH (security_invoker = true) AS
 SELECT
-    c."restaurante_id",
-    c."mesa_id",
-    m."etiqueta"  AS "mesa_etiqueta",
-    c."salon_id",
-    s."nombre"    AS "salon_nombre",
-    count(*)::int                                                      AS "comandas",
-    count(*) FILTER (WHERE c."despachada_en" IS NOT NULL)::int         AS "comandas_por_cobrar",
-    count(*) FILTER (WHERE c."despachada_en" IS NULL)::int             AS "comandas_en_cocina",
-    sum(c."total")                                                     AS "cuenta_total",
-    coalesce(sum(c."total") FILTER (WHERE c."despachada_en" IS NOT NULL), 0) AS "total_por_cobrar",
-    coalesce(sum(c."total") FILTER (WHERE c."despachada_en" IS NULL), 0)     AS "total_en_cocina",
-    max(c."comensales")                                                AS "comensales",
-    min(c."creada_en")                                                 AS "ocupada_desde",
-    round(extract(epoch FROM (now() - min(c."creada_en"))) / 60)::int  AS "minutos_ocupada",
-    (array_agg(c."mesero_id" ORDER BY c."creada_en"))[1]               AS "mesero_id",
-    (array_agg(c."reservacion_id" ORDER BY c."creada_en")
-       FILTER (WHERE c."reservacion_id" IS NOT NULL))[1]               AS "reservacion_id"
-FROM "comanda" c
-JOIN "mesa"  m ON m."restaurante_id" = c."restaurante_id" AND m."id" = c."mesa_id"
-LEFT JOIN "salon" s ON s."restaurante_id" = c."restaurante_id" AND s."id" = c."salon_id"
-WHERE c."mesa_id"    IS NOT NULL
-  AND c."cobro_id"   IS NULL
-  AND c."anulada_en" IS NULL
-GROUP BY c."restaurante_id", c."mesa_id", m."etiqueta", c."salon_id", s."nombre";
+    k."restaurante_id",
+    k."id"            AS "cliente_id",
+    k."nombre"        AS "cliente_nombre",
+    k."mesa_id",
+    m."etiqueta"      AS "mesa_etiqueta",
+    m."salon_id",
+    s."nombre"        AS "salon_nombre",
+    (k."mesa_id" IS NOT NULL) AS "sentado",
+    k."reservacion_id",
+    k."fecha_operativa",
+    k."creado_por_id" AS "mesero_id",
+    k."creado_en"     AS "ocupada_desde",
+    round(extract(epoch FROM (now() - k."creado_en")) / 60)::int AS "minutos_ocupada",
+    d."comandas",
+    d."comandas_por_cobrar",
+    d."comandas_en_cocina",
+    d."lineas_por_cobrar",
+    d."cuenta_total",
+    d."total_por_cobrar",
+    d."total_en_cocina",
+    cm."comensales",
+    cb."facturas",
+    cb."total_cobrado"
+FROM "cliente" k
+LEFT JOIN "mesa"  m ON m."restaurante_id" = k."restaurante_id" AND m."id" = k."mesa_id"
+LEFT JOIN "salon" s ON s."restaurante_id" = m."restaurante_id" AND s."id" = m."salon_id"
+-- La deuda viva. Usa `comanda_item_deuda_idx`.
+LEFT JOIN LATERAL (
+    SELECT count(DISTINCT ci."comanda_id")::int                                              AS "comandas",
+           count(DISTINCT ci."comanda_id") FILTER (WHERE c."despachada_en" IS NOT NULL)::int AS "comandas_por_cobrar",
+           count(DISTINCT ci."comanda_id") FILTER (WHERE c."despachada_en" IS NULL)::int     AS "comandas_en_cocina",
+           count(*) FILTER (WHERE c."despachada_en" IS NOT NULL)::int                        AS "lineas_por_cobrar",
+           coalesce(sum(ci."total_linea"), 0)                                                AS "cuenta_total",
+           coalesce(sum(ci."total_linea") FILTER (WHERE c."despachada_en" IS NOT NULL), 0)   AS "total_por_cobrar",
+           coalesce(sum(ci."total_linea") FILTER (WHERE c."despachada_en" IS NULL), 0)       AS "total_en_cocina"
+      FROM "comanda_item" ci
+      JOIN "comanda" c ON c."restaurante_id" = ci."restaurante_id" AND c."id" = ci."comanda_id"
+     WHERE ci."restaurante_id" = k."restaurante_id"
+       AND ci."cliente_id"     = k."id"
+       AND ci."cobro_id"     IS NULL
+       AND ci."cancelado_en" IS NULL
+       AND c."anulada_en"    IS NULL
+) d ON TRUE
+-- El grupo tiene UN número de comensales; si creció, manda el mayor.
+LEFT JOIN LATERAL (
+    SELECT coalesce(max(c."comensales"), 0) AS "comensales"
+      FROM "comanda" c
+     WHERE c."restaurante_id" = k."restaurante_id" AND c."cliente_id" = k."id" AND c."anulada_en" IS NULL
+) cm ON TRUE
+LEFT JOIN LATERAL (
+    SELECT count(*)::int AS "facturas", coalesce(sum(f."total"), 0) AS "total_cobrado"
+      FROM "cobro" f
+     WHERE f."restaurante_id" = k."restaurante_id" AND f."cliente_id" = k."id" AND f."anulado_en" IS NULL
+) cb ON TRUE
+WHERE k."cerrado_en" IS NULL;
 
 
 -- ───────────────────────────────────────────────────────────────────────────
@@ -273,21 +309,33 @@ GROUP BY cb."restaurante_id", cb."fecha_operativa", cb."turno";
 
 -- ───────────────────────────────────────────────────────────────────────────
 -- v_venta_dia_metodo · desglose por método de pago (cuadre de caja)
+--
+-- Desde 2026-11-05 agrupa por el día en que el dinero ENTRÓ o SALIÓ
+-- (`cobro_pago.fecha_operativa`), no por el de la factura: una devolución hecha
+-- hoy sobre una factura de ayer cuadra la caja de hoy. Para lo histórico ambos
+-- días coinciden. Las devoluciones (montos negativos) suman con su signo;
+-- `pagos` cuenta sólo los positivos.
+-- `ajustes_otros_dias_usd` = la parte de `monto_usd` que corrige facturas de
+-- OTRO día operativo (se corrigen cualquier día). Es lo que separa la caja del
+-- día de la venta del día: caja = venta del día + ajustes_otros_dias_usd.
 -- ───────────────────────────────────────────────────────────────────────────
 CREATE OR REPLACE VIEW "v_venta_dia_metodo" WITH (security_invoker = true) AS
 SELECT
-    cb."restaurante_id",
-    cb."fecha_operativa",
+    p."restaurante_id",
+    p."fecha_operativa",
     p."metodo",
     p."moneda",
-    count(*)           AS "pagos",
-    sum(p."monto")     AS "monto_moneda",
-    sum(p."monto_usd") AS "monto_usd"
+    count(*) FILTER (WHERE p."monto" > 0)               AS "pagos",
+    count(*) FILTER (WHERE p."monto" < 0)               AS "devoluciones",
+    sum(p."monto")                                      AS "monto_moneda",
+    sum(p."monto_usd")                                  AS "monto_usd",
+    coalesce(sum(p."monto_usd") FILTER (WHERE cb."fecha_operativa" <> p."fecha_operativa"), 0)
+                                                        AS "ajustes_otros_dias_usd"
 FROM "cobro_pago" p
 JOIN "cobro" cb
   ON cb."restaurante_id" = p."restaurante_id" AND cb."id" = p."cobro_id"
 WHERE cb."anulado_en" IS NULL
-GROUP BY cb."restaurante_id", cb."fecha_operativa", p."metodo", p."moneda";
+GROUP BY p."restaurante_id", p."fecha_operativa", p."metodo", p."moneda";
 
 
 -- ───────────────────────────────────────────────────────────────────────────
@@ -298,12 +346,11 @@ GROUP BY cb."restaurante_id", cb."fecha_operativa", p."metodo", p."moneda";
 --   · por ingreso  → ORDER BY ingreso_usd DESC
 -- (son respuestas distintas: la empanada gana por unidades, el solomo por
 -- ingreso; por eso la vista devuelve las dos y no decide por el negocio).
--- Los ítems cancelados no cuentan: se pidieron, no se vendieron.
+-- Los ítems cancelados no cuentan: se pidieron, no se vendieron; tampoco una
+-- línea facturada y cancelada después (devolución).
 --
--- El día y el turno salen del COBRO, igual que v_venta_dia. Si uno usara la
--- fecha de la comanda y el otro la del cobro, la suma de los productos de un
--- día dejaría de dar la venta de ese día en las noches que cruzan la hora de
--- corte.
+-- El día y el turno salen del COBRO, igual que v_venta_dia. Desde 2026-11-05
+-- la línea apunta a su factura directamente (`comanda_item.cobro_id`).
 -- ───────────────────────────────────────────────────────────────────────────
 CREATE OR REPLACE VIEW "v_producto_vendido_dia" WITH (security_invoker = true) AS
 SELECT
@@ -316,10 +363,8 @@ SELECT
     sum(ci."total_linea")  AS "ingreso_usd",
     count(DISTINCT ci."comanda_id") AS "comandas"
 FROM "comanda_item" ci
-JOIN "comanda" c
-  ON c."restaurante_id" = ci."restaurante_id" AND c."id" = ci."comanda_id"
 JOIN "cobro" cb
-  ON cb."restaurante_id" = c."restaurante_id" AND cb."id" = c."cobro_id"
+  ON cb."restaurante_id" = ci."restaurante_id" AND cb."id" = ci."cobro_id"
 WHERE cb."anulado_en"  IS NULL
   AND ci."cancelado_en" IS NULL
 GROUP BY cb."restaurante_id", cb."fecha_operativa", cb."turno",
@@ -329,10 +374,10 @@ GROUP BY cb."restaurante_id", cb."fecha_operativa", cb."turno",
 -- ───────────────────────────────────────────────────────────────────────────
 -- v_cobro_descuadre · auditoría de caja  (antes v_comanda_descuadre)
 --
--- Cobros donde la suma de los pagos no coincide con el total. No se puede
--- expresar como CHECK (cruza dos tablas) y no debería ocurrir nunca: si aparece
--- una fila aquí, hay un bug de cobro o un cobro a medias.
--- Consultarla en el cierre de caja. Debe dar 0 filas siempre.
+-- Cobros donde la suma de los pagos no coincide con el total. Desde
+-- 2026-11-05 lo impide el constraint trigger diferido `cobro_coherente`
+-- (`cobro_pagos_cuadran`), así que sólo podría listar facturas históricas
+-- anteriores a esa migración. Debe dar 0 filas siempre.
 -- ───────────────────────────────────────────────────────────────────────────
 CREATE OR REPLACE VIEW "v_cobro_descuadre" WITH (security_invoker = true) AS
 SELECT

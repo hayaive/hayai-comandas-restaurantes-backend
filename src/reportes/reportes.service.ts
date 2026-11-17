@@ -444,6 +444,18 @@ export class ReportesService {
    * GET /reportes/cierre-caja — desglose por método de pago y auditoría de
    * descuadres. Sigue siendo de UN día operativo: el cierre de caja es una
    * operación diaria, no un acumulado (`fecha` ausente = el día en curso).
+   *
+   * La caja se cuenta por el día en que el dinero ENTRÓ o SALIÓ
+   * (`cobro_pago.fecha_operativa`), no por el de la factura, y los pagos son un
+   * libro de sólo agregar: una devolución es un pago NEGATIVO. Por eso:
+   *   · `porMetodo` suma con signo (`monto_moneda`, `monto_usd`) y trae
+   *     `pagos` (sólo positivos) y `devoluciones` (sólo negativos);
+   *   · corregir HOY una factura de OTRO día mueve la caja de hoy y la venta de
+   *     ese otro día. `ajustes_otros_dias_usd` (por método) y
+   *     `resumen.ajustesOtrosDiasUsd` separan esa parte:
+   *     caja del día = venta del día + ajustes de otros días;
+   *   · `devoluciones` lista cada salida de dinero del día, con la factura de la
+   *     que sale, para el conteo físico de la gaveta.
    */
   async cierreCaja(restauranteId: string, fecha?: string) {
     if (!fecha) fecha = (await this.resolverRango(restauranteId, 'dia')).fecha;
@@ -456,6 +468,35 @@ export class ReportesService {
       SELECT * FROM v_cobro_descuadre
        WHERE restaurante_id = ${restauranteId}::uuid AND fecha_operativa = ${fecha}::date
     `;
-    return { porMetodo, descuadres };
+    const devoluciones = await this.prisma.$queryRaw<any[]>`
+      SELECT p.id AS pago_id, p.cobro_id, cb.numero_dia AS factura_numero_dia,
+             cb.fecha_operativa AS factura_fecha_operativa, p.metodo, p.moneda,
+             p.monto, p.monto_usd, p.referencia, p.recibido_en, p.registrado_por_id
+        FROM cobro_pago p
+        JOIN cobro cb ON cb.restaurante_id = p.restaurante_id AND cb.id = p.cobro_id
+       WHERE p.restaurante_id = ${restauranteId}::uuid
+         AND p.fecha_operativa = ${fecha}::date
+         AND p.monto < 0
+         AND cb.anulado_en IS NULL
+       ORDER BY p.recibido_en
+    `;
+    const [resumen] = await this.prisma.$queryRaw<any[]>`
+      SELECT round(coalesce(sum(monto_usd), 0), 4)::text                    AS caja_usd,
+             round(coalesce(sum(ajustes_otros_dias_usd), 0), 4)::text       AS ajustes_otros_dias_usd,
+             round(coalesce(sum(monto_usd - ajustes_otros_dias_usd), 0), 4)::text AS venta_del_dia_usd
+        FROM v_venta_dia_metodo
+       WHERE restaurante_id = ${restauranteId}::uuid AND fecha_operativa = ${fecha}::date
+    `;
+    return {
+      fecha,
+      porMetodo,
+      descuadres,
+      devoluciones,
+      resumen: {
+        cajaUsd: resumen.caja_usd,
+        ventaDelDiaUsd: resumen.venta_del_dia_usd,
+        ajustesOtrosDiasUsd: resumen.ajustes_otros_dias_usd,
+      },
+    };
   }
 }

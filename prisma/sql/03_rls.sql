@@ -49,6 +49,11 @@ DECLARE
   tablas text[] := ARRAY[
     'usuario', 'salon', 'mesa', 'plantilla', 'plantilla_mesa',
     'categoria', 'producto', 'reservacion', 'comanda', 'comanda_item',
+    -- `cliente` (la cuenta de cada visita) y `bitacora` (quién corrigió qué
+    -- factura), migración 20261105120100. La bitácora la escribe un trigger
+    -- con el rol que consulta: bajo RLS su INSERT pasa por el WITH CHECK, así
+    -- que `app.restaurante_id` tiene que estar fijado igual que en todo lo demás.
+    'cliente', 'bitacora',
     -- `cobro` y `cobro_pago` llevan el dinero cobrado: si se olvidaran aquí,
     -- el día que se active RLS un tenant vería la facturación de otro.
     -- `cobro_pago` y `contador_dia` se llamaban `comanda_pago` y

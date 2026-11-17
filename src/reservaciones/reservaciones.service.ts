@@ -5,6 +5,8 @@ import { nuevoId } from '../comun/id';
 import { generarCodigoCorto, generarCodigoPublico } from '../comun/codigos';
 import { Prisma } from '../generated/prisma/client';
 import { EstadoReservacion, OrigenReservacion } from '../generated/prisma/enums';
+import { fijarAutor } from '../comun/prisma/autor';
+import { ClientesService } from '../clientes/clientes.service';
 import { CrearReservacionDto, ActualizarReservacionDto } from './dto/reservacion.dto';
 
 const ESTADOS_VIVOS: EstadoReservacion[] = ['pendiente', 'confirmada', 'sentada'];
@@ -29,6 +31,7 @@ interface DatosReservacionInterna {
 export class ReservacionesService {
   constructor(
     private readonly prisma: PrismaService,
+    private readonly clientes: ClientesService,
   ) {}
 
   async resolverPlantillaActiva(
@@ -174,47 +177,60 @@ export class ReservacionesService {
     });
   }
 
-  async cancelar(restauranteId: string, id: string, motivo: string) {
+  /**
+   * Una reserva `sentada` ocupa la mesa a través de su cliente: al cancelarla o
+   * marcarla no-show se cierra ese cliente (si ya consumió algo sin pagar, 409:
+   * primero se cobra, se reasigna o se cancela).
+   */
+  private async terminarReserva(
+    restauranteId: string,
+    id: string,
+    usuarioId: string,
+    data: Prisma.ReservacionUpdateInput,
+  ) {
     const reservacion = await this.obtener(restauranteId, id);
     if (!ESTADOS_VIVOS.includes(reservacion.estado)) {
       throw new ConflictException('Esa reservación ya no está viva');
     }
-    return this.prisma.reservacion.update({
-      where: { id },
-      data: { estado: 'cancelada', canceladaEn: new Date(), motivoCancelacion: motivo },
+    return this.prisma.$transaction(async (tx) => {
+      await fijarAutor(tx, usuarioId);
+      if (reservacion.estado === 'sentada') {
+        const abierto = await tx.cliente.findFirst({ where: { restauranteId, reservacionId: id, cerradoEn: null } });
+        if (abierto) await this.clientes.cerrarEnTx(tx, restauranteId, abierto.id, usuarioId);
+      }
+      return tx.reservacion.update({ where: { id }, data });
     });
   }
 
-  async noShow(restauranteId: string, id: string) {
-    const reservacion = await this.obtener(restauranteId, id);
-    if (!ESTADOS_VIVOS.includes(reservacion.estado)) {
-      throw new ConflictException('Esa reservación ya no está viva');
-    }
-    return this.prisma.reservacion.update({ where: { id }, data: { estado: 'no_show' } });
+  cancelar(restauranteId: string, id: string, motivo: string, usuarioId: string) {
+    return this.terminarReserva(restauranteId, id, usuarioId, {
+      estado: 'cancelada',
+      canceladaEn: new Date(),
+      motivoCancelacion: motivo,
+    });
+  }
+
+  noShow(restauranteId: string, id: string, usuarioId: string) {
+    return this.terminarReserva(restauranteId, id, usuarioId, { estado: 'no_show' });
   }
 
   /**
-   * El cliente llegó: se le asigna mesa (si faltaba) y la reserva queda
-   * `sentada`.
+   * El cliente llegó: se le asigna mesa (si faltaba), la reserva queda
+   * `sentada` y se ABRE el cliente (la visita) con el nombre de la reserva,
+   * sentado en esa mesa. La mesa queda ocupada en el acto (`v_mesa_estado`
+   * cuenta clientes abiertos), aunque no haya pedido todavía.
    *
-   * ⚠️ Ya NO abre comanda, y por eso devuelve sólo `{ reservacion }`. Antes la
-   * abría porque la comanda ERA la ocupación de la mesa; desde el rediseño una
-   * comanda es un PEDIDO y exige al menos una línea, así que abrir una vacía
-   * metería un ticket en blanco en la cola de cocina. La primera comanda la
-   * crea el mesero al tomar la nota, pasando `reservacionId`, y es la que
-   * ocupa la mesa.
+   * No abre comanda: una comanda es un PEDIDO y exige al menos una línea. El
+   * mesero pide después con `POST /comandas { clienteId }`. La ocupación se
+   * libera al cerrar el cliente (cobrado), o cancelando la reserva / no-show.
    *
-   * ⭐ La mesa SÍ queda ocupada en el acto, aunque no haya pedido: `v_mesa_estado`
-   * trata una reserva en estado `sentada` como ocupación por sí sola. Es lo que
-   * pidió el dueño —al escanear el QR la mesa se toma ya, no cuando el mesero
-   * apunta— y lo que impide que el refresco del plano pise el estado optimista
-   * que el frontend pinta tras el check-in. Se libera al cobrar la mesa, o
-   * explícitamente cancelando la reserva / marcándola no-show.
+   * El `updateMany` condicionado al estado hace atómico el doble toque: el
+   * segundo recibe 409 en vez de abrir otro cliente.
    */
   async sentar(
     restauranteId: string,
     id: string,
-    _meseroId: string,
+    usuarioId: string,
     dto: { mesaId?: string; comensales?: number },
   ) {
     const reservacion = await this.obtener(restauranteId, id);
@@ -226,12 +242,21 @@ export class ReservacionesService {
     if (!mesaId) throw new BadRequestException('Falta asignar una mesa antes de sentar');
     await this.validarMesaDisponibleEnPlantilla(this.prisma, restauranteId, reservacion.plantillaId, mesaId);
 
-    await this.prisma.reservacion.update({
-      where: { id },
-      data: { mesaId, estado: 'sentada', sentadaEn: new Date() },
+    const cliente = await this.prisma.$transaction(async (tx) => {
+      const { count } = await tx.reservacion.updateMany({
+        where: { restauranteId, id, estado: { in: ['pendiente', 'confirmada'] } },
+        data: { mesaId, estado: 'sentada', sentadaEn: new Date() },
+      });
+      if (count === 0) throw new ConflictException('Esa reservación no está lista para sentarse');
+      return this.clientes.abrir(
+        tx,
+        restauranteId,
+        { nombre: reservacion.clienteNombre, mesaId, reservacionId: id, creadoPorId: usuarioId },
+        { validarMesa: false },
+      );
     });
 
-    return { reservacion: await this.obtener(restauranteId, id) };
+    return { reservacion: await this.obtener(restauranteId, id), cliente };
   }
 
   async huerfanas(restauranteId: string) {

@@ -89,26 +89,35 @@ enum OrigenReservacion {
   @@map("origen_reservacion")
 }
 
-/// Estado de UN pedido (no de la cuenta de la mesa: eso es `Cobro`).
+/// Estado de UN pedido (no de la cuenta del cliente: esa son sus líneas sin
+/// factura, `v_cuenta_cliente`).
 ///
 /// ⚠️ DERIVADO, no escrito. La columna existe para que el contrato con el
 /// frontend, los filtros de Prisma y los predicados de las vistas se lean de
 /// una sola palabra, pero su valor lo calcula el trigger `comanda_estado`
-/// (prisma/sql/01_constraints_y_triggers.sql §8) a partir de los TRES hechos
-/// independientes que sí se escriben: `anulada_en`, `cobro_id`, `despachada_en`.
+/// (prisma/sql/01_constraints_y_triggers.sql §8) a partir de `anulada_en`,
+/// `despachada_en` y de cuántas de sus LÍNEAS tienen factura
+/// (`comanda_item.cobro_id`, desde la migración 20261105120100).
 /// Escribirla desde la aplicación no sirve de nada: el trigger la pisa.
 enum EstadoComanda {
   /// Está en la cola de despacho; la cocina todavía no la sacó.
   pendiente
-  /// Salió de cocina/barra y forma parte de la cuenta viva de la mesa.
+  /// Salió de cocina/barra; ninguna de sus líneas está facturada todavía.
   despachada
-  /// Cubierta por un `Cobro`.
+  /// Despachada, con ALGUNAS líneas facturadas y otras vivas sin factura
+  /// (cobro dividido por líneas, o una línea agregada después de cobrar).
+  /// Va en su propia migración (20261105120000): un valor de enum recién
+  /// creado no se puede usar en la misma transacción que lo crea.
+  cobrada_parcial
+  /// Todas sus líneas vivas están facturadas.
   cobrada
   anulada
 
   @@map("estado_comanda")
 }
 
+/// `mesa` = se consume en el local, CON o SIN mesa asignada (desde 2026-11-05
+/// un cliente sin mesa pide con tipo `mesa`). `para_llevar` nunca lleva mesa.
 enum TipoComanda {
   mesa
   para_llevar
@@ -324,10 +333,12 @@ model Restaurante {
   categorias        Categoria[]
   productos         Producto[]
   reservaciones     Reservacion[]
+  clientes          Cliente[]
   comandas          Comanda[]
   comandaItems      ComandaItem[]
   cobros            Cobro[]
   pagos             CobroPago[]
+  bitacora          Bitacora[]
   tasas             TasaCambio[]
   contadores        ContadorDia[]
   resumenes         ResumenDia[]
@@ -403,6 +414,9 @@ model Usuario {
 
   plantillasCreadas     Plantilla[]        @relation("plantilla_creada_por")
   reservaciones         Reservacion[]      @relation("reservacion_creada_por")
+  clientesRegistrados   Cliente[]          @relation("cliente_creado_por")
+  clientesCerrados      Cliente[]          @relation("cliente_cerrado_por")
+  bitacora              Bitacora[]
   comandasAtendidas     Comanda[]          @relation("comanda_mesero")
   comandasAnuladas      Comanda[]          @relation("comanda_anulada_por")
   itemsCancelados       ComandaItem[]      @relation("item_cancelado_por")
@@ -488,6 +502,8 @@ model Mesa {
 
   enPlantillas  PlantillaMesa[]
   reservaciones Reservacion[]
+  /// Quién está sentado AHORA (cerrado_en NULL) y quién se sentó alguna vez.
+  clientes      Cliente[]
   comandas      Comanda[]
   cobros        Cobro[]
 
@@ -705,6 +721,9 @@ model Reservacion {
   /// genera tantas como rondas pida la mesa (antes era 1:1, garantizado por
   /// `comanda_reservacion_unica`, que murió con el rediseño).
   comandas Comanda[]
+  /// El cliente que se abrió al sentarla. A lo sumo UNO abierto por reserva
+  /// (índice único parcial `cliente_reservacion_abierta_unica`).
+  clientes Cliente[]
 
   @@unique([restauranteId, id], map: "reservacion_restaurante_id_key")
   @@index([restauranteId, iniciaEn])
@@ -713,35 +732,114 @@ model Reservacion {
   @@map("reservacion")
 }
 
-// ═══════════════════ 5 · COMANDAS Y COBRO ══════════════════════════════════
+// ═══════════════════ 5 · CLIENTES, COMANDAS Y COBRO ════════════════════════
 //
-// Dos entidades, dos preguntas distintas:
-//   · `Comanda` — QUÉ se pidió y si ya salió de cocina. Unidad de despacho.
-//   · `Cobro`   — CUÁNTO se pagó y cuándo entró el dinero. Unidad de venta.
-// Una mesa acumula N comandas vivas; un cobro las liquida de una vez.
+// Cuatro entidades, cuatro preguntas distintas (desde 2026-11-05, §15 de
+// docs/DECISIONES-DATOS.md):
+//   · `Cliente`     — QUIÉN está en el local y a quién se le cobra. Unidad de
+//                     cobro. Puede estar sentado en una mesa o no.
+//   · `Comanda`     — QUÉ se pidió y si ya salió de cocina. Unidad de despacho.
+//   · `ComandaItem` — la línea. Unidad de DEUDA y de FACTURACIÓN: cada línea
+//                     tiene un deudor (`cliente_id`) y a lo sumo una factura.
+//   · `Cobro`       — CUÁNTO se pagó y cuándo entró el dinero. Unidad de venta.
+// Un cliente acumula N comandas; cada cobro factura algunas de sus líneas.
+
+/// UN cliente presente en el local: la cuenta a la que se le cobra.
+///
+/// ⚠️ No es un cliente de CRM (persona que vuelve otro día): es una VISITA. Se
+/// abre cuando el mesero lo registra en la pantalla de mesas (o al sentar una
+/// reserva) y se cierra cuando se va. El nombre lo escribe el mesero
+/// ("Juan", "Señora de rojo"); sólo identifica la cuenta en pantalla y es el
+/// nombre por defecto de sus facturas.
+///
+/// Sustituye a la mesa como unidad de cobro y a "la comanda es la ocupación":
+/// la mesa está ocupada ⟺ tiene al menos un cliente abierto sentado en ella
+/// (`v_mesa_estado`). Dos clientes en la misma mesa es legal (cuentas
+/// separadas, barra compartida); un cliente sin mesa también.
+///
+/// Abierto ⟺ `cerrado_en IS NULL`. Cerrarlo con deuda es imposible: lo impide
+/// el trigger `cliente_cierre_sin_deuda`, y escribirle deuda a un cliente
+/// cerrado también (`comanda_item_editable`). Reabrir = `cerrado_en = NULL`.
+///
+/// El historial de asiento (de qué mesa a qué mesa se movió) no tiene tabla
+/// propia: cada cambio de `mesa_id` queda en `bitacora` con antes/después, y
+/// cada comanda congela la mesa donde se sirvió (`comanda.mesa_id`).
+model Cliente {
+  id            String  @id @db.Uuid
+  restauranteId String  @map("restaurante_id") @db.Uuid
+  /// Trim y no vacío (CHECK `cliente_nombre_normalizado`). Tope de 120 en el DTO.
+  nombre        String
+  /// Dónde está sentado AHORA. NULL = sin mesa (en la barra, de pie, esperando,
+  /// o un pedido para llevar). Mesa viva, en la distribución activa y no
+  /// bloqueada: lo comprueba el servicio, igual que al crear una comanda.
+  mesaId        String? @map("mesa_id") @db.Uuid
+  /// La reserva que lo trajo, si vino de una. Al cerrar el cliente, el
+  /// servicio pasa esa reserva de `sentada` a `completada`.
+  reservacionId String? @map("reservacion_id") @db.Uuid
+
+  /// Día contable de APERTURA (hayai_fecha_operativa, nunca en TypeScript).
+  /// Ordena el histórico de clientes; la venta sigue siendo la del cobro.
+  fechaOperativa DateTime @map("fecha_operativa") @db.Date
+
+  creadoPorId  String?   @map("creado_por_id") @db.Uuid
+  cerradoEn    DateTime? @map("cerrado_en") @db.Timestamptz(6)
+  cerradoPorId String?   @map("cerrado_por_id") @db.Uuid
+
+  creadoEn      DateTime @default(now()) @map("creado_en") @db.Timestamptz(6)
+  actualizadoEn DateTime @updatedAt @map("actualizado_en") @db.Timestamptz(6)
+
+  restaurante Restaurante  @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  mesa        Mesa?        @relation(fields: [restauranteId, mesaId], references: [restauranteId, id], onDelete: Restrict)
+  reservacion Reservacion? @relation(fields: [restauranteId, reservacionId], references: [restauranteId, id], onDelete: Restrict)
+  creadoPor   Usuario?     @relation("cliente_creado_por", fields: [restauranteId, creadoPorId], references: [restauranteId, id], onDelete: Restrict)
+  cerradoPor  Usuario?     @relation("cliente_cerrado_por", fields: [restauranteId, cerradoPorId], references: [restauranteId, id], onDelete: Restrict)
+
+  /// Las comandas que se pidieron PARA este cliente (origen; lo que ve cocina).
+  comandas Comanda[]
+  /// Las líneas que DEBE este cliente (deudor). Coincide con las de sus
+  /// comandas salvo que se haya reasignado deuda (§15.4 del doc).
+  lineas   ComandaItem[]
+  cobros   Cobro[]
+
+  @@unique([restauranteId, id], map: "cliente_restaurante_id_key")
+  /// ⚠️ Dos índices PARCIALES viven en prisma/sql/01_constraints_y_triggers.sql
+  /// §2: `cliente_abierto_idx` (clientes abiertos por mesa: el plano y la
+  /// pantalla de mesas) y `cliente_reservacion_abierta_unica` (un solo
+  /// cliente abierto por reserva: el doble toque en "sentar" da 23505).
+  @@map("cliente")
+}
 
 /// UN pedido: lo que se manda a cocina/barra de una vez y sale de una vez.
 ///
-/// ⚠️ Ya NO es "la cuenta de la mesa" (eso es `Cobro`) ni la ocupación exclusiva
-/// de la mesa. Cada envío a cocina crea una comanda nueva, así que una mesa
-/// tiene N comandas vivas a la vez y `comanda_mesa_activa_unica` desapareció;
-/// las rondas dentro de una comanda (`comanda_item.ronda`) también, porque la
-/// ronda ES la comanda. La cuenta viva de la mesa se lee de `v_cuenta_mesa`.
+/// ⚠️ No es la cuenta (eso son las líneas sin factura de un `Cliente`) ni la
+/// ocupación de la mesa (eso es un `Cliente` abierto sentado en ella). Cada
+/// envío a cocina crea una comanda nueva; las rondas son comandas.
 ///
-/// El ciclo de vida son TRES hechos independientes y no un campo de estado:
-///   · `despachada_en` — la cocina la sacó; entra en la cuenta cobrable.
-///   · `cobro_id`      — quedó cubierta por una factura.
-///   · `anulada_en`    — se descartó.
-/// `estado` es la lectura derivada de los tres, y la calcula el trigger
+/// El ciclo de vida son hechos independientes y no un campo de estado:
+///   · `despachada_en`          — la cocina la sacó; sus líneas son cobrables.
+///   · `comanda_item.cobro_id`  — qué líneas ya tienen factura (desde
+///                                2026-11-05 se factura POR LÍNEA; la columna
+///                                `comanda.cobro_id` ya no existe).
+///   · `anulada_en`             — se descartó.
+/// `estado` y `total` son lecturas derivadas, y las calcula el trigger
 /// `comanda_estado`, nunca la aplicación.
 model Comanda {
   id            String      @id @db.Uuid
   restauranteId String      @map("restaurante_id") @db.Uuid
   tipo          TipoComanda @default(mesa)
-  /// NULL sólo cuando tipo = para_llevar (CHECK a mano).
+  /// Para quién se pidió. NOT NULL: toda comanda es de un cliente. Es el
+  /// ORIGEN (lo que lee cocina y quien entrega el plato); quién DEBE cada
+  /// línea es `comanda_item.cliente_id`, que coincide salvo reasignación.
+  clienteId     String      @map("cliente_id") @db.Uuid
+  /// Dónde se sirvió: la mesa del cliente AL PEDIR (foto, no puntero vivo).
+  /// NULL si el cliente no estaba sentado o es para llevar. Si hay mesa, hay
+  /// salón y plantilla (CHECK `comanda_tipo_coherente`).
   salonId       String?     @map("salon_id") @db.Uuid
   mesaId        String?     @map("mesa_id") @db.Uuid
   plantillaId   String?     @map("plantilla_id") @db.Uuid
+  /// ⚠️ LEGADO desde 2026-11-05: la reserva se lee de `cliente.reservacion_id`.
+  /// Se conserva por el histórico; las comandas nuevas pueden copiar la del
+  /// cliente como foto, pero nada nuevo debe decidir con esta columna.
   reservacionId String?     @map("reservacion_id") @db.Uuid
 
   /// Número visible del día ("Comanda #14"). Se asigna con un UPSERT atómico
@@ -753,10 +851,11 @@ model Comanda {
   fechaOperativa DateTime      @map("fecha_operativa") @db.Date
   turno          TurnoServicio
 
-  comensales Int     @default(1)
-  meseroId   String? @map("mesero_id") @db.Uuid
-  /// Lo que escribió el mesero al tomar el pedido. NULL = no lo dijo. Normalizado
-  /// (sin espacios de borde, no vacío) por `comanda_cliente_nombre_normalizado`.
+  comensales    Int     @default(1)
+  meseroId      String? @map("mesero_id") @db.Uuid
+  /// ⚠️ LEGADO desde 2026-11-05: el nombre vive en `cliente.nombre`. Se conserva
+  /// por el histórico (lo que escribió el mesero antes de que existiera el
+  /// cliente). Normalizado por `comanda_cliente_nombre_normalizado`.
   clienteNombre String? @map("cliente_nombre")
 
   /// DERIVADO por el trigger `comanda_estado`. Ver el enum `EstadoComanda`.
@@ -764,16 +863,16 @@ model Comanda {
 
   /// La cocina/barra sacó el pedido. Mientras sea NULL, la comanda está en la
   /// cola de despacho (`v_cola_despacho`, índice `comanda_cola_despacho_idx`).
+  /// Ninguna línea se factura antes (`comanda_cobro_tras_despacho`, trigger).
   despachadaEn DateTime? @map("despachada_en") @db.Timestamptz(6)
-  /// Se descartó el pedido. Excluyente con `cobroId` (`comanda_anulada_no_cobrada`).
+  /// Se descartó el pedido. Imposible si alguna línea tiene factura
+  /// (`comanda_anulada_no_cobrada`, trigger): primero se desfactura.
   anuladaEn    DateTime? @map("anulada_en") @db.Timestamptz(6)
-  /// La factura que la cubre. NULL = sigue en la cuenta viva de la mesa.
-  /// Sólo se puede poner sobre una comanda ya despachada (`comanda_cobro_tras_despacho`).
-  cobroId      String?   @map("cobro_id") @db.Uuid
 
-  /// Suma de las líneas VIVAS de esta comanda, y nada más. Descuento, impuesto
-  /// y propina se negocian sobre la cuenta de la mesa y viven en `Cobro`: un
-  /// ticket de cocina no tiene propina. Lo recalcula el servidor, nunca el cliente.
+  /// Suma de las líneas VIVAS (facturadas o no). DERIVADO desde 2026-11-05:
+  /// lo recalcula el trigger `comanda_estado` cada vez que cambia una línea,
+  /// así que escribirlo desde la aplicación no hace nada. Descuento, impuesto
+  /// y propina viven en `Cobro`: un ticket de cocina no tiene propina.
   total Decimal @default(0) @db.Decimal(14, 4)
 
   anuladaPorId    String? @map("anulada_por_id") @db.Uuid
@@ -784,13 +883,13 @@ model Comanda {
   actualizadaEn DateTime @updatedAt @map("actualizada_en") @db.Timestamptz(6)
 
   restaurante Restaurante  @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  cliente     Cliente      @relation(fields: [restauranteId, clienteId], references: [restauranteId, id], onDelete: Restrict)
   salon       Salon?       @relation(fields: [restauranteId, salonId], references: [restauranteId, id], onDelete: Restrict)
   mesa        Mesa?        @relation(fields: [restauranteId, mesaId], references: [restauranteId, id], onDelete: Restrict)
   plantilla   Plantilla?   @relation(fields: [restauranteId, plantillaId], references: [restauranteId, id], onDelete: Restrict)
   reservacion Reservacion? @relation(fields: [restauranteId, reservacionId], references: [restauranteId, id], onDelete: Restrict)
   mesero      Usuario?     @relation("comanda_mesero", fields: [restauranteId, meseroId], references: [restauranteId, id], onDelete: Restrict)
   anuladaPor  Usuario?     @relation("comanda_anulada_por", fields: [restauranteId, anuladaPorId], references: [restauranteId, id], onDelete: Restrict)
-  cobro       Cobro?       @relation(fields: [restauranteId, cobroId], references: [restauranteId, id], onDelete: Restrict)
 
   items ComandaItem[]
 
@@ -799,15 +898,14 @@ model Comanda {
   @@index([restauranteId, fechaOperativa, estado])
   @@index([restauranteId, estado, creadaEn])
   @@index([restauranteId, meseroId, fechaOperativa])
-  /// Qué comandas cubrió una factura (reimprimirla sin inferir por timestamp).
-  @@index([restauranteId, cobroId], map: "comanda_cobro_idx")
+  /// Las comandas de un cliente (su cuenta, cerrar el cliente) e índice de la FK.
+  @@index([restauranteId, clienteId], map: "comanda_cliente_idx")
   /// Una reserva sentada genera N comandas: índice, ya no unicidad.
   @@index([restauranteId, reservacionId])
-  /// ⚠️ Los dos índices que sostienen la operación —`comanda_cola_despacho_idx`
-  /// (FIFO de la cola) y `comanda_cuenta_abierta_idx` (cuenta viva de la mesa)—
-  /// son PARCIALES y viven en prisma/sql/01_constraints_y_triggers.sql. Prisma
-  /// no los ve y en cada `migrate dev` propone un DROP INDEX sobre ellos: hay
-  /// que borrar ese DROP a mano (docs/DECISIONES-DATOS.md §8).
+  /// ⚠️ `comanda_cola_despacho_idx` (FIFO de la cola) es PARCIAL y vive en
+  /// prisma/sql/01_constraints_y_triggers.sql. `comanda_cuenta_abierta_idx`
+  /// murió con `comanda.cobro_id` (2026-11-05): la cuenta viva ahora es por
+  /// línea y la sirve `comanda_item_deuda_idx`.
   @@map("comanda")
 }
 
@@ -815,11 +913,30 @@ model Comanda {
 /// ticket de hoy debe reimprimirse idéntico dentro de un año aunque el producto
 /// haya cambiado de precio o de nombre. Es también la tabla sobre la que se
 /// calculan "ventas del día" y "producto más vendido".
+///
+/// ⭐ Desde 2026-11-05 la línea es la unidad de DEUDA y de FACTURACIÓN
+/// (docs/DECISIONES-DATOS.md §15):
+///   · `cliente_id` — quién la debe. Nace igual al cliente de la comanda;
+///     reasignar deuda es cambiar esto (sólo mientras no tenga factura).
+///   · `cobro_id`   — la factura que la cubre; NULL = deuda viva del cliente.
+///     Una línea está en A LO SUMO UNA factura por construcción (es una
+///     columna). Cobrar 2 de 3 cafés = PARTIR la línea (2 + 1) y facturar una;
+///     no hay tabla puente con cantidades.
+/// Deuda viva = `cancelado_en IS NULL AND cobro_id IS NULL` en una comanda no
+/// anulada (`comanda_item_deuda_idx`, `v_cuenta_cliente`).
 model ComandaItem {
-  id            String @id @db.Uuid
-  restauranteId String @map("restaurante_id") @db.Uuid
-  comandaId     String @map("comanda_id") @db.Uuid
-  productoId    String @map("producto_id") @db.Uuid
+  id            String  @id @db.Uuid
+  restauranteId String  @map("restaurante_id") @db.Uuid
+  comandaId     String  @map("comanda_id") @db.Uuid
+  productoId    String  @map("producto_id") @db.Uuid
+  /// Deudor de la línea. NOT NULL. Si la línea tiene factura, es el cliente
+  /// de esa factura: lo garantiza la FK compuesta hacia `cobro`.
+  clienteId     String  @map("cliente_id") @db.Uuid
+  /// Factura que cubre la línea. Sólo sobre una línea VIVA de una comanda
+  /// DESPACHADA y no anulada (trigger `comanda_item_editable`). Una línea
+  /// facturada que luego se cancela CONSERVA su `cobro_id` (traza) y deja de
+  /// sumar en el subtotal de la factura.
+  cobroId       String? @map("cobro_id") @db.Uuid
 
   orden Int @default(0)
 
@@ -828,18 +945,21 @@ model ComandaItem {
   destinoSnap        DestinoPreparacion @map("destino_snap")
   cantidad           Decimal            @db.Decimal(14, 3)
   descuentoLinea     Decimal            @default(0) @map("descuento_linea") @db.Decimal(14, 4)
-  /// cantidad * precio_unitario_snap - descuento_linea. Se persiste para que
-  /// los reportes sumen una columna en vez de recalcular en cada consulta.
+  /// round(cantidad * precio_unitario_snap - descuento_linea, 4). Se persiste
+  /// para que los reportes sumen una columna; desde 2026-11-05 el CHECK
+  /// `comanda_item_total_coherente` impide que mienta, porque es lo que suma
+  /// el subtotal de la factura.
   totalLinea         Decimal            @map("total_linea") @db.Decimal(14, 4)
 
   nota String?
 
-  /// Cancelada ⟺ `cancelado_en IS NOT NULL`. Sustituye al enum de estado de
-  /// línea: sin workflow por ítem (la comanda se despacha entera), los estados
-  /// `pendiente`/`en_preparacion`/`servido` no tenían quién los moviera, y
-  /// `enviado_en`/`servido_en` eran fechas que nadie escribía.
-  /// ⚠️ Sólo se puede escribir mientras la comanda siga `pendiente`: lo impide
-  /// el trigger `comanda_item_solo_pendiente`.
+  /// Cancelada ⟺ `cancelado_en IS NOT NULL`. Sin workflow por ítem: la
+  /// comanda se despacha entera.
+  /// Desde 2026-11-05 una línea se puede agregar, cambiar o cancelar también en
+  /// comandas despachadas y cobradas (trigger `comanda_item_editable`, que
+  /// sustituye a `comanda_item_solo_pendiente`), y todo cambio posterior al
+  /// despacho queda en `bitacora`. Una línea agregada a una comanda ya
+  /// despachada NO vuelve a cocina: se considera servida.
   canceladoEn       DateTime? @map("cancelado_en") @db.Timestamptz(6)
   canceladoPorId    String?   @map("cancelado_por_id") @db.Uuid
   motivoCancelacion String?   @map("motivo_cancelacion")
@@ -851,26 +971,47 @@ model ComandaItem {
   comanda      Comanda     @relation(fields: [restauranteId, comandaId], references: [restauranteId, id], onDelete: Cascade)
   producto     Producto    @relation(fields: [restauranteId, productoId], references: [restauranteId, id], onDelete: Restrict)
   canceladoPor Usuario?    @relation("item_cancelado_por", fields: [restauranteId, canceladoPorId], references: [restauranteId, id], onDelete: Restrict)
+  cliente      Cliente     @relation(fields: [restauranteId, clienteId], references: [restauranteId, id], onDelete: Restrict)
+  /// ⭐ FK de TRES columnas: una línea facturada pertenece al cliente de su
+  /// factura, por construcción. MATCH SIMPLE: con `cobro_id` NULL no se mira.
+  /// `onUpdate: Restrict` a propósito (el default de Prisma es Cascade): cambiar
+  /// el cliente de una factura no debe arrastrar en silencio a sus líneas.
+  cobro        Cobro?      @relation(fields: [restauranteId, cobroId, clienteId], references: [restauranteId, id, clienteId], onDelete: Restrict, onUpdate: Restrict)
 
   @@unique([restauranteId, id], map: "comanda_item_restaurante_id_key")
   @@index([comandaId, orden])
   @@index([restauranteId, productoId])
+  /// Las líneas de una factura (reimprimirla) e índice de la FK hacia `cobro`.
+  @@index([restauranteId, cobroId], map: "comanda_item_cobro_idx")
   /// No hay índice de "cola de cocina" por ítem: la cola es de COMANDAS
   /// (`comanda_cola_despacho_idx`) y `v_cola_despacho` trae las líneas
   /// embebidas en jsonb desde el índice de arriba.
+  /// ⚠️ `comanda_item_deuda_idx` (deuda viva por cliente) es PARCIAL y vive en
+  /// prisma/sql/01_constraints_y_triggers.sql §2.
   @@map("comanda_item")
 }
 
-/// ⭐ LA FACTURA: la cuenta consolidada de una mesa, cobrada de una vez.
+/// ⭐ LA FACTURA: algunas (o todas) las líneas de UN cliente, cobradas juntas.
 ///
 /// Es un comprobante INTERNO de cobro, no un documento fiscal: no lleva RIF,
 /// ni IVA discriminado, ni correlativo SENIAT. Si algún día se vuelve fiscal,
 /// entra como una entidad aparte que apunta aquí, sin tocar esto.
 ///
-/// Reúne N comandas despachadas de la misma mesa vía `comanda.cobro_id`. Es una
-/// FK simple y NO una tabla puente: un cobro parcial ("cóbrame estas tres
-/// comandas, la cuarta sigue en cocina") se expresa eligiendo qué comandas se
-/// apuntan, y esa decisión es de la API (`comandaIds[]`), no del esquema.
+/// Desde 2026-11-05 (§15) cubre LÍNEAS vía `comanda_item.cobro_id`, no
+/// comandas: dividir la cuenta es elegir qué líneas se apuntan. Todas son del
+/// cliente de la factura (FK compuesta de `comanda_item`).
+///
+/// Ya emitida SÍ se puede corregir, en CUALQUIER día operativo (decisión del
+/// dueño, 2026-11-05) y con bitácora: agregar/quitar/cambiar líneas,
+/// descuento, propina. Reglas que hace cumplir la base:
+///   · su día y su número no cambian nunca (`cobro_guardia`): la venta
+///     corregida sigue en el día ORIGINAL de la factura, y el dinero del ajuste
+///     cae en la caja del día en que se corrige (`cobro_pago.fecha_operativa`);
+///   · al COMMIT, subtotal = Σ líneas vivas, total y total_bs coherentes y
+///     Σ pagos = total ± 0,01 (`cobro_coherente`, diferido): si el total
+///     cambia, en la misma transacción entra el cobro adicional o la
+///     devolución que lo compensa;
+///   · una anulada es inmutable.
 ///
 /// El día operativo y el turno son LOS DEL COBRO, no los de las comandas: la
 /// venta se reconoce cuando entra el dinero, que es lo que tiene que cuadrar
@@ -878,8 +1019,10 @@ model ComandaItem {
 model Cobro {
   id            String  @id @db.Uuid
   restauranteId String  @map("restaurante_id") @db.Uuid
-  /// NULL = cobro de una comanda para llevar. Si hay mesa, hay salón
-  /// (`cobro_tipo_coherente`).
+  /// A quién se le cobra. NOT NULL. Las líneas facturadas son suyas.
+  clienteId     String  @map("cliente_id") @db.Uuid
+  /// Dónde estaba sentado el cliente al cobrar (foto). NULL = sin mesa o para
+  /// llevar. Si hay mesa, hay salón (`cobro_tipo_coherente`).
   mesaId        String? @map("mesa_id") @db.Uuid
   salonId       String? @map("salon_id") @db.Uuid
 
@@ -892,12 +1035,16 @@ model Cobro {
   /// El máximo de las comandas cubiertas: la mesa tiene UN número de comensales
   /// y si creció durante la noche manda el mayor.
   comensales     Int           @default(1)
-  /// Nombre CONGELADO en la factura (lo que se imprime y se reimprime). Lo
-  /// resuelve el servidor al cobrar (§14). NULL = "Consumidor final".
+  /// Nombre CONGELADO en la factura (lo que se imprime y se reimprime). NULL =
+  /// "Consumidor final". Desde §15: DTO del cajero > `cliente.nombre`. Es lo
+  /// que permite "facturar a otro nombre" sin cambiar de cliente.
   clienteNombre  String?       @map("cliente_nombre")
 
   /// Totales en moneda base (USD). Los calcula el servidor a partir de las
-  /// comandas bloqueadas con FOR UPDATE; jamás se toman del cliente.
+  /// líneas bloqueadas con FOR UPDATE; jamás se toman del cliente. La base los
+  /// VERIFICA al COMMIT (`cobro_coherente`): subtotal = Σ total_linea de las
+  /// líneas vivas; total = subtotal - descuento + impuesto + propina;
+  /// total_bs = round(total * tasa_valor, 4).
   subtotal  Decimal @default(0) @db.Decimal(14, 4)
   descuento Decimal @default(0) @db.Decimal(14, 4)
   impuesto  Decimal @default(0) @db.Decimal(14, 4)
@@ -923,24 +1070,32 @@ model Cobro {
   actualizadoEn DateTime @updatedAt @map("actualizado_en") @db.Timestamptz(6)
 
   restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  cliente     Cliente     @relation(fields: [restauranteId, clienteId], references: [restauranteId, id], onDelete: Restrict)
   mesa        Mesa?       @relation(fields: [restauranteId, mesaId], references: [restauranteId, id], onDelete: Restrict)
   salon       Salon?      @relation(fields: [restauranteId, salonId], references: [restauranteId, id], onDelete: Restrict)
   tasa        TasaCambio  @relation(fields: [restauranteId, tasaId], references: [restauranteId, id], onDelete: Restrict)
   cobradoPor  Usuario?    @relation("cobro_cobrado_por", fields: [restauranteId, cobradoPorId], references: [restauranteId, id], onDelete: Restrict)
   anuladoPor  Usuario?    @relation("cobro_anulado_por", fields: [restauranteId, anuladoPorId], references: [restauranteId, id], onDelete: Restrict)
 
-  comandas Comanda[]
-  pagos    CobroPago[]
+  /// Las líneas facturadas (incluidas las canceladas después, que ya no suman).
+  lineas ComandaItem[]
+  pagos  CobroPago[]
 
   @@unique([restauranteId, id], map: "cobro_restaurante_id_key")
+  /// Destino de la FK de tres columnas de `comanda_item` (línea ↔ cliente de su
+  /// factura). Redundante con la PK a propósito: es lo que la hace declarable.
+  @@unique([restauranteId, id, clienteId], map: "cobro_cliente_key")
   @@unique([restauranteId, fechaOperativa, numeroDia], map: "cobro_numero_dia_unico")
   @@index([restauranteId, fechaOperativa, turno], map: "cobro_dia_idx")
   @@index([restauranteId, mesaId, cobradoEn], map: "cobro_mesa_idx")
-  /// ⚠️ `cobro_no_vacio` es un CONSTRAINT TRIGGER diferido (vive en
-  /// prisma/sql/01_constraints_y_triggers.sql): un cobro que no cubre ninguna
-  /// comanda revienta en el COMMIT. Es la red que convierte la carrera de dos
-  /// cajeros cobrando la misma mesa en un error limpio en vez de en una factura
-  /// fantasma con pagos dentro y ninguna venta detrás.
+  /// "Lo que ya pagó este cliente" (`v_cuenta_cliente.total_cobrado`) e índice
+  /// de la FK hacia `cliente`.
+  @@index([restauranteId, clienteId], map: "cobro_cliente_idx")
+  /// ⚠️ `cobro_coherente` es un CONSTRAINT TRIGGER diferido (vive en
+  /// prisma/sql/01_constraints_y_triggers.sql §10): al COMMIT verifica que la
+  /// factura cubra al menos una línea viva (error `cobro_no_vacio`, la carrera
+  /// de dos cajeros), que sus totales salgan de sus líneas y que los pagos
+  /// cuadren. Más `cobro_guardia`: día y número inmutables, anulada congelada.
   @@map("cobro")
 }
 
@@ -949,6 +1104,18 @@ model Cobro {
 /// `monto_usd` es el equivalente en moneda base con la tasa que se aplicó; se
 /// persiste porque es dinero que YA entró, no un precio derivado, y el reporte
 /// de cuadre de caja suma esa columna.
+///
+/// ⭐ LIBRO DE SÓLO AGREGAR (desde 2026-11-05, §15.3). Un pago registrado no se
+/// edita (trigger `cobro_pago_guardia`): si la factura baja, se registra una
+/// DEVOLUCIÓN = fila con `monto` y `monto_usd` NEGATIVOS, con el método por el
+/// que sale el dinero (y referencia si es pago móvil/transferencia); si sube,
+/// un pago positivo más. Así cada método de la caja cuadra solo
+/// (`v_venta_dia_metodo` suma con signo) y nunca desaparece dinero registrado.
+/// Una devolución en Bs usa la tasa CONGELADA de la factura (`cobro.tasa_valor`).
+/// No se aceptan pagos nuevos en facturas anuladas. Cada movimiento se fecha
+/// con el día operativo en que ocurre (`fecha_operativa`), no con el de la
+/// factura: corregir hoy una factura de ayer cambia la VENTA de ayer pero el
+/// dinero del ajuste entra o sale de la caja de HOY.
 model CobroPago {
   id            String @id @db.Uuid
   restauranteId String @map("restaurante_id") @db.Uuid
@@ -956,7 +1123,8 @@ model CobroPago {
 
   metodo       MetodoPago
   moneda       Moneda
-  /// Monto en la moneda de `moneda`.
+  /// Monto en la moneda de `moneda`. Negativo = devolución (mismo signo que
+  /// `monto_usd`, nunca 0: CHECK `cobro_pago_monto_valido`).
   monto        Decimal    @db.Decimal(18, 4)
   /// Tasa usada para convertir. NULL si moneda = USD (moneda base).
   tasaAplicada Decimal?   @map("tasa_aplicada") @db.Decimal(18, 8)
@@ -965,6 +1133,13 @@ model CobroPago {
   referencia   String?
 
   recibidoEn      DateTime @default(now()) @map("recibido_en") @db.Timestamptz(6)
+  /// Día operativo en que el dinero ENTRÓ o SALIÓ de la caja (no el de la
+  /// factura). Lo fija el trigger `cobro_pago_guardia` a partir de
+  /// `recibido_en`; el default sólo existe para que Prisma no lo exija en el
+  /// `create`. Es la fecha por la que agrupa el cuadre por método
+  /// (`v_venta_dia_metodo`): una corrección hecha hoy sobre una factura de
+  /// otro día mueve la caja de HOY y no reescribe la de ese día.
+  fechaOperativa  DateTime @default(dbgenerated("CURRENT_DATE")) @map("fecha_operativa") @db.Date
   registradoPorId String?  @map("registrado_por_id") @db.Uuid
 
   restaurante   Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
@@ -974,7 +1149,60 @@ model CobroPago {
   @@unique([restauranteId, id], map: "cobro_pago_restaurante_id_key")
   @@index([cobroId])
   @@index([restauranteId, recibidoEn])
+  /// El cierre de caja de un día (`v_venta_dia_metodo`).
+  @@index([restauranteId, fechaOperativa], map: "cobro_pago_dia_idx")
   @@map("cobro_pago")
+}
+
+/// Bitácora de auditoría: quién, cuándo, qué fila, antes y después.
+///
+/// ⚠️ La escriben TRIGGERS, nunca la aplicación (`hayai_bitacora`, prisma/sql/
+/// 01_constraints_y_triggers.sql §12). Así ningún camino de código puede
+/// corregir una factura sin dejar rastro. Qué se registra:
+///   · `comanda_item` — toda línea agregada o cambiada DESPUÉS del despacho
+///     (cantidad, nota, precio, descuento, cancelación, deudor, factura). No el
+///     simple "facturar" (cobro_id NULL → X sin otro cambio): eso ya es el cobro.
+///   · `cobro`        — toda corrección de una factura emitida (totales,
+///     descuento, propina, nombre, anulación).
+///   · `cliente`      — cambios de nombre, de mesa (= historial de asiento),
+///     cierre y reapertura.
+/// Los pagos NO pasan por aquí: `cobro_pago` ya es un libro de sólo agregar
+/// con autor y hora propios.
+///
+/// El autor sale de `SET LOCAL app.usuario_id` (y el motivo, opcional, de
+/// `app.motivo`), que el servicio fija al abrir la transacción. Sin autor el
+/// trigger REVIENTA (`bitacora_sin_autor`): una bitácora sin "quién" no sirve.
+/// Es la única tabla cuyo id lo genera la base (`gen_random_uuid()`): sus filas
+/// las inserta un trigger, no el backend.
+/// Inmutable: el trigger `bitacora_inmutable` rechaza cualquier UPDATE.
+model Bitacora {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  restauranteId String   @map("restaurante_id") @db.Uuid
+  /// 'comanda_item' | 'cobro' | 'cliente' (TG_TABLE_NAME).
+  tabla         String
+  /// Id de la fila afectada en `tabla`.
+  entidadId     String   @map("entidad_id") @db.Uuid
+  /// 'INSERT' | 'UPDATE' (TG_OP).
+  operacion     String
+  /// Columnas que cambiaron (vacío en un INSERT).
+  cambios       String[] @default([])
+  /// La fila completa antes y después (`to_jsonb`, claves snake_case). NULL
+  /// `antes` en un INSERT.
+  antes         Json?
+  despues       Json?
+  usuarioId     String   @map("usuario_id") @db.Uuid
+  motivo        String?
+  creadoEn      DateTime @default(dbgenerated("clock_timestamp()")) @map("creado_en") @db.Timestamptz(6)
+
+  restaurante Restaurante @relation(fields: [restauranteId], references: [id], onDelete: Cascade)
+  usuario     Usuario     @relation(fields: [restauranteId, usuarioId], references: [restauranteId, id], onDelete: Restrict)
+
+  /// Historia de UNA fila (una línea, una factura, un cliente).
+  @@index([restauranteId, entidadId], map: "bitacora_entidad_idx")
+  /// Lo corregido en un rango de tiempo (cierre de caja). La FK de autor no
+  /// lleva índice propio: un usuario no se borra nunca.
+  @@index([restauranteId, creadoEn], map: "bitacora_fecha_idx")
+  @@map("bitacora")
 }
 
 // ═══════════════════ 6 · SOPORTE: TASA, CONTADOR, ROLLUP ═══════════════════

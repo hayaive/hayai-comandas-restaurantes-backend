@@ -60,9 +60,10 @@ CREATE UNIQUE INDEX "plantilla_activa_unica"
 -- Murió con el rediseño de comandas múltiples (migración
 -- 20260915183000_comandas_multiples_y_cobro): ahora cada envío a cocina es una
 -- comanda propia y una mesa tiene N vivas a la vez. Su sucesor sin el UNIQUE es
--- `comanda_cuenta_abierta_idx`, en §2 — conserva los dos beneficios de
--- rendimiento (el plano y las cuentas por cobrar leen un índice minúsculo) y
--- pierde sólo el invariante que dejó de aplicar.
+-- `comanda_cuenta_abierta_idx` (que a su vez murió el 2026-11-05: hoy la cuenta
+-- es del cliente y la sirven `comanda_item_deuda_idx` y `cliente_abierto_idx`,
+-- en §2). Tampoco hay unicidad de cliente por mesa: dos cuentas separadas en
+-- la misma mesa son legales.
 -- No se reintroduce: si alguien lo recrea, la segunda comanda de una mesa
 -- empieza a fallar con 23505 en plena cena.
 
@@ -81,12 +82,33 @@ CREATE INDEX "comanda_cola_despacho_idx"
   ON "comanda" ("restaurante_id", "creada_en")
   WHERE "despachada_en" IS NULL AND "anulada_en" IS NULL;
 
--- ⭐ La cuenta viva de una mesa: toda comanda no cobrada y no anulada, esté en
--- cocina o esperando pago. Sirve a `v_mesa_estado` y a `v_cuenta_mesa`.
--- Sustituye a `comanda_por_cobrar_idx` (ya no existe el estado `por_cobrar`).
-CREATE INDEX "comanda_cuenta_abierta_idx"
-  ON "comanda" ("restaurante_id", "mesa_id")
-  WHERE "mesa_id" IS NOT NULL AND "cobro_id" IS NULL AND "anulada_en" IS NULL;
+-- ⚠️ AQUÍ VIVÍA `comanda_cuenta_abierta_idx` (comandas sin cobrar por mesa).
+-- Murió con `comanda.cobro_id` en la migración 20261105120100: la factura pasó
+-- a la LÍNEA y la cuenta, al CLIENTE (docs/DECISIONES-DATOS.md §15). Sus
+-- sucesores son los tres de abajo.
+
+-- ⭐ La deuda viva: líneas sin factura y sin cancelar, por deudor. Diminuto:
+-- sólo lo que está por cobrar AHORA. Sirve a `v_cuenta_cliente`, a
+-- `v_mesa_estado` y al cierre del cliente.
+-- ponytail: incluye las líneas de comandas ANULADAS (la anulación no toca las
+-- líneas y el filtro `comanda.anulada_en` está en otra tabla); crecen al
+-- ritmo de las anulaciones, que son pocas. Si algún día pesa, cancelar las
+-- líneas al anular la comanda y el índice vuelve a ser exacto.
+CREATE INDEX "comanda_item_deuda_idx"
+  ON "comanda_item" ("restaurante_id", "cliente_id")
+  WHERE "cobro_id" IS NULL AND "cancelado_en" IS NULL;
+
+-- Clientes ABIERTOS por mesa: el plano (¿quién está sentado aquí?) y la
+-- pantalla de mesas (con el prefijo restaurante_id, todos los abiertos).
+CREATE INDEX "cliente_abierto_idx"
+  ON "cliente" ("restaurante_id", "mesa_id")
+  WHERE "cerrado_en" IS NULL;
+
+-- Un solo cliente ABIERTO por reserva: el doble toque en "sentar" (o dos
+-- pantallas haciendo check-in a la vez) da 23505 en vez de dos cuentas.
+CREATE UNIQUE INDEX "cliente_reservacion_abierta_unica"
+  ON "cliente" ("restaurante_id", "reservacion_id")
+  WHERE "reservacion_id" IS NOT NULL AND "cerrado_en" IS NULL;
 
 -- Agenda de reservas: sólo las que todavía pueden ocupar una mesa.
 CREATE INDEX "reservacion_agenda_idx"
@@ -259,35 +281,33 @@ ALTER TABLE "comanda_item"
   -- La traza de cancelación sólo existe si hubo cancelación.
   ADD CONSTRAINT "comanda_item_cancelacion_coherente" CHECK (
     "cancelado_en" IS NOT NULL OR ("cancelado_por_id" IS NULL AND "motivo_cancelacion" IS NULL)
-  );
+  ),
+  -- (2026-11-05) `total_linea` es lo que suma el subtotal de la factura: no
+  -- puede mentir. La migración lo crea NOT VALID + VALIDATE que perdona, para
+  -- no caerse en el deploy si hay líneas históricas mal calculadas.
+  ADD CONSTRAINT "comanda_item_total_coherente"
+    CHECK ("total_linea" = round("cantidad" * "precio_unitario_snap" - "descuento_linea", 4));
 
--- Una comanda de mesa necesita mesa, salón y plantilla; una de para llevar,
--- ninguna de las tres. Sin esto aparecen comandas de mesa sin mesa, que es el
--- estado que rompe el plano.
+-- (2026-11-05) Una comanda puede no tener mesa aunque se consuma en el local:
+-- el cliente no está sentado. Lo que no puede es tener mesa sin salón ni
+-- plantilla, ni ser para llevar con mesa.
 ALTER TABLE "comanda"
   ADD CONSTRAINT "comanda_tipo_coherente" CHECK (
-    ("tipo" = 'mesa'        AND "mesa_id" IS NOT NULL AND "salon_id" IS NOT NULL AND "plantilla_id" IS NOT NULL)
-    OR
-    ("tipo" = 'para_llevar' AND "mesa_id" IS NULL)
+    ("mesa_id" IS NULL OR ("salon_id" IS NOT NULL AND "plantilla_id" IS NOT NULL))
+    AND ("tipo" = 'mesa' OR "mesa_id" IS NULL)
   ),
   -- `comanda.total` es sólo la suma de sus líneas vivas. Descuento, impuesto y
   -- propina se negocian sobre la cuenta de la mesa y viven en `cobro`, así que
   -- el viejo `comanda_totales_validos` (que los cubría a los cinco) se partió
   -- en esto y en `cobro_totales_validos`.
   ADD CONSTRAINT "comanda_total_valido" CHECK ("total" >= 0),
-  -- Una comanda anulada no se cobra, y una cobrada no se anula.
-  ADD CONSTRAINT "comanda_anulada_no_cobrada" CHECK ("anulada_en" IS NULL OR "cobro_id" IS NULL),
+  -- ⚠️ `comanda_anulada_no_cobrada` y `comanda_cobro_tras_despacho` eran CHECK
+  -- sobre `comanda.cobro_id`. Desde 2026-11-05 la factura vive en la línea y
+  -- las dos reglas cruzan tablas: las hacen `comanda_estado` (§8) y
+  -- `comanda_item_editable` (§9), que lanzan el error con el MISMO nombre.
   -- La traza de anulación sólo existe si hubo anulación.
   ADD CONSTRAINT "comanda_anulacion_coherente" CHECK (
     "anulada_en" IS NOT NULL OR ("anulada_por_id" IS NULL AND "motivo_anulacion" IS NULL)
-  ),
-  -- No se factura lo que no salió de cocina. Es lo que hace segura la regla del
-  -- dueño "si la mesa tiene algo pendiente, se cobra sólo lo despachado".
-  -- Sustituye a `comanda_cierre_coherente` y a `comanda_tasa_congelada`: el
-  -- cierre ya no es un estado + una fecha, son tres hechos independientes, y la
-  -- tasa se congela en `cobro`, donde es NOT NULL por columna.
-  ADD CONSTRAINT "comanda_cobro_tras_despacho" CHECK (
-    "cobro_id" IS NULL OR "despachada_en" IS NOT NULL
   ),
   -- Nombre del cliente normalizado (migración 20260919100000, DECISIONES-DATOS §14).
   -- Sin tope de longitud a propósito: el tope de 120 vive en los DTOs.
@@ -311,8 +331,11 @@ ALTER TABLE "cobro"
 -- Pago móvil y transferencia sin referencia = un pago que no se puede conciliar
 -- con el banco. Se bloquea en la base, no en el formulario.
 -- (Los tres CHECKs se llamaban `pago_*` cuando la tabla era `comanda_pago`.)
+-- (2026-11-05) Negativo = devolución. Nunca 0, y los dos montos con el mismo signo.
 ALTER TABLE "cobro_pago"
-  ADD CONSTRAINT "cobro_pago_monto_valido" CHECK ("monto" > 0 AND "monto_usd" > 0),
+  ADD CONSTRAINT "cobro_pago_monto_valido" CHECK (
+    ("monto" > 0 AND "monto_usd" > 0) OR ("monto" < 0 AND "monto_usd" < 0)
+  ),
   ADD CONSTRAINT "cobro_pago_referencia_obligatoria" CHECK (
     "metodo" NOT IN ('pago_movil', 'transferencia') OR (length(btrim(coalesce("referencia", ''))) > 0)
   ),
@@ -325,6 +348,11 @@ ALTER TABLE "cobro_pago"
 
 ALTER TABLE "tasa_cambio"
   ADD CONSTRAINT "tasa_valor_valido" CHECK ("valor" > 0);
+
+-- (2026-11-05) El cliente: nombre normalizado y traza de cierre coherente.
+ALTER TABLE "cliente"
+  ADD CONSTRAINT "cliente_nombre_normalizado" CHECK (length("nombre") > 0 AND "nombre" = btrim("nombre")),
+  ADD CONSTRAINT "cliente_cierre_coherente" CHECK ("cerrado_en" IS NOT NULL OR "cerrado_por_id" IS NULL);
 
 
 -- ───────────────────────────────────────────────────────────────────────────
@@ -366,7 +394,7 @@ AS $$
            ELSE 'madrugada'
          END::"turno_servicio"
   FROM (SELECT extract(hour FROM (momento AT TIME ZONE zona))::int AS h) t;
-$;
+$$;
 
 -- Fin de un acceso temporal (añadido 2026-09-18, migración
 -- 20260918230000_accesos_temporales). Copia de DOCUMENTACIÓN: la fuente es la
@@ -381,10 +409,10 @@ CREATE OR REPLACE FUNCTION "hayai_fin_acceso"(
 RETURNS timestamptz
 LANGUAGE sql
 STABLE
-AS $
+AS $$
   SELECT (("hayai_fecha_operativa"(momento, zona, corte) + duracion)::date + corte)
          AT TIME ZONE zona;
-$;
+$$;
 
 
 -- ───────────────────────────────────────────────────────────────────────────
@@ -489,33 +517,57 @@ CREATE TRIGGER "tasa_divisa_inmutable"
 
 
 -- ───────────────────────────────────────────────────────────────────────────
--- 8 · `comanda.estado` es DERIVADO          (añadido 2026-09-15)
+-- 8 a 13 · Cliente, factura por líneas y correcciones auditadas   (2026-11-05)
 --
--- El ciclo de vida de una comanda son TRES hechos independientes que sí se
--- escriben —`despachada_en`, `cobro_id`, `anulada_en`— y `estado` es la lectura
--- de una palabra que el frontend, los filtros de Prisma y los predicados de las
--- vistas necesitan. Este trigger es la ÚNICA definición de esa derivación:
--- escriba quien escriba (Prisma, un $executeRaw, un UPDATE a mano), la columna
--- no puede desincronizarse de los hechos.
+-- Copia de DOCUMENTACIÓN: la fuente es la migración
+-- 20261105120100_cliente_y_facturacion_por_lineas (§6 y §9, numeración de la
+-- migración). Sustituye a los antiguos §8 (comanda_estado sobre cobro_id),
+-- §9 (comanda_item_solo_pendiente) y §10 (cobro_no_vacio). El porqué, en
+-- docs/DECISIONES-DATOS.md §15.
 --
--- No es una columna GENERATED porque el cast texto->enum no es IMMUTABLE — la
--- misma trampa que impidió generar `reservacion.periodo` (§3).
---
--- ⚠️ Consecuencia para el código de aplicación: mandar `estado` en un INSERT o
--- UPDATE de Prisma no hace nada, el trigger lo pisa. Para mover una comanda se
--- escribe el HECHO (`despachadaEn`, `anuladaEn`, `cobroId`), nunca el estado.
+-- ⚠️ Los tres triggers *_cobro_coherente van AL FINAL de cualquier migración
+-- que haga UPDATE masivo: diferidos, cada fila tocada deja un evento pendiente
+-- que prohíbe los ALTER TABLE siguientes y se verifica entero al COMMIT.
 -- ───────────────────────────────────────────────────────────────────────────
 
+-- ───────────────────────────────────────────────────────────────────────────
+-- 6 · Funciones y triggers inmediatos
+-- ───────────────────────────────────────────────────────────────────────────
+
+-- 6.2 · `comanda.estado` y `comanda.total`, derivados de las líneas ─────────
 CREATE OR REPLACE FUNCTION "hayai_comanda_estado"()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
+DECLARE
+  v_total      numeric;
+  v_facturadas int;
+  v_por_cobrar int;
 BEGIN
+  SELECT coalesce(sum(ci."total_linea") FILTER (WHERE ci."cancelado_en" IS NULL), 0),
+         count(*) FILTER (WHERE ci."cobro_id" IS NOT NULL),
+         count(*) FILTER (WHERE ci."cobro_id" IS NULL AND ci."cancelado_en" IS NULL)
+    INTO v_total, v_facturadas, v_por_cobrar
+    FROM "comanda_item" ci
+   WHERE ci."restaurante_id" = NEW."restaurante_id" AND ci."comanda_id" = NEW."id";
+
+  -- Eran CHECKs sobre `comanda.cobro_id`; ahora cruzan a las líneas.
+  IF v_facturadas > 0 AND NEW."anulada_en" IS NOT NULL THEN
+    RAISE EXCEPTION 'La comanda % tiene líneas facturadas: desfactúralas antes de anularla', NEW."id"
+      USING ERRCODE = '23514', CONSTRAINT = 'comanda_anulada_no_cobrada';
+  END IF;
+  IF v_facturadas > 0 AND NEW."despachada_en" IS NULL THEN
+    RAISE EXCEPTION 'La comanda % tiene líneas facturadas y no figura como despachada', NEW."id"
+      USING ERRCODE = '23514', CONSTRAINT = 'comanda_cobro_tras_despacho';
+  END IF;
+
+  NEW."total"  := v_total;
   NEW."estado" := CASE
     WHEN NEW."anulada_en"    IS NOT NULL THEN 'anulada'
-    WHEN NEW."cobro_id"      IS NOT NULL THEN 'cobrada'
-    WHEN NEW."despachada_en" IS NOT NULL THEN 'despachada'
-    ELSE                                      'pendiente'
+    WHEN NEW."despachada_en" IS NULL     THEN 'pendiente'
+    WHEN v_facturadas = 0                THEN 'despachada'
+    WHEN v_por_cobrar = 0                THEN 'cobrada'
+    ELSE                                      'cobrada_parcial'
   END::"estado_comanda";
   RETURN NEW;
 END;
@@ -526,93 +578,443 @@ CREATE TRIGGER "comanda_estado"
   FOR EACH ROW
   EXECUTE FUNCTION "hayai_comanda_estado"();
 
-
--- ───────────────────────────────────────────────────────────────────────────
--- 9 · Los ítems sólo se tocan mientras la comanda esté pendiente
---
--- Cubre las tres reglas del dueño de una vez:
---   · se puede anular un ítem ANTES de despachar la comanda;
---   · no se le agregan ítems a una comanda que ya salió — rompería el FIFO: el
---     pedido entró a la cola con un contenido y saldría con otro;
---   · no se toca nada de una comanda ya cobrada — eso cambiaría el monto de una
---     factura ya emitida.
---
--- Sólo INSERT/UPDATE: el DELETE de un ítem no existe en el producto (cancelar
--- es lógico, con `cancelado_en`) y vigilarlo aquí rompería el DELETE en cascada
--- del restaurante.
--- ───────────────────────────────────────────────────────────────────────────
-
-CREATE OR REPLACE FUNCTION "hayai_comanda_item_solo_pendiente"()
+-- 6.3 · Qué se puede escribir en una línea ─────────────────────────────────
+-- Sustituye a `comanda_item_solo_pendiente`. Ya se pueden agregar, cambiar y
+-- cancelar líneas de comandas despachadas y cobradas (§15.2); lo que sigue
+-- prohibido:
+--   · tocar líneas de una comanda ANULADA;
+--   · mover una línea a otra comanda (rompería el estado y el total de ambas);
+--   · facturar una línea que no salió de cocina, o una ya cancelada;
+--   · meter o sacar líneas de una factura ANULADA, o cambiarlas (salvo la nota);
+--   · dejar deuda viva a un cliente CERRADO (cerrar y anotar a la vez se
+--     serializa con FOR SHARE: ver `hayai_cliente_cierre`).
+-- La regla "la línea facturada es del cliente de su factura" no está aquí: la
+-- hace la FK `comanda_item_restaurante_id_cobro_id_cliente_id_fkey`.
+-- Sólo INSERT/UPDATE: el DELETE no existe en el producto (cancelar es lógico)
+-- y vigilarlo rompería el DELETE en cascada del restaurante.
+CREATE OR REPLACE FUNCTION "hayai_comanda_item_editable"()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  v_estado "estado_comanda";
+  v_despachada timestamptz;
+  v_anulada    timestamptz;
+  v_cobro_anul timestamptz;
+  v_cerrado    timestamptz;
 BEGIN
-  SELECT c."estado" INTO v_estado
+  IF TG_OP = 'UPDATE' AND NEW."comanda_id" IS DISTINCT FROM OLD."comanda_id" THEN
+    RAISE EXCEPTION 'Una línea no cambia de comanda (línea %)', NEW."id"
+      USING ERRCODE = '23514', CONSTRAINT = 'comanda_item_comanda_fija';
+  END IF;
+
+  SELECT c."despachada_en", c."anulada_en" INTO v_despachada, v_anulada
     FROM "comanda" c
    WHERE c."restaurante_id" = NEW."restaurante_id" AND c."id" = NEW."comanda_id";
-
   -- Sin fila: que hable la FK compuesta (23503), cuyo mensaje es el correcto.
-  IF v_estado IS NULL THEN
+  IF NOT FOUND THEN
     RETURN NEW;
   END IF;
 
-  IF v_estado <> 'pendiente' THEN
-    RAISE EXCEPTION
-      'La comanda % está % : sus ítems ya no se pueden modificar',
-      NEW."comanda_id", v_estado
-      USING ERRCODE = '23514', CONSTRAINT = 'comanda_item_solo_pendiente';
+  IF v_anulada IS NOT NULL THEN
+    RAISE EXCEPTION 'La comanda % está anulada: sus líneas ya no se pueden modificar', NEW."comanda_id"
+      USING ERRCODE = '23514', CONSTRAINT = 'comanda_item_comanda_anulada';
+  END IF;
+
+  -- Entra en una factura (nueva o distinta).
+  IF NEW."cobro_id" IS NOT NULL
+     AND (TG_OP = 'INSERT' OR NEW."cobro_id" IS DISTINCT FROM OLD."cobro_id") THEN
+    IF v_despachada IS NULL THEN
+      RAISE EXCEPTION 'La comanda % sigue en cocina: sus líneas todavía no se facturan', NEW."comanda_id"
+        USING ERRCODE = '23514', CONSTRAINT = 'comanda_cobro_tras_despacho';
+    END IF;
+    IF NEW."cancelado_en" IS NOT NULL THEN
+      RAISE EXCEPTION 'La línea % está cancelada: no se factura', NEW."id"
+        USING ERRCODE = '23514', CONSTRAINT = 'comanda_item_factura_linea_viva';
+    END IF;
+    SELECT cb."anulado_en" INTO v_cobro_anul
+      FROM "cobro" cb WHERE cb."restaurante_id" = NEW."restaurante_id" AND cb."id" = NEW."cobro_id";
+    IF v_cobro_anul IS NOT NULL THEN
+      RAISE EXCEPTION 'La factura % está anulada: no admite líneas', NEW."cobro_id"
+        USING ERRCODE = '23514', CONSTRAINT = 'cobro_anulado_inmutable';
+    END IF;
+  END IF;
+
+  -- Una línea de una factura anulada está congelada (salvo la nota).
+  IF TG_OP = 'UPDATE' AND OLD."cobro_id" IS NOT NULL
+     AND (NEW."cantidad", NEW."precio_unitario_snap", NEW."descuento_linea", NEW."total_linea",
+          NEW."cancelado_en", NEW."cliente_id", NEW."cobro_id")
+         IS DISTINCT FROM
+         (OLD."cantidad", OLD."precio_unitario_snap", OLD."descuento_linea", OLD."total_linea",
+          OLD."cancelado_en", OLD."cliente_id", OLD."cobro_id") THEN
+    SELECT cb."anulado_en" INTO v_cobro_anul
+      FROM "cobro" cb WHERE cb."restaurante_id" = OLD."restaurante_id" AND cb."id" = OLD."cobro_id";
+    IF v_cobro_anul IS NOT NULL THEN
+      RAISE EXCEPTION 'La línea % pertenece a la factura anulada %: no se modifica', NEW."id", OLD."cobro_id"
+        USING ERRCODE = '23514', CONSTRAINT = 'cobro_anulado_inmutable';
+    END IF;
+  END IF;
+
+  -- Deuda viva ⇒ deudor abierto. FOR SHARE choca con el UPDATE que cierra al
+  -- cliente: o este INSERT espera y ve el cierre, o el cierre espera y ve la
+  -- línea (y se niega). Sin el lock, los dos pasan y queda un cliente cerrado
+  -- con deuda, que es dinero que nadie cobrará.
+  IF NEW."cobro_id" IS NULL AND NEW."cancelado_en" IS NULL THEN
+    SELECT k."cerrado_en" INTO v_cerrado
+      FROM "cliente" k
+     WHERE k."restaurante_id" = NEW."restaurante_id" AND k."id" = NEW."cliente_id"
+       FOR SHARE;
+    IF FOUND AND v_cerrado IS NOT NULL THEN
+      RAISE EXCEPTION 'El cliente % está cerrado: reábrelo para anotarle consumo', NEW."cliente_id"
+        USING ERRCODE = '23514', CONSTRAINT = 'cliente_cerrado';
+    END IF;
   END IF;
 
   RETURN NEW;
 END;
 $$;
 
-CREATE TRIGGER "comanda_item_solo_pendiente"
+CREATE TRIGGER "comanda_item_editable"
   BEFORE INSERT OR UPDATE ON "comanda_item"
   FOR EACH ROW
-  EXECUTE FUNCTION "hayai_comanda_item_solo_pendiente"();
+  EXECUTE FUNCTION "hayai_comanda_item_editable"();
 
-
--- ───────────────────────────────────────────────────────────────────────────
--- 10 · ⭐⭐ Un cobro SIEMPRE cubre al menos una comanda
---
--- Es la red que convierte la carrera de dos cajeros cobrando la misma mesa en
--- un error limpio en vez de en una factura fantasma: con pagos dentro, contada
--- en el reporte de ventas, y ninguna venta detrás.
---
--- La receta de cobro del servicio bloquea las comandas con `SELECT ... FOR
--- UPDATE` y ésa es la defensa principal; esto es el último recurso para
--- cualquier camino que no pase por ahí.
---
--- DEFERRABLE INITIALLY DEFERRED porque la transacción legítima es
--- `INSERT cobro` -> `UPDATE comanda SET cobro_id`, y en el instante del INSERT
--- todavía no hay ninguna comanda apuntando. Se evalúa en el COMMIT.
--- No desactivarlo con SET CONSTRAINTS en el código de aplicación.
--- ───────────────────────────────────────────────────────────────────────────
-
-CREATE OR REPLACE FUNCTION "hayai_cobro_no_vacio"()
+-- 6.4 · Cada cambio de una línea re-deriva su comanda ──────────────────────
+-- `UPDATE comanda SET total = total` no escribe nada útil: dispara
+-- `comanda_estado`, que recalcula total y estado desde las líneas. Sólo cuando
+-- cambió algo que los afecta (una nota no).
+CREATE OR REPLACE FUNCTION "hayai_comanda_item_derivar"()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  IF NEW."anulado_en" IS NULL
-     AND NOT EXISTS (
-           SELECT 1 FROM "comanda" c
-            WHERE c."restaurante_id" = NEW."restaurante_id" AND c."cobro_id" = NEW."id")
-  THEN
-    RAISE EXCEPTION
-      'El cobro % no cubre ninguna comanda (¿la mesa ya la cobró otro cajero?)',
-      NEW."id"
+  IF TG_OP = 'DELETE' THEN
+    UPDATE "comanda" SET "total" = "total"
+     WHERE "restaurante_id" = OLD."restaurante_id" AND "id" = OLD."comanda_id";
+    RETURN NULL;
+  END IF;
+
+  IF TG_OP = 'UPDATE'
+     AND NEW."total_linea"  IS NOT DISTINCT FROM OLD."total_linea"
+     AND NEW."cancelado_en" IS NOT DISTINCT FROM OLD."cancelado_en"
+     AND NEW."cobro_id"     IS NOT DISTINCT FROM OLD."cobro_id" THEN
+    RETURN NULL;
+  END IF;
+
+  UPDATE "comanda" SET "total" = "total"
+   WHERE "restaurante_id" = NEW."restaurante_id" AND "id" = NEW."comanda_id";
+  RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER "comanda_item_derivar"
+  AFTER INSERT OR UPDATE OR DELETE ON "comanda_item"
+  FOR EACH ROW
+  EXECUTE FUNCTION "hayai_comanda_item_derivar"();
+
+-- 6.5 · Un cliente no se cierra con deuda ──────────────────────────────────
+-- Deuda = líneas vivas sin factura que él DEBE, en comandas no anuladas. Lo
+-- que esté en cocina cuenta: si se va, alguien tiene que pagarlo o cancelarlo.
+CREATE OR REPLACE FUNCTION "hayai_cliente_cierre"()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_lineas int;
+  v_monto  numeric;
+BEGIN
+  IF NEW."cerrado_en" IS NOT NULL AND OLD."cerrado_en" IS NULL THEN
+    SELECT count(*), coalesce(sum(ci."total_linea"), 0) INTO v_lineas, v_monto
+      FROM "comanda_item" ci
+      JOIN "comanda" c ON c."restaurante_id" = ci."restaurante_id" AND c."id" = ci."comanda_id"
+     WHERE ci."restaurante_id" = NEW."restaurante_id"
+       AND ci."cliente_id"     = NEW."id"
+       AND ci."cobro_id"     IS NULL
+       AND ci."cancelado_en" IS NULL
+       AND c."anulada_en"    IS NULL;
+    IF v_lineas > 0 THEN
+      RAISE EXCEPTION 'El cliente % debe % línea(s) por % USD: factúralas, reasígnalas o cancélalas antes de cerrarlo',
+        NEW."nombre", v_lineas, v_monto
+        USING ERRCODE = '23514', CONSTRAINT = 'cliente_cierre_sin_deuda';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER "cliente_cierre_sin_deuda"
+  BEFORE UPDATE ON "cliente"
+  FOR EACH ROW
+  EXECUTE FUNCTION "hayai_cliente_cierre"();
+
+-- 6.6 · Lo que una factura emitida no puede hacer ──────────────────────────
+-- Decisión del dueño (2026-11-05): una factura se CORRIGE en cualquier día
+-- operativo, con bitácora. Lo que nunca cambia es su día y su número (la
+-- venta sigue perteneciendo a su día original), y una anulada no se toca ni
+-- se reactiva. El dinero del ajuste cae en la caja del día en que se corrige
+-- (`cobro_pago.fecha_operativa`, §6.7); la venta cambia en el día de la factura.
+CREATE OR REPLACE FUNCTION "hayai_cobro_guardia"()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW."fecha_operativa" IS DISTINCT FROM OLD."fecha_operativa"
+     OR NEW."numero_dia" IS DISTINCT FROM OLD."numero_dia" THEN
+    RAISE EXCEPTION 'El día y el número de una factura emitida no cambian (factura %)', OLD."id"
+      USING ERRCODE = '23514', CONSTRAINT = 'cobro_fecha_inmutable';
+  END IF;
+
+  IF OLD."anulado_en" IS NOT NULL AND NEW."anulado_en" IS NULL THEN
+    RAISE EXCEPTION 'Una factura anulada no se reactiva (factura %)', OLD."id"
+      USING ERRCODE = '23514', CONSTRAINT = 'cobro_anulado_inmutable';
+  END IF;
+
+  IF (NEW."subtotal", NEW."descuento", NEW."impuesto", NEW."propina", NEW."total",
+      NEW."total_bs", NEW."tasa_id", NEW."tasa_valor")
+     IS DISTINCT FROM
+     (OLD."subtotal", OLD."descuento", OLD."impuesto", OLD."propina", OLD."total",
+      OLD."total_bs", OLD."tasa_id", OLD."tasa_valor") THEN
+    IF OLD."anulado_en" IS NOT NULL THEN
+      RAISE EXCEPTION 'La factura % está anulada: no se corrige', OLD."id"
+        USING ERRCODE = '23514', CONSTRAINT = 'cobro_anulado_inmutable';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER "cobro_guardia"
+  BEFORE UPDATE ON "cobro"
+  FOR EACH ROW
+  EXECUTE FUNCTION "hayai_cobro_guardia"();
+
+-- 6.7 · Los pagos son un libro de sólo agregar ─────────────────────────────
+-- INSERT: fecha el movimiento con el día operativo en que ocurre (no el de la
+-- factura) y rechaza pagos sobre facturas anuladas.
+-- UPDATE: sólo la referencia se puede corregir; el dinero registrado no se
+-- edita, se compensa con una devolución (fila negativa).
+CREATE OR REPLACE FUNCTION "hayai_cobro_pago_guardia"()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_anulado timestamptz;
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    IF (NEW."cobro_id", NEW."metodo", NEW."moneda", NEW."monto", NEW."tasa_aplicada", NEW."monto_usd",
+        NEW."recibido_en", NEW."fecha_operativa", NEW."registrado_por_id")
+       IS DISTINCT FROM
+       (OLD."cobro_id", OLD."metodo", OLD."moneda", OLD."monto", OLD."tasa_aplicada", OLD."monto_usd",
+        OLD."recibido_en", OLD."fecha_operativa", OLD."registrado_por_id") THEN
+      RAISE EXCEPTION 'Un pago registrado no se edita: registra una devolución y el pago correcto (pago %)', OLD."id"
+        USING ERRCODE = '23514', CONSTRAINT = 'cobro_pago_inmutable';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  SELECT cb."anulado_en" INTO v_anulado
+    FROM "cobro" cb WHERE cb."restaurante_id" = NEW."restaurante_id" AND cb."id" = NEW."cobro_id";
+  IF v_anulado IS NOT NULL THEN
+    RAISE EXCEPTION 'La factura % está anulada: no admite pagos ni devoluciones', NEW."cobro_id"
+      USING ERRCODE = '23514', CONSTRAINT = 'cobro_anulado_inmutable';
+  END IF;
+
+  SELECT "hayai_fecha_operativa"(NEW."recibido_en", r."zona_horaria", r."hora_corte_dia")
+    INTO NEW."fecha_operativa"
+    FROM "restaurante" r WHERE r."id" = NEW."restaurante_id";
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER "cobro_pago_guardia"
+  BEFORE INSERT OR UPDATE ON "cobro_pago"
+  FOR EACH ROW
+  EXECUTE FUNCTION "hayai_cobro_pago_guardia"();
+
+-- 6.8 · La bitácora no se reescribe ────────────────────────────────────────
+CREATE OR REPLACE FUNCTION "hayai_bitacora_inmutable"()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'La bitácora no se modifica'
+    USING ERRCODE = '23514', CONSTRAINT = 'bitacora_inmutable';
+END;
+$$;
+
+CREATE TRIGGER "bitacora_inmutable"
+  BEFORE UPDATE ON "bitacora"
+  FOR EACH ROW
+  EXECUTE FUNCTION "hayai_bitacora_inmutable"();
+
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- 9 · Triggers diferidos y de bitácora
+-- Al final a propósito: no deben ver ni verificar el backfill.
+-- ───────────────────────────────────────────────────────────────────────────
+
+-- 9.1 · ⭐⭐ La factura, verificada entera al COMMIT ──────────────────────────
+-- Sustituye a `cobro_no_vacio` y lo amplía. Una factura VIVA tiene que:
+--   1. cubrir al menos una línea viva           (error `cobro_no_vacio`: la
+--      carrera de dos cajeros; o se le quitaron todas → anularla);
+--   2. subtotal = Σ total_linea de sus líneas vivas   (`cobro_subtotal_coherente`);
+--   3. total = subtotal - descuento + impuesto + propina, y
+--      total_bs = round(total * tasa_valor, 4) ± 0,01  (`cobro_total_coherente`);
+--   4. Σ pagos.monto_usd = total ± 0,01               (`cobro_pagos_cuadran`).
+-- Diferido porque la transacción legítima pasa por estados intermedios
+-- (INSERT cobro → facturar líneas → INSERT pagos; o cancelar línea → bajar
+-- subtotal → devolución). No desactivarlo con SET CONSTRAINTS.
+-- Una factura anulada no se verifica: es histórico congelado.
+CREATE OR REPLACE FUNCTION "hayai_cobro_verificar"(p_restaurante uuid, p_cobro uuid)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  cb         record;
+  v_vivas    int;
+  v_subtotal numeric;
+  v_pagado   numeric;
+BEGIN
+  SELECT * INTO cb FROM "cobro" WHERE "restaurante_id" = p_restaurante AND "id" = p_cobro;
+  IF NOT FOUND OR cb."anulado_en" IS NOT NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT count(*), coalesce(sum(ci."total_linea"), 0) INTO v_vivas, v_subtotal
+    FROM "comanda_item" ci
+   WHERE ci."restaurante_id" = p_restaurante AND ci."cobro_id" = p_cobro AND ci."cancelado_en" IS NULL;
+
+  IF v_vivas = 0 THEN
+    RAISE EXCEPTION 'La factura % no cubre ninguna línea viva (¿la cuenta ya la cobró otro cajero? si se le quitaron todas, anúlala)', p_cobro
       USING ERRCODE = '23514', CONSTRAINT = 'cobro_no_vacio';
+  END IF;
+  IF cb."subtotal" <> v_subtotal THEN
+    RAISE EXCEPTION 'La factura % dice subtotal % y sus líneas vivas suman %', p_cobro, cb."subtotal", v_subtotal
+      USING ERRCODE = '23514', CONSTRAINT = 'cobro_subtotal_coherente';
+  END IF;
+  IF cb."total" <> cb."subtotal" - cb."descuento" + cb."impuesto" + cb."propina"
+     OR abs(cb."total_bs" - round(cb."total" * cb."tasa_valor", 4)) > 0.01 THEN
+    RAISE EXCEPTION 'La factura % tiene total % / total_bs % incoherentes con subtotal, descuento, impuesto, propina y tasa',
+      p_cobro, cb."total", cb."total_bs"
+      USING ERRCODE = '23514', CONSTRAINT = 'cobro_total_coherente';
+  END IF;
+
+  SELECT coalesce(sum(p."monto_usd"), 0) INTO v_pagado
+    FROM "cobro_pago" p WHERE p."restaurante_id" = p_restaurante AND p."cobro_id" = p_cobro;
+  IF abs(cb."total" - v_pagado) > 0.01 THEN
+    RAISE EXCEPTION 'La factura % suma % USD y sus pagos % USD: registra el cobro adicional o la devolución de la diferencia',
+      p_cobro, cb."total", v_pagado
+      USING ERRCODE = '23514', CONSTRAINT = 'cobro_pagos_cuadran';
+  END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION "hayai_cobro_coherente"()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_TABLE_NAME = 'cobro' THEN
+    PERFORM "hayai_cobro_verificar"(NEW."restaurante_id", NEW."id");
+  ELSE
+    -- cobro_pago y comanda_item: la factura de antes y la de después.
+    IF TG_OP <> 'INSERT' AND OLD."cobro_id" IS NOT NULL THEN
+      PERFORM "hayai_cobro_verificar"(OLD."restaurante_id", OLD."cobro_id");
+    END IF;
+    IF TG_OP <> 'DELETE' AND NEW."cobro_id" IS NOT NULL THEN
+      PERFORM "hayai_cobro_verificar"(NEW."restaurante_id", NEW."cobro_id");
+    END IF;
   END IF;
   RETURN NULL;
 END;
 $$;
 
-CREATE CONSTRAINT TRIGGER "cobro_no_vacio"
+CREATE CONSTRAINT TRIGGER "cobro_coherente"
   AFTER INSERT OR UPDATE ON "cobro"
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW
-  EXECUTE FUNCTION "hayai_cobro_no_vacio"();
+  EXECUTE FUNCTION "hayai_cobro_coherente"();
+
+CREATE CONSTRAINT TRIGGER "comanda_item_cobro_coherente"
+  AFTER INSERT OR UPDATE OR DELETE ON "comanda_item"
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW
+  EXECUTE FUNCTION "hayai_cobro_coherente"();
+
+CREATE CONSTRAINT TRIGGER "cobro_pago_cobro_coherente"
+  AFTER INSERT OR UPDATE OR DELETE ON "cobro_pago"
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW
+  EXECUTE FUNCTION "hayai_cobro_coherente"();
+
+-- 9.2 · Bitácora ───────────────────────────────────────────────────────────
+-- AFTER: registra la fila tal como quedó. Qué entra (y qué no, a propósito):
+--   · comanda_item: INSERT o UPDATE cuando la comanda YA salió de cocina.
+--     Antes del despacho no se audita (era libre antes de esta migración y la
+--     cocina todavía no hizo nada). Tampoco el "facturar" a secas (cobro_id
+--     de NULL a X sin otro cambio): la factura misma es el registro.
+--   · cobro: todo UPDATE que cambie algo (el INSERT es la factura misma).
+--   · cliente: todo UPDATE que cambie algo — el cambio de `mesa_id` ES el
+--     historial de asiento.
+-- El autor viene de `SET LOCAL app.usuario_id` (set_config(..., true)) y el
+-- motivo, opcional, de `app.motivo`. Sin autor, error: falla cerrado.
+CREATE OR REPLACE FUNCTION "hayai_bitacora"()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_antes      jsonb;
+  v_despues    jsonb;
+  v_cambios    text[] := '{}';
+  v_despachada timestamptz;
+  v_usuario    uuid;
+BEGIN
+  v_despues := to_jsonb(NEW) - 'actualizado_en';
+  IF TG_OP = 'UPDATE' THEN
+    v_antes := to_jsonb(OLD) - 'actualizado_en';
+    SELECT coalesce(array_agg(d.key ORDER BY d.key), '{}') INTO v_cambios
+      FROM jsonb_each(v_despues) d
+     WHERE d.value IS DISTINCT FROM v_antes -> d.key;
+    IF cardinality(v_cambios) = 0 THEN
+      RETURN NULL;
+    END IF;
+  END IF;
+
+  IF TG_TABLE_NAME = 'comanda_item' THEN
+    SELECT c."despachada_en" INTO v_despachada
+      FROM "comanda" c WHERE c."restaurante_id" = NEW."restaurante_id" AND c."id" = NEW."comanda_id";
+    IF v_despachada IS NULL THEN
+      RETURN NULL;
+    END IF;
+    IF TG_OP = 'UPDATE' AND v_cambios = ARRAY['cobro_id'] AND OLD."cobro_id" IS NULL THEN
+      RETURN NULL;
+    END IF;
+  END IF;
+
+  v_usuario := nullif(current_setting('app.usuario_id', true), '')::uuid;
+  IF v_usuario IS NULL THEN
+    RAISE EXCEPTION 'Corrección sin autor en % (%): el servicio debe fijar app.usuario_id con SET LOCAL', TG_TABLE_NAME, NEW."id"
+      USING ERRCODE = '23514', CONSTRAINT = 'bitacora_sin_autor';
+  END IF;
+
+  INSERT INTO "bitacora" ("restaurante_id", "tabla", "entidad_id", "operacion", "cambios",
+                          "antes", "despues", "usuario_id", "motivo")
+  VALUES (NEW."restaurante_id", TG_TABLE_NAME, NEW."id", TG_OP, v_cambios,
+          v_antes, v_despues, v_usuario, nullif(current_setting('app.motivo', true), ''));
+  RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER "comanda_item_bitacora"
+  AFTER INSERT OR UPDATE ON "comanda_item"
+  FOR EACH ROW
+  EXECUTE FUNCTION "hayai_bitacora"();
+
+CREATE TRIGGER "cobro_bitacora"
+  AFTER UPDATE ON "cobro"
+  FOR EACH ROW
+  EXECUTE FUNCTION "hayai_bitacora"();
+
+CREATE TRIGGER "cliente_bitacora"
+  AFTER UPDATE ON "cliente"
+  FOR EACH ROW
+  EXECUTE FUNCTION "hayai_bitacora"();
